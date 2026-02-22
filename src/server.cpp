@@ -27,6 +27,7 @@ bool server::start() {
 }
 
 void server::stop() {
+    if (!m_running) return;
     m_running = false;
     m_socket.close();
     std::cout << "[server] Stopped" << std::endl;

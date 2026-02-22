@@ -30,6 +30,7 @@ bool client::connect() {
 }
 
 void client::disconnect() {
+    if (!m_connected) return;
     m_connected = false;
     m_socket.close();
     std::cout << "[client] Disconnected" << std::endl;
