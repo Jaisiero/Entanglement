@@ -1,20 +1,23 @@
 #include "platform.h"
 
-namespace entanglement {
+namespace entanglement
+{
 
-bool platform_init() {
+    bool platform_init()
+    {
 #ifdef ENTANGLEMENT_PLATFORM_WINDOWS
-    WSADATA wsa;
-    return WSAStartup(MAKEWORD(2, 2), &wsa) == 0;
+        WSADATA wsa;
+        return WSAStartup(MAKEWORD(2, 2), &wsa) == 0;
 #else
-    return true;
+        return true;
 #endif
-}
+    }
 
-void platform_shutdown() {
+    void platform_shutdown()
+    {
 #ifdef ENTANGLEMENT_PLATFORM_WINDOWS
-    WSACleanup();
+        WSACleanup();
 #endif
-}
+    }
 
 } // namespace entanglement

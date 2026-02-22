@@ -40,6 +40,12 @@
 # debug information files
 *.dwo
 
+#vscode files
+.vscode
+.clang-format
+
 # folders
 build
+
+#clang
 .cache
