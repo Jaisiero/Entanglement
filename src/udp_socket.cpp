@@ -45,6 +45,10 @@ namespace entanglement
         int opt = 1;
         setsockopt(m_socket, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char *>(&opt), sizeof(opt));
 
+        // Increase receive buffer for high-throughput scenarios
+        int rcvbuf = 256 * 1024; // 256 KB
+        setsockopt(m_socket, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char *>(&rcvbuf), sizeof(rcvbuf));
+
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_port = htons(port);
@@ -165,6 +169,12 @@ namespace entanglement
             return ntohs(addr.sin_port);
         }
         return 0;
+    }
+
+    bool udp_socket::set_recv_buffer_size(int size_bytes)
+    {
+        return setsockopt(m_socket, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char *>(&size_bytes),
+                          sizeof(size_bytes)) == 0;
     }
 
     void udp_socket::close()

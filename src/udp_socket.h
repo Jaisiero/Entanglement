@@ -44,6 +44,9 @@ namespace entanglement
         // Set non-blocking mode
         bool set_non_blocking(bool enabled);
 
+        // Set socket receive buffer size (SO_RCVBUF)
+        bool set_recv_buffer_size(int size_bytes);
+
         // Get the local port the socket is bound to
         uint16_t local_port() const;
 

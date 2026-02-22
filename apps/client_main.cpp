@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <iomanip>
 #include <iostream>
 #include <mutex>
 #include <string>
@@ -17,8 +18,12 @@ struct client_stats
     int id = 0;
     int packets_sent = 0;
     int responses_received = 0;
+    int retransmissions = 0;
+    uint32_t rtt_samples = 0;
     uint64_t local_seq = 0;
     uint64_t remote_seq = 0;
+    double rtt_ms = 0.0;
+    double rto_ms = 0.0;
     long long elapsed_ms = 0;
     bool passed_wrap = false;
     bool passed_echo = false;
@@ -40,6 +45,25 @@ static client_stats run_client(int id, const char *server_ip, uint16_t port, int
     cli.set_on_response([&](const packet_header & /*hdr*/, const uint8_t * /*payload*/, size_t /*size*/)
                         { ++responses; });
 
+    // Pre-generate all payloads before timing starts
+    std::vector<std::string> messages(total_packets);
+    for (int i = 0; i < total_packets; ++i)
+    {
+        messages[i] = "c" + std::to_string(id) + "#" + std::to_string(i);
+    }
+
+    // Payload provider callback — resolves sequence to pre-generated message (zero-copy)
+    auto provider = [&](uint64_t seq) -> std::pair<const uint8_t *, uint16_t>
+    {
+        uint64_t idx = seq - 1; // sequences start at 1
+        if (idx < static_cast<uint64_t>(total_packets))
+        {
+            const auto &m = messages[idx];
+            return {reinterpret_cast<const uint8_t *>(m.data()), static_cast<uint16_t>(m.size())};
+        }
+        return {nullptr, 0};
+    };
+
     if (!cli.connect())
     {
         std::lock_guard<std::mutex> lock(g_cout_mutex);
@@ -54,35 +78,45 @@ static client_stats run_client(int id, const char *server_ip, uint16_t port, int
 
     auto t0 = std::chrono::steady_clock::now();
 
-    // Send packets, polling every 16 to process ACKs
+    int total_retransmissions = 0;
+
+    // Send packets, polling + retransmitting every 16
     for (int i = 0; i < total_packets; ++i)
     {
-        std::string msg = "c" + std::to_string(id) + "#" + std::to_string(i);
-        cli.send_payload(msg.data(), msg.size(), FLAG_RELIABLE);
+        const auto &msg = messages[i];
+
+        packet_header hdr{};
+        hdr.flags = FLAG_RELIABLE;
+        hdr.payload_size = static_cast<uint16_t>(msg.size());
+        cli.send(hdr, msg.data());
 
         if ((i & 0xF) == 0xF)
         {
             cli.poll();
+            total_retransmissions += cli.update(provider);
         }
     }
 
-    // Drain remaining responses (short timeout — no retransmission yet)
-    for (int attempt = 0; attempt < 100; ++attempt)
+    // Drain remaining responses with retransmission
+    for (int attempt = 0; attempt < 500; ++attempt)
     {
-        if (cli.poll() == 0)
-        {
-            if (responses.load() >= total_packets)
-                break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
-        }
+        cli.poll();
+        total_retransmissions += cli.update(provider);
+        if (responses.load() >= total_packets)
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
 
     auto t1 = std::chrono::steady_clock::now();
 
     auto &conn = cli.connection();
     stats.responses_received = responses.load();
+    stats.retransmissions = total_retransmissions;
+    stats.rtt_samples = conn.rtt_sample_count();
     stats.local_seq = conn.local_sequence();
     stats.remote_seq = conn.remote_sequence();
+    stats.rtt_ms = conn.srtt_ms();
+    stats.rto_ms = conn.rto_ms();
     stats.elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
     stats.passed_wrap = (stats.local_seq - 1) >= SEQUENCE_BUFFER_SIZE;
     stats.passed_echo = (stats.responses_received == total_packets);
@@ -153,8 +187,9 @@ int main()
         all_echo &= s.passed_echo;
 
         int pct = s.packets_sent > 0 ? static_cast<int>(100LL * s.responses_received / s.packets_sent) : 0;
-        std::cout << "  Client " << s.id << ": sent=" << s.packets_sent << " recv=" << s.responses_received << " ("
-                  << pct << "%) seq=" << s.local_seq - 1 << " " << s.elapsed_ms << "ms"
+        std::cout << "  Client " << s.id << ": recv=" << s.responses_received << "/" << s.packets_sent << " (" << pct
+                  << "%) retx=" << s.retransmissions << " rtt=" << std::fixed << std::setprecision(1) << s.rtt_ms
+                  << "ms rto=" << s.rto_ms << "ms samples=" << s.rtt_samples << " " << s.elapsed_ms << "ms"
                   << (s.passed_echo ? " [OK]" : " [PARTIAL]") << std::endl;
     }
 
@@ -169,9 +204,9 @@ int main()
         std::cout << "[FAIL] Some clients did not wrap." << std::endl;
 
     if (all_echo)
-        std::cout << "[PASS] All echoes received from all clients." << std::endl;
+        std::cout << "[PASS] All echoes received (reliability works!)." << std::endl;
     else
-        std::cout << "[WARN] Some responses missing (no retransmission yet)." << std::endl;
+        std::cout << "[WARN] Some responses missing." << std::endl;
 
     platform_shutdown();
     return 0;

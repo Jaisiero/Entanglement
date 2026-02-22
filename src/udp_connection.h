@@ -3,6 +3,7 @@
 #include "constants.h"
 #include "packet_header.h"
 #include <array>
+#include <chrono>
 #include <cstdint>
 
 namespace entanglement
@@ -26,15 +27,26 @@ namespace entanglement
         }
     };
 
-    // --- Sent packet entry (stored in send buffer for potential retransmission) ---
+    // --- Sent packet entry (metadata only, no payload copy) ---
 
     struct sent_packet_entry
     {
         uint64_t sequence = 0;
         bool acked = false;
-        bool active = false; // slot in use
-        // TODO: timestamp for RTT / retransmission
-        // TODO: payload copy for retransmission
+        bool active = false;
+        uint8_t flags = 0;
+        int retransmit_count = 0;
+        std::chrono::steady_clock::time_point send_time{};
+        packet_header header_copy{}; // snapshot of header at send time
+    };
+
+    // --- Lost packet info (returned by collect_lost for application-layer retransmission) ---
+
+    struct lost_packet_info
+    {
+        uint64_t sequence = 0;
+        packet_header header{}; // original header with refreshed ack/ack_bitmap
+        int retransmit_count = 0;
     };
 
     // --- Connection state per peer ---
@@ -54,7 +66,8 @@ namespace entanglement
         // Get next sequence number and register it in the send buffer
         uint64_t next_sequence();
 
-        // Fill header with current ack state before sending
+        // Fill header with current ack state before sending.
+        // Registers the packet in the send buffer for ACK tracking / loss detection.
         void prepare_header(packet_header &header);
 
         // --- Receiving side ---
@@ -75,6 +88,20 @@ namespace entanglement
         uint64_t local_sequence() const { return m_local_sequence; }
         uint64_t remote_sequence() const { return m_remote_sequence; }
 
+        // --- Reliability ---
+
+        // Scan send buffer for timed-out reliable packets that need retransmission.
+        // Fills 'out' with up to max_count lost_packet_info entries.
+        // The application layer is responsible for providing the payload and resending.
+        // Returns how many lost packets were detected.
+        int collect_lost(std::chrono::steady_clock::time_point now, lost_packet_info *out, int max_count);
+
+        // RTT queries (milliseconds)
+        double srtt_ms() const { return m_srtt / 1000.0; }
+        double rttvar_ms() const { return m_rttvar / 1000.0; }
+        double rto_ms() const { return static_cast<double>(m_rto) / 1000.0; }
+        uint32_t rtt_sample_count() const { return m_rtt_sample_count; }
+
     private:
         bool m_active = false;
         endpoint_key m_endpoint{};
@@ -87,8 +114,18 @@ namespace entanglement
         uint64_t m_remote_sequence = 0;
         uint32_t m_recv_bitmap = 0;
 
-        // Helper: mark a sent packet as acked
+        // RTT estimation (microseconds) — Jacobson/Karels (RFC 6298)
+        bool m_rtt_initialized = false;
+        double m_srtt = 0.0;            // smoothed RTT
+        double m_rttvar = 0.0;          // RTT variance
+        int64_t m_rto = INITIAL_RTO_US; // retransmission timeout
+        uint32_t m_rtt_sample_count = 0;
+
+        // Helper: mark a sent packet as acked (+ RTT sample)
         void ack_packet(uint64_t sequence);
+
+        // Helper: update RTT estimates from a sample
+        void update_rtt(int64_t sample_us);
 
         // Helper: check if we already received a sequence
         bool is_sequence_received(uint64_t sequence) const;

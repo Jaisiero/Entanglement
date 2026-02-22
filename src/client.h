@@ -37,6 +37,14 @@ namespace entanglement
         // Process incoming packets from the server (up to max_packets per call)
         int poll(int max_packets = DEFAULT_MAX_POLL_PACKETS);
 
+        // Callback type: given a sequence number, return pointer+size of the
+        // payload to retransmit.  Return {nullptr, 0} if unavailable.
+        using payload_provider = std::function<std::pair<const uint8_t *, uint16_t>(uint64_t sequence)>;
+
+        // Process retransmissions of reliable unACKed packets.
+        // The application provides payloads via the callback. Returns retransmissions sent.
+        int update(payload_provider provider);
+
         // Set the response callback
         void set_on_response(on_response_received callback);
 
