@@ -19,10 +19,9 @@ namespace entanglement
     constexpr int DEFAULT_MAX_POLL_PACKETS = 64;
 
     // --- Reliability ---
-    constexpr int64_t INITIAL_RTO_US = 200'000;   // 200 ms initial retransmission timeout
-    constexpr int64_t MIN_RTO_US = 50'000;        // 50 ms minimum RTO
-    constexpr int64_t MAX_RTO_US = 2'000'000;     // 2 s maximum RTO
-    constexpr int MAX_RETRANSMISSIONS = 10;       // give up after this many retries
-    constexpr int MAX_RETRANSMIT_PER_UPDATE = 16; // max retransmissions per update() call
+    constexpr int64_t INITIAL_RTO_US = 200'000; // 200 ms initial retransmission timeout
+    constexpr int64_t MIN_RTO_US = 50'000;      // 50 ms minimum RTO
+    constexpr int64_t MAX_RTO_US = 2'000'000;   // 2 s maximum RTO
+    constexpr int MAX_LOSSES_PER_UPDATE = 16;   // max loss notifications per update() call
 
 } // namespace entanglement

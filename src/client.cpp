@@ -107,27 +107,24 @@ namespace entanglement
         m_on_response = std::move(callback);
     }
 
-    int client::update(payload_provider provider)
+    int client::update(on_packet_lost callback)
     {
-        if (!m_connected || !provider)
+        if (!m_connected)
             return 0;
 
         auto now = std::chrono::steady_clock::now();
-        lost_packet_info lost[MAX_RETRANSMIT_PER_UPDATE];
-        int count = m_connection.collect_lost(now, lost, MAX_RETRANSMIT_PER_UPDATE);
+        lost_packet_info lost[MAX_LOSSES_PER_UPDATE];
+        int count = m_connection.collect_losses(now, lost, MAX_LOSSES_PER_UPDATE);
 
-        int sent = 0;
-        for (int i = 0; i < count; ++i)
+        if (callback)
         {
-            auto [ptr, size] = provider(lost[i].sequence);
-            if (ptr && size > 0)
+            for (int i = 0; i < count; ++i)
             {
-                m_socket.send_packet(lost[i].header, ptr, m_server_address, m_server_port);
-                ++sent;
+                callback(lost[i]);
             }
         }
 
-        return sent;
+        return count;
     }
 
     uint16_t client::local_port() const

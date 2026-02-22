@@ -47,9 +47,10 @@ namespace entanglement
         entry.acked = false;
         entry.active = true;
         entry.flags = header.flags;
-        entry.retransmit_count = 0;
+        entry.channel_id = header.channel_id;
+        entry.shard_id = header.shard_id;
+        entry.payload_size = header.payload_size;
         entry.send_time = std::chrono::steady_clock::now();
-        entry.header_copy = header;
     }
 
     // --- Receiving side ---
@@ -132,15 +133,13 @@ namespace entanglement
         {
             entry.acked = true;
 
-            // Compute RTT only from non-retransmitted packets (Karn's algorithm)
-            if (entry.retransmit_count == 0)
+            // Every ACKed packet is a first transmission (losses are deactivated,
+            // not retried), so all RTT samples are valid — no Karn's filtering needed.
+            auto now = std::chrono::steady_clock::now();
+            auto sample = std::chrono::duration_cast<std::chrono::microseconds>(now - entry.send_time).count();
+            if (sample > 0)
             {
-                auto now = std::chrono::steady_clock::now();
-                auto sample = std::chrono::duration_cast<std::chrono::microseconds>(now - entry.send_time).count();
-                if (sample > 0)
-                {
-                    update_rtt(sample);
-                }
+                update_rtt(sample);
             }
         }
     }
@@ -173,7 +172,7 @@ namespace entanglement
 
     // --- Reliability ---
 
-    int udp_connection::collect_lost(std::chrono::steady_clock::time_point now, lost_packet_info *out, int max_count)
+    int udp_connection::collect_losses(std::chrono::steady_clock::time_point now, lost_packet_info *out, int max_count)
     {
         int count = 0;
 
@@ -189,24 +188,22 @@ namespace entanglement
                 continue;
             if (!(entry.flags & FLAG_RELIABLE))
                 continue;
-            if (entry.retransmit_count >= MAX_RETRANSMISSIONS)
-                continue;
 
             auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - entry.send_time);
             if (elapsed.count() < m_rto)
                 continue;
 
-            // This packet needs retransmission
-            ++entry.retransmit_count;
-            entry.send_time = now; // reset timer for next potential retransmit
-
-            // Report to application with original header + refreshed ack state
+            // Report loss metadata to application
             out[count].sequence = seq;
-            out[count].header = entry.header_copy;
-            out[count].header.ack = m_remote_sequence;
-            out[count].header.ack_bitmap = m_recv_bitmap;
-            out[count].retransmit_count = entry.retransmit_count;
+            out[count].flags = entry.flags;
+            out[count].channel_id = entry.channel_id;
+            out[count].shard_id = entry.shard_id;
+            out[count].payload_size = entry.payload_size;
             ++count;
+
+            // Deactivate — we give up on this packet.
+            // The application may resend as a new packet if it chooses.
+            entry.active = false;
         }
 
         return count;

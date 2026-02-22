@@ -9,6 +9,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 static std::mutex g_cout_mutex;
@@ -52,16 +53,31 @@ static client_stats run_client(int id, const char *server_ip, uint16_t port, int
         messages[i] = "c" + std::to_string(id) + "#" + std::to_string(i);
     }
 
-    // Payload provider callback — resolves sequence to pre-generated message (zero-copy)
-    auto provider = [&](uint64_t seq) -> std::pair<const uint8_t *, uint16_t>
+    // Track which message each sequence carries (for loss-driven resend)
+    std::unordered_map<uint64_t, size_t> seq_to_msg;
+    int total_retransmissions = 0;
+
+    // Loss callback — resend the same message as a brand-new packet
+    auto on_loss = [&](const entanglement::lost_packet_info &info)
     {
-        uint64_t idx = seq - 1; // sequences start at 1
-        if (idx < static_cast<uint64_t>(total_packets))
+        auto it = seq_to_msg.find(info.sequence);
+        if (it != seq_to_msg.end())
         {
-            const auto &m = messages[idx];
-            return {reinterpret_cast<const uint8_t *>(m.data()), static_cast<uint16_t>(m.size())};
+            size_t msg_idx = it->second;
+            const auto &msg = messages[msg_idx];
+
+            packet_header hdr{};
+            hdr.flags = info.flags;
+            hdr.channel_id = info.channel_id;
+            hdr.shard_id = info.shard_id;
+            hdr.payload_size = info.payload_size;
+            cli.send(hdr, msg.data());
+
+            // Track the new sequence for the same message
+            seq_to_msg[hdr.sequence] = msg_idx;
+            seq_to_msg.erase(it);
+            ++total_retransmissions;
         }
-        return {nullptr, 0};
     };
 
     if (!cli.connect())
@@ -78,9 +94,7 @@ static client_stats run_client(int id, const char *server_ip, uint16_t port, int
 
     auto t0 = std::chrono::steady_clock::now();
 
-    int total_retransmissions = 0;
-
-    // Send packets, polling + retransmitting every 16
+    // Send packets, polling + checking for losses every 16
     for (int i = 0; i < total_packets; ++i)
     {
         const auto &msg = messages[i];
@@ -90,18 +104,20 @@ static client_stats run_client(int id, const char *server_ip, uint16_t port, int
         hdr.payload_size = static_cast<uint16_t>(msg.size());
         cli.send(hdr, msg.data());
 
+        seq_to_msg[hdr.sequence] = static_cast<size_t>(i);
+
         if ((i & 0xF) == 0xF)
         {
             cli.poll();
-            total_retransmissions += cli.update(provider);
+            cli.update(on_loss);
         }
     }
 
-    // Drain remaining responses with retransmission
+    // Drain remaining responses with loss detection
     for (int attempt = 0; attempt < 500; ++attempt)
     {
         cli.poll();
-        total_retransmissions += cli.update(provider);
+        cli.update(on_loss);
         if (responses.load() >= total_packets)
             break;
         std::this_thread::sleep_for(std::chrono::milliseconds(2));

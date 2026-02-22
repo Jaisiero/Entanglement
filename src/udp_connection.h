@@ -35,18 +35,21 @@ namespace entanglement
         bool acked = false;
         bool active = false;
         uint8_t flags = 0;
-        int retransmit_count = 0;
+        uint8_t channel_id = 0;
+        uint16_t shard_id = 0;
+        uint16_t payload_size = 0;
         std::chrono::steady_clock::time_point send_time{};
-        packet_header header_copy{}; // snapshot of header at send time
     };
 
-    // --- Lost packet info (returned by collect_lost for application-layer retransmission) ---
+    // --- Lost packet info (returned by collect_losses for application-layer notification) ---
 
     struct lost_packet_info
     {
         uint64_t sequence = 0;
-        packet_header header{}; // original header with refreshed ack/ack_bitmap
-        int retransmit_count = 0;
+        uint8_t flags = 0;
+        uint8_t channel_id = 0;
+        uint16_t shard_id = 0;
+        uint16_t payload_size = 0;
     };
 
     // --- Connection state per peer ---
@@ -90,11 +93,11 @@ namespace entanglement
 
         // --- Reliability ---
 
-        // Scan send buffer for timed-out reliable packets that need retransmission.
-        // Fills 'out' with up to max_count lost_packet_info entries.
-        // The application layer is responsible for providing the payload and resending.
-        // Returns how many lost packets were detected.
-        int collect_lost(std::chrono::steady_clock::time_point now, lost_packet_info *out, int max_count);
+        // Scan send buffer for timed-out reliable packets.
+        // Marks them as inactive (gives up) and fills 'out' with loss metadata.
+        // The application decides whether to resend as a new packet.
+        // Returns how many losses were detected.
+        int collect_losses(std::chrono::steady_clock::time_point now, lost_packet_info *out, int max_count);
 
         // RTT queries (milliseconds)
         double srtt_ms() const { return m_srtt / 1000.0; }

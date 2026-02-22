@@ -37,13 +37,14 @@ namespace entanglement
         // Process incoming packets from the server (up to max_packets per call)
         int poll(int max_packets = DEFAULT_MAX_POLL_PACKETS);
 
-        // Callback type: given a sequence number, return pointer+size of the
-        // payload to retransmit.  Return {nullptr, 0} if unavailable.
-        using payload_provider = std::function<std::pair<const uint8_t *, uint16_t>(uint64_t sequence)>;
+        // Callback invoked for each reliable packet detected as lost.
+        // The application decides whether to resend (as a new packet via send()).
+        using on_packet_lost = std::function<void(const lost_packet_info &info)>;
 
-        // Process retransmissions of reliable unACKed packets.
-        // The application provides payloads via the callback. Returns retransmissions sent.
-        int update(payload_provider provider);
+        // Detect timed-out reliable packets and notify via callback.
+        // Lost entries are deactivated — the app can resend as new packets.
+        // Returns the number of losses detected.
+        int update(on_packet_lost callback = nullptr);
 
         // Set the response callback
         void set_on_response(on_response_received callback);
