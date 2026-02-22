@@ -154,7 +154,7 @@ namespace entanglement
             // Handle control packets internally
             if ((header.flags & FLAG_CONTROL) && header.payload_size >= 1)
             {
-                handle_control(payload[0]);
+                handle_control(payload, header.payload_size);
                 ++count;
                 continue;
             }
@@ -226,17 +226,23 @@ namespace entanglement
 
     void client::send_control(uint8_t control_type)
     {
+        send_control_payload(&control_type, 1);
+    }
+
+    void client::send_control_payload(const void *payload, size_t size)
+    {
         packet_header header{};
         header.flags = FLAG_CONTROL;
         header.channel_id = channels::CONTROL.id;
-        header.payload_size = 1;
+        header.payload_size = static_cast<uint16_t>(size);
         // Control channel is always reliable
         m_connection.prepare_header(header, true);
-        m_socket.send_packet(header, &control_type, m_server_address, m_server_port);
+        m_socket.send_packet(header, payload, m_server_address, m_server_port);
     }
 
-    void client::handle_control(uint8_t control_type)
+    void client::handle_control(const uint8_t *payload, size_t payload_size)
     {
+        uint8_t control_type = payload[0];
         switch (control_type)
         {
             case CONTROL_CONNECTION_ACCEPTED:
@@ -272,12 +278,105 @@ namespace entanglement
             case CONTROL_HEARTBEAT:
                 // process_incoming already updated timestamps
                 break;
+
+            case CONTROL_CHANNEL_ACK:
+            {
+                // Payload: [type(1)][channel_id(1)][status(1)]
+                if (payload_size >= 3)
+                {
+                    uint8_t ch_id = payload[1];
+                    uint8_t status = payload[2];
+                    if (m_pending_channel_id == static_cast<int>(ch_id))
+                    {
+                        m_channel_ack_status = status;
+                        m_pending_channel_id = -1; // ACK received — unblock open_channel
+                    }
+                }
+                break;
+            }
         }
     }
 
     uint16_t client::local_port() const
     {
         return m_socket.local_port();
+    }
+
+    // --- Channel negotiation ---
+
+    int client::open_channel(channel_mode mode, uint8_t priority, const char *name, uint8_t hint)
+    {
+        if (m_connection.state() != connection_state::CONNECTED)
+            return -1;
+
+        // Register locally first (picks an available slot)
+        int id = m_channels.open_channel(mode, priority, name, hint);
+        if (id < 0)
+            return -1;
+
+        // Build CHANNEL_OPEN payload: [type(1)][channel_id(1)][mode(1)][priority(1)]
+        uint8_t open_payload[4] = {
+            CONTROL_CHANNEL_OPEN,
+            static_cast<uint8_t>(id),
+            static_cast<uint8_t>(mode),
+            priority,
+        };
+
+        m_pending_channel_id = id;
+        m_channel_ack_status = CHANNEL_STATUS_REJECTED; // pessimistic default
+        send_control_payload(open_payload, sizeof(open_payload));
+
+        // Wait for ACK with retries (synchronous, like the handshake)
+        auto retry_interval = std::chrono::milliseconds(CHANNEL_OPEN_RETRY_INTERVAL_MS);
+        auto last_attempt = std::chrono::steady_clock::now();
+        int attempt = 0;
+
+        while (attempt < CHANNEL_OPEN_MAX_ATTEMPTS)
+        {
+            poll();
+
+            if (m_pending_channel_id < 0)
+            {
+                // ACK received
+                if (m_channel_ack_status == CHANNEL_STATUS_ACCEPTED)
+                {
+                    if (m_verbose)
+                    {
+                        std::cout << "[client] Channel " << id << " accepted by server" << std::endl;
+                    }
+                    return id;
+                }
+                else
+                {
+                    // Rejected — roll back local registration
+                    if (m_verbose)
+                    {
+                        std::cerr << "[client] Channel " << id << " rejected by server" << std::endl;
+                    }
+                    m_channels.unregister_channel(static_cast<uint8_t>(id));
+                    return -1;
+                }
+            }
+
+            auto now = std::chrono::steady_clock::now();
+            if (now - last_attempt >= retry_interval)
+            {
+                ++attempt;
+                send_control_payload(open_payload, sizeof(open_payload));
+                last_attempt = now;
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
+        // Timed out — roll back
+        if (m_verbose)
+        {
+            std::cerr << "[client] Channel " << id << " open timed out" << std::endl;
+        }
+        m_pending_channel_id = -1;
+        m_channels.unregister_channel(static_cast<uint8_t>(id));
+        return -1;
     }
 
 } // namespace entanglement

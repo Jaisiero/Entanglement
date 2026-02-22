@@ -1555,6 +1555,186 @@ static bool test_open_channel_saturation()
     return true;
 }
 
+// ============================================================================
+// TEST 36: Channel negotiation — client.open_channel() accepted by server
+// ============================================================================
+
+static bool test_channel_negotiation_accepted()
+{
+    server srv(9922);
+    srv.channels().register_defaults();
+    std::atomic<bool> stop_flag{false};
+
+    // Default: no on_channel_requested callback → server accepts all
+    TEST_ASSERT(srv.start(), "server should start");
+
+    std::thread server_thread(
+        [&]()
+        {
+            while (!stop_flag.load())
+            {
+                srv.poll();
+                srv.update();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+
+    client c("127.0.0.1", 9922);
+    c.set_verbose(false);
+    c.channels().register_defaults();
+    TEST_ASSERT(c.connect(), "client should connect");
+
+    // Negotiate a new reliable channel
+    int ch_id = c.open_channel(channel_mode::RELIABLE, 200, "combat");
+    TEST_ASSERT(ch_id >= 4, "open_channel should return valid id >= 4");
+
+    // The channel should now be registered on both sides
+    TEST_ASSERT(c.channels().is_registered(static_cast<uint8_t>(ch_id)), "client should have channel registered");
+    TEST_ASSERT(c.channels().is_reliable(static_cast<uint8_t>(ch_id)), "client channel should be reliable");
+
+    // Give server a moment to have processed CHANNEL_OPEN
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    TEST_ASSERT(srv.channels().is_registered(static_cast<uint8_t>(ch_id)), "server should have channel registered");
+    TEST_ASSERT(srv.channels().is_reliable(static_cast<uint8_t>(ch_id)), "server channel should be reliable");
+
+    // Send data on the negotiated channel and verify echo
+    std::atomic<int> responses{0};
+    std::string last_response;
+    c.set_on_response(
+        [&](const packet_header &, const uint8_t *payload, size_t size)
+        {
+            last_response = std::string(reinterpret_cast<const char *>(payload), size);
+            responses++;
+        });
+
+    srv.set_on_packet_received(
+        [&](const packet_header &header, const uint8_t *payload, size_t payload_size, const std::string &addr,
+            uint16_t port)
+        {
+            packet_header resp{};
+            resp.channel_id = header.channel_id;
+            resp.payload_size = static_cast<uint16_t>(payload_size);
+            srv.send_to(resp, payload, addr, port);
+        });
+
+    const char *msg = "NEGOTIATED";
+    c.send_payload(msg, 10, 0, static_cast<uint8_t>(ch_id));
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (responses.load() == 0 && std::chrono::steady_clock::now() < deadline)
+    {
+        c.poll();
+        c.update(nullptr);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    TEST_ASSERT(responses.load() >= 1, "should receive echo on negotiated channel");
+    TEST_ASSERT(last_response == "NEGOTIATED", "echo payload should match");
+
+    c.disconnect();
+    stop_flag = true;
+    server_thread.join();
+    srv.stop();
+
+    return true;
+}
+
+// ============================================================================
+// TEST 37: Channel negotiation — server rejects via callback
+// ============================================================================
+
+static bool test_channel_negotiation_rejected()
+{
+    server srv(9923);
+    srv.channels().register_defaults();
+    std::atomic<bool> stop_flag{false};
+
+    // Reject all channel open requests
+    srv.set_on_channel_requested([](const endpoint_key &, uint8_t, channel_mode, uint8_t) -> bool { return false; });
+
+    TEST_ASSERT(srv.start(), "server should start");
+
+    std::thread server_thread(
+        [&]()
+        {
+            while (!stop_flag.load())
+            {
+                srv.poll();
+                srv.update();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+
+    client c("127.0.0.1", 9923);
+    c.set_verbose(false);
+    c.channels().register_defaults();
+    TEST_ASSERT(c.connect(), "client should connect");
+
+    // Attempt to open a channel — should be rejected
+    int ch_id = c.open_channel(channel_mode::RELIABLE, 128, "rejected_ch");
+    TEST_ASSERT(ch_id == -1, "open_channel should return -1 when rejected");
+
+    // Verify the channel was NOT registered locally (rolled back)
+    // The hint was 4, so if it was registered and rolled back, slot 4 should be free
+    TEST_ASSERT(!c.channels().is_registered(4), "rejected channel should not remain registered on client");
+
+    c.disconnect();
+    stop_flag = true;
+    server_thread.join();
+    srv.stop();
+
+    return true;
+}
+
+// ============================================================================
+// TEST 38: Channel negotiation — selective accept via callback
+// ============================================================================
+
+static bool test_channel_negotiation_selective()
+{
+    server srv(9924);
+    srv.channels().register_defaults();
+    std::atomic<bool> stop_flag{false};
+
+    // Accept only RELIABLE channels, reject UNRELIABLE
+    srv.set_on_channel_requested([](const endpoint_key &, uint8_t, channel_mode mode, uint8_t) -> bool
+                                 { return mode != channel_mode::UNRELIABLE; });
+
+    TEST_ASSERT(srv.start(), "server should start");
+
+    std::thread server_thread(
+        [&]()
+        {
+            while (!stop_flag.load())
+            {
+                srv.poll();
+                srv.update();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+
+    client c("127.0.0.1", 9924);
+    c.set_verbose(false);
+    c.channels().register_defaults();
+    TEST_ASSERT(c.connect(), "client should connect");
+
+    // This one should be accepted (RELIABLE)
+    int ch_reliable = c.open_channel(channel_mode::RELIABLE, 128, "ok_channel");
+    TEST_ASSERT(ch_reliable >= 4, "RELIABLE channel should be accepted");
+    TEST_ASSERT(c.channels().is_registered(static_cast<uint8_t>(ch_reliable)), "accepted channel registered on client");
+
+    // This one should be rejected (UNRELIABLE)
+    int ch_unreliable = c.open_channel(channel_mode::UNRELIABLE, 64, "bad_channel");
+    TEST_ASSERT(ch_unreliable == -1, "UNRELIABLE channel should be rejected");
+
+    c.disconnect();
+    stop_flag = true;
+    server_thread.join();
+    srv.stop();
+
+    return true;
+}
+
 int main()
 {
     platform_init();
@@ -1601,6 +1781,9 @@ int main()
     register_test("Open channel dynamic", test_open_channel);
     register_test("Unregistered channel unreliable", test_unregistered_channel_is_unreliable);
     register_test("Open channel saturation", test_open_channel_saturation);
+    register_test("Channel negotiation accepted", test_channel_negotiation_accepted);
+    register_test("Channel negotiation rejected", test_channel_negotiation_rejected);
+    register_test("Channel negotiation selective", test_channel_negotiation_selective);
 
     std::cout << "========================================" << std::endl;
     std::cout << " Entanglement Test Battery" << std::endl;

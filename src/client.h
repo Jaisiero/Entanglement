@@ -64,6 +64,12 @@ namespace entanglement
         channel_manager &channels() { return m_channels; }
         const channel_manager &channels() const { return m_channels; }
 
+        // Open a remote channel via negotiation with the server.
+        // Registers locally, sends CONTROL_CHANNEL_OPEN and waits for ACK.
+        // Returns the assigned channel_id (>= 0) or -1 on failure/rejection.
+        // Must be called while connected.
+        int open_channel(channel_mode mode, uint8_t priority = 128, const char *name = "", uint8_t hint = 4);
+
         // Congestion control: application queries these to pace sends
         bool can_send() const { return m_connection.can_send(); }
         congestion_info congestion() const { return m_connection.congestion(); }
@@ -84,11 +90,18 @@ namespace entanglement
         on_response_received m_on_response;
         on_disconnected m_on_disconnected;
 
+        // Pending channel-open negotiation state
+        int m_pending_channel_id = -1;    // channel id awaiting ACK, or -1
+        uint8_t m_channel_ack_status = 0; // last received ACK status
+
         // Send a control packet (FLAG_CONTROL + type byte)
         void send_control(uint8_t control_type);
 
+        // Send a multi-byte control payload
+        void send_control_payload(const void *payload, size_t size);
+
         // Dispatch incoming control packet
-        void handle_control(uint8_t control_type);
+        void handle_control(const uint8_t *payload, size_t payload_size);
     };
 
 } // namespace entanglement

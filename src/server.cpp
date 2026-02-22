@@ -86,7 +86,7 @@ namespace entanglement
             // Control packets are handled internally
             if ((header.flags & FLAG_CONTROL) && header.payload_size >= 1)
             {
-                handle_control(key, header, payload[0], sender_addr, sender_port);
+                handle_control(key, header, payload, header.payload_size, sender_addr, sender_port);
                 ++count;
                 continue;
             }
@@ -177,6 +177,11 @@ namespace entanglement
         m_on_client_disconnected = std::move(callback);
     }
 
+    void server::set_on_channel_requested(on_channel_requested callback)
+    {
+        m_on_channel_requested = std::move(callback);
+    }
+
     // --- Sending ---
 
     int server::send_to(packet_header &header, const void *payload, const std::string &address, uint16_t port)
@@ -260,9 +265,10 @@ namespace entanglement
 
     // --- Control packet handling ---
 
-    void server::handle_control(const endpoint_key &key, const packet_header &header, uint8_t control_type,
-                                const std::string &address, uint16_t port)
+    void server::handle_control(const endpoint_key &key, const packet_header &header, const uint8_t *payload,
+                                size_t payload_size, const std::string &address, uint16_t port)
     {
+        uint8_t control_type = payload[0];
         udp_connection *conn = find(key);
 
         switch (control_type)
@@ -336,18 +342,76 @@ namespace entanglement
                 }
                 break;
             }
+
+            case CONTROL_CHANNEL_OPEN:
+            {
+                if (!conn || conn->state() != connection_state::CONNECTED)
+                    break;
+
+                conn->process_incoming(header);
+
+                // Payload: [type(1)][channel_id(1)][mode(1)][priority(1)] = 4 bytes
+                if (payload_size < 4)
+                    break;
+
+                uint8_t ch_id = payload[1];
+                auto ch_mode = static_cast<channel_mode>(payload[2]);
+                uint8_t ch_priority = payload[3];
+
+                // Validate mode
+                if (payload[2] > static_cast<uint8_t>(channel_mode::RELIABLE_ORDERED))
+                    break;
+
+                // Consult the application callback (accept all if no callback)
+                bool accepted = true;
+                if (m_on_channel_requested)
+                {
+                    accepted = m_on_channel_requested(key, ch_id, ch_mode, ch_priority);
+                }
+
+                if (accepted)
+                {
+                    // Register on server side (ignore if already registered — idempotent)
+                    if (!m_channels.is_registered(ch_id))
+                    {
+                        m_channels.register_channel({ch_id, ch_mode, ch_priority, "remote"});
+                    }
+                }
+
+                // Send CHANNEL_ACK: [type(1)][channel_id(1)][status(1)]
+                uint8_t ack_payload[3] = {
+                    CONTROL_CHANNEL_ACK,
+                    ch_id,
+                    accepted ? CHANNEL_STATUS_ACCEPTED : CHANNEL_STATUS_REJECTED,
+                };
+                send_control_payload_to(conn, ack_payload, sizeof(ack_payload), address, port);
+
+                if (m_verbose)
+                {
+                    std::cout << "[server] Channel " << (accepted ? "accepted" : "rejected")
+                              << ": id=" << static_cast<int>(ch_id) << " mode=" << static_cast<int>(payload[2])
+                              << " from " << address << ":" << port << std::endl;
+                }
+                break;
+            }
         }
     }
 
     void server::send_control_to(udp_connection *conn, uint8_t control_type, const std::string &address, uint16_t port)
     {
+        send_control_payload_to(conn, &control_type, 1, address, port);
+    }
+
+    void server::send_control_payload_to(udp_connection *conn, const void *payload, size_t size,
+                                         const std::string &address, uint16_t port)
+    {
         packet_header header{};
         header.flags = FLAG_CONTROL;
         header.channel_id = channels::CONTROL.id;
-        header.payload_size = 1;
+        header.payload_size = static_cast<uint16_t>(size);
         // Control channel is always reliable
         conn->prepare_header(header, true);
-        m_socket.send_packet(header, &control_type, address, port);
+        m_socket.send_packet(header, payload, address, port);
     }
 
     void server::send_raw_control(uint8_t control_type, const std::string &address, uint16_t port)

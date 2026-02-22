@@ -25,6 +25,11 @@ namespace entanglement
     using on_client_disconnected =
         std::function<void(const endpoint_key &key, const std::string &address, uint16_t port)>;
 
+    // Callback: a client requests opening a dynamic channel.
+    // Return true to accept, false to reject.  If no callback is set the server accepts all.
+    using on_channel_requested =
+        std::function<bool(const endpoint_key &key, uint8_t channel_id, channel_mode mode, uint8_t priority)>;
+
     class server
     {
     public:
@@ -50,6 +55,7 @@ namespace entanglement
         void set_on_packet_received(on_packet_received callback);
         void set_on_client_connected(on_client_connected callback);
         void set_on_client_disconnected(on_client_disconnected callback);
+        void set_on_channel_requested(on_channel_requested callback);
 
         // Send a data packet to a connected client
         int send_to(packet_header &header, const void *payload, const std::string &address, uint16_t port);
@@ -80,6 +86,7 @@ namespace entanglement
         on_packet_received m_on_packet_received;
         on_client_connected m_on_client_connected;
         on_client_disconnected m_on_client_disconnected;
+        on_channel_requested m_on_channel_requested;
 
         // Connection pool + index
         std::unique_ptr<std::array<udp_connection, MAX_CONNECTIONS>> m_pool;
@@ -90,11 +97,15 @@ namespace entanglement
         int allocate_slot();
 
         // Control packet handling
-        void handle_control(const endpoint_key &key, const packet_header &header, uint8_t control_type,
-                            const std::string &address, uint16_t port);
+        void handle_control(const endpoint_key &key, const packet_header &header, const uint8_t *payload,
+                            size_t payload_size, const std::string &address, uint16_t port);
 
         // Send a control packet through an established connection
         void send_control_to(udp_connection *conn, uint8_t control_type, const std::string &address, uint16_t port);
+
+        // Send a multi-byte control payload through an established connection
+        void send_control_payload_to(udp_connection *conn, const void *payload, size_t size, const std::string &address,
+                                     uint16_t port);
 
         // Send a control packet without a connection (e.g. CONNECTION_DENIED)
         void send_raw_control(uint8_t control_type, const std::string &address, uint16_t port);

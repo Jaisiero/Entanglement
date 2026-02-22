@@ -59,6 +59,14 @@ namespace entanglement
         CONTROL_CONNECTION_DENIED = 0x03,
         CONTROL_DISCONNECT = 0x04,
         CONTROL_HEARTBEAT = 0x05,
+        CONTROL_CHANNEL_OPEN = 0x06, // Client requests opening a channel
+        CONTROL_CHANNEL_ACK = 0x07,  // Server responds to channel open
     };
+
+    // --- Channel negotiation ---
+    constexpr uint8_t CHANNEL_STATUS_ACCEPTED = 0x00;
+    constexpr uint8_t CHANNEL_STATUS_REJECTED = 0x01;
+    constexpr int CHANNEL_OPEN_MAX_ATTEMPTS = 5;            // retries before giving up
+    constexpr int64_t CHANNEL_OPEN_RETRY_INTERVAL_MS = 200; // ms between retries
 
 } // namespace entanglement
