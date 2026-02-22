@@ -20,7 +20,9 @@ struct client_stats
     int packets_sent = 0;
     int responses_received = 0;
     int retransmissions = 0;
+    int pacing_waits = 0;
     uint32_t rtt_samples = 0;
+    uint32_t final_cwnd = 0;
     uint64_t local_seq = 0;
     uint64_t remote_seq = 0;
     double rtt_ms = 0.0;
@@ -94,22 +96,54 @@ static client_stats run_client(int id, const char *server_ip, uint16_t port, int
 
     auto t0 = std::chrono::steady_clock::now();
 
-    // Send packets, polling + checking for losses every 16
-    for (int i = 0; i < total_packets; ++i)
+    // Send packets with congestion-controlled pacing
+    int sent = 0;
+    int pacing_waits = 0;
+    auto next_send_time = std::chrono::steady_clock::now();
+
+    while (sent < total_packets)
     {
-        const auto &msg = messages[i];
+        // Always process incoming ACKs and losses first
+        cli.poll();
+        cli.update(on_loss);
+
+        // Check congestion window
+        if (!cli.can_send())
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            ++pacing_waits;
+            continue;
+        }
+
+        // Check pacing interval
+        auto now = std::chrono::steady_clock::now();
+        if (now < next_send_time)
+        {
+            // Not time yet — do a quick poll instead of blocking
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+            ++pacing_waits;
+            continue;
+        }
+
+        const auto &msg = messages[sent];
 
         packet_header hdr{};
         hdr.flags = FLAG_RELIABLE;
         hdr.payload_size = static_cast<uint16_t>(msg.size());
         cli.send(hdr, msg.data());
 
-        seq_to_msg[hdr.sequence] = static_cast<size_t>(i);
+        seq_to_msg[hdr.sequence] = static_cast<size_t>(sent);
+        ++sent;
 
-        if ((i & 0xF) == 0xF)
+        // Schedule next send based on pacing interval
+        auto ci = cli.congestion();
+        if (ci.pacing_interval_us > 0)
         {
-            cli.poll();
-            cli.update(on_loss);
+            next_send_time = now + std::chrono::microseconds(ci.pacing_interval_us);
+        }
+        else
+        {
+            next_send_time = now; // no pacing info yet — send immediately
         }
     }
 
@@ -128,7 +162,9 @@ static client_stats run_client(int id, const char *server_ip, uint16_t port, int
     auto &conn = cli.connection();
     stats.responses_received = responses.load();
     stats.retransmissions = total_retransmissions;
+    stats.pacing_waits = pacing_waits;
     stats.rtt_samples = conn.rtt_sample_count();
+    stats.final_cwnd = conn.congestion().cwnd;
     stats.local_seq = conn.local_sequence();
     stats.remote_seq = conn.remote_sequence();
     stats.rtt_ms = conn.srtt_ms();
@@ -204,8 +240,9 @@ int main()
 
         int pct = s.packets_sent > 0 ? static_cast<int>(100LL * s.responses_received / s.packets_sent) : 0;
         std::cout << "  Client " << s.id << ": recv=" << s.responses_received << "/" << s.packets_sent << " (" << pct
-                  << "%) retx=" << s.retransmissions << " rtt=" << std::fixed << std::setprecision(1) << s.rtt_ms
-                  << "ms rto=" << s.rto_ms << "ms samples=" << s.rtt_samples << " " << s.elapsed_ms << "ms"
+                  << "%) retx=" << s.retransmissions << " cwnd=" << s.final_cwnd << " waits=" << s.pacing_waits
+                  << " rtt=" << std::fixed << std::setprecision(1) << s.rtt_ms << "ms rto=" << s.rto_ms
+                  << "ms samples=" << s.rtt_samples << " " << s.elapsed_ms << "ms"
                   << (s.passed_echo ? " [OK]" : " [PARTIAL]") << std::endl;
     }
 

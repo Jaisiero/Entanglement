@@ -27,6 +27,9 @@ namespace entanglement
         m_rttvar = 0.0;
         m_rto = INITIAL_RTO_US;
         m_rtt_sample_count = 0;
+
+        // Reset congestion control
+        m_cc.reset();
     }
 
     // --- Sending side ---
@@ -58,6 +61,9 @@ namespace entanglement
         entry.payload_size = header.payload_size;
         entry.send_time = std::chrono::steady_clock::now();
         m_last_send_time = entry.send_time;
+
+        // Track in congestion window
+        m_cc.on_packet_sent();
     }
 
     // --- Receiving side ---
@@ -151,6 +157,10 @@ namespace entanglement
             {
                 update_rtt(sample);
             }
+
+            // Notify congestion controller and update pacing
+            m_cc.on_packet_acked();
+            m_cc.update_pacing(m_srtt);
         }
     }
 
@@ -214,6 +224,10 @@ namespace entanglement
             // Deactivate — we give up on this packet.
             // The application may resend as a new packet if it chooses.
             entry.active = false;
+
+            // Notify congestion controller
+            m_cc.on_packet_lost();
+            m_cc.update_pacing(m_srtt);
         }
 
         return count;

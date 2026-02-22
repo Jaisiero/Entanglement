@@ -6,6 +6,7 @@
 // ============================================================================
 
 #include "client.h"
+#include "congestion_control.h"
 #include "server.h"
 #include "udp_connection.h"
 #include <atomic>
@@ -1007,6 +1008,194 @@ static bool test_multiple_clients_independent()
 // Register all tests and run
 // ============================================================================
 
+// ============================================================================
+// TEST 21: Congestion control initial state
+// ============================================================================
+// Verify defaults: cwnd = INITIAL_CWND, in_flight = 0, can_send = true.
+// ============================================================================
+
+static bool test_cc_initial_state()
+{
+    congestion_control cc;
+    cc.reset();
+
+    TEST_ASSERT(cc.cwnd() == INITIAL_CWND, "initial cwnd should be INITIAL_CWND");
+    TEST_ASSERT(cc.in_flight() == 0, "initial in_flight should be 0");
+    TEST_ASSERT(cc.ssthresh() == INITIAL_SSTHRESH, "initial ssthresh should be INITIAL_SSTHRESH");
+    TEST_ASSERT(cc.can_send(), "should be able to send initially");
+    TEST_ASSERT(cc.in_slow_start(), "should start in slow start");
+    TEST_ASSERT(cc.pacing_interval_us() == 0, "pacing should be 0 before RTT samples");
+
+    return true;
+}
+
+// ============================================================================
+// TEST 22: Window blocks sends when full
+// ============================================================================
+// Send INITIAL_CWND packets. can_send() should return false.
+// ACK one — can_send() returns true again.
+// ============================================================================
+
+static bool test_cc_window_blocks()
+{
+    congestion_control cc;
+    cc.reset();
+
+    for (uint32_t i = 0; i < INITIAL_CWND; ++i)
+    {
+        TEST_ASSERT(cc.can_send(), "should be able to send before window is full");
+        cc.on_packet_sent();
+    }
+
+    TEST_ASSERT(!cc.can_send(), "should NOT be able to send when window is full");
+    TEST_ASSERT(cc.in_flight() == INITIAL_CWND, "in_flight should equal cwnd");
+
+    // ACK one packet — opens a slot
+    cc.on_packet_acked();
+    TEST_ASSERT(cc.can_send(), "should be able to send after one ACK");
+
+    return true;
+}
+
+// ============================================================================
+// TEST 23: Slow start grows cwnd exponentially
+// ============================================================================
+// Each ACK during slow start increases cwnd by 1 (doubling per RTT).
+// ============================================================================
+
+static bool test_cc_slow_start_growth()
+{
+    congestion_control cc;
+    cc.reset();
+
+    uint32_t initial = cc.cwnd();
+
+    // Simulate sending and ACKing a full window
+    for (uint32_t i = 0; i < initial; ++i)
+        cc.on_packet_sent();
+    for (uint32_t i = 0; i < initial; ++i)
+        cc.on_packet_acked();
+
+    // cwnd should be initial + initial = 2 * initial (each ACK adds 1 in slow start)
+    TEST_ASSERT(cc.cwnd() == initial * 2, "cwnd should double after one RTT in slow start");
+    TEST_ASSERT(cc.in_slow_start(), "should still be in slow start (cwnd < ssthresh)");
+
+    return true;
+}
+
+// ============================================================================
+// TEST 24: Loss triggers multiplicative decrease
+// ============================================================================
+// After loss: ssthresh = cwnd/2, cwnd = ssthresh.
+// ============================================================================
+
+static bool test_cc_loss_decrease()
+{
+    congestion_control cc;
+    cc.reset();
+
+    // Grow cwnd to 16 via slow start
+    for (int round = 0; round < 2; ++round)
+    {
+        uint32_t w = cc.cwnd();
+        for (uint32_t i = 0; i < w; ++i)
+            cc.on_packet_sent();
+        for (uint32_t i = 0; i < w; ++i)
+            cc.on_packet_acked();
+    }
+    // initial=4 → 8 → 16
+    TEST_ASSERT(cc.cwnd() == 16, "cwnd should be 16 after two slow-start rounds");
+
+    // Simulate a packet in flight then lost
+    cc.on_packet_sent();
+    cc.on_packet_lost();
+
+    TEST_ASSERT(cc.ssthresh() == 8, "ssthresh should be cwnd/2 = 8");
+    TEST_ASSERT(cc.cwnd() == 8, "cwnd should drop to ssthresh");
+    TEST_ASSERT(!cc.in_slow_start(), "should NOT be in slow start (cwnd == ssthresh)");
+
+    return true;
+}
+
+// ============================================================================
+// TEST 25: Pacing interval calculation
+// ============================================================================
+// interval = srtt / cwnd. Verify the math.
+// ============================================================================
+
+static bool test_cc_pacing_interval()
+{
+    congestion_control cc;
+    cc.reset();
+
+    // Simulate srtt = 100ms = 100000 us, cwnd = 4
+    cc.update_pacing(100'000.0);
+
+    // Expected interval: 100000 / 4 = 25000 us
+    TEST_ASSERT(cc.pacing_interval_us() == 25'000, "pacing should be srtt/cwnd");
+
+    // Grow cwnd and recalculate
+    for (uint32_t i = 0; i < 4; ++i)
+        cc.on_packet_sent();
+    for (uint32_t i = 0; i < 4; ++i)
+        cc.on_packet_acked();
+    // cwnd is now 8 (slow start)
+    cc.update_pacing(100'000.0);
+
+    // Expected: 100000 / 8 = 12500 us
+    TEST_ASSERT(cc.pacing_interval_us() == 12'500, "pacing should decrease as cwnd grows");
+
+    return true;
+}
+
+// ============================================================================
+// TEST 26: Congestion control integrates with udp_connection
+// ============================================================================
+// Verify that prepare_header increments in_flight and ACKs decrement it.
+// ============================================================================
+
+static bool test_cc_connection_integration()
+{
+    udp_connection conn;
+    conn.reset();
+    conn.set_active(true);
+    conn.set_state(connection_state::CONNECTED);
+
+    TEST_ASSERT(conn.can_send(), "should be able to send initially");
+    auto ci = conn.congestion();
+    TEST_ASSERT(ci.in_flight == 0, "in_flight should be 0 initially");
+
+    // Send INITIAL_CWND packets
+    for (uint32_t i = 0; i < INITIAL_CWND; ++i)
+    {
+        packet_header hdr{};
+        hdr.flags = FLAG_RELIABLE;
+        hdr.payload_size = 10;
+        conn.prepare_header(hdr);
+    }
+
+    ci = conn.congestion();
+    TEST_ASSERT(ci.in_flight == INITIAL_CWND, "in_flight should equal INITIAL_CWND after sends");
+    TEST_ASSERT(!conn.can_send(), "should NOT be able to send when window is full");
+
+    // Simulate an ACK from remote that acks seq 1
+    packet_header ack_hdr{};
+    ack_hdr.magic = PROTOCOL_MAGIC;
+    ack_hdr.version = PROTOCOL_VERSION;
+    ack_hdr.flags = 0;
+    ack_hdr.sequence = 1;
+    ack_hdr.ack = 1;
+    ack_hdr.ack_bitmap = 0;
+    ack_hdr.payload_size = 0;
+    conn.process_incoming(ack_hdr);
+
+    ci = conn.congestion();
+    TEST_ASSERT(ci.in_flight == INITIAL_CWND - 1, "in_flight should decrease after ACK");
+    TEST_ASSERT(conn.can_send(), "should be able to send after ACK frees a slot");
+
+    return true;
+}
+
 int main()
 {
     platform_init();
@@ -1034,6 +1223,14 @@ int main()
     register_test("Server disconnect callback", test_server_disconnect_callback);
     register_test("Header integrity", test_header_integrity);
     register_test("Multiple clients independent", test_multiple_clients_independent);
+
+    // -- Congestion control --
+    register_test("CC initial state", test_cc_initial_state);
+    register_test("CC window blocks sends", test_cc_window_blocks);
+    register_test("CC slow start growth", test_cc_slow_start_growth);
+    register_test("CC loss multiplicative decrease", test_cc_loss_decrease);
+    register_test("CC pacing interval", test_cc_pacing_interval);
+    register_test("CC connection integration", test_cc_connection_integration);
 
     std::cout << "========================================" << std::endl;
     std::cout << " Entanglement Test Battery" << std::endl;

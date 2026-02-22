@@ -1,5 +1,6 @@
 #pragma once
 
+#include "congestion_control.h"
 #include "constants.h"
 #include "packet_header.h"
 #include <array>
@@ -121,6 +122,12 @@ namespace entanglement
         double rto_ms() const { return static_cast<double>(m_rto) / 1000.0; }
         uint32_t rtt_sample_count() const { return m_rtt_sample_count; }
 
+        // --- Congestion control ---
+
+        bool can_send() const { return m_cc.can_send(); }
+        congestion_info congestion() const { return m_cc.info(); }
+        congestion_control &cc() { return m_cc; }
+
     private:
         bool m_active = false;
         connection_state m_state = connection_state::DISCONNECTED;
@@ -144,6 +151,9 @@ namespace entanglement
         double m_rttvar = 0.0;          // RTT variance
         int64_t m_rto = INITIAL_RTO_US; // retransmission timeout
         uint32_t m_rtt_sample_count = 0;
+
+        // Congestion control algorithm instance
+        congestion_control m_cc;
 
         // Helper: mark a sent packet as acked (+ RTT sample)
         void ack_packet(uint64_t sequence);

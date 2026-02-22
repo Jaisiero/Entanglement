@@ -24,6 +24,12 @@ namespace entanglement
     constexpr int64_t MAX_RTO_US = 2'000'000;   // 2 s maximum RTO
     constexpr int MAX_LOSSES_PER_UPDATE = 16;   // max loss notifications per update() call
 
+    // --- Congestion control ---
+    constexpr uint32_t INITIAL_CWND = 4;      // conservative initial window (packets)
+    constexpr uint32_t MIN_CWND = 2;          // floor — never starve the connection
+    constexpr uint32_t INITIAL_SSTHRESH = 64; // switch slow-start → congestion avoidance
+    constexpr uint32_t MAX_CWND = 256;        // cap for gaming (low-latency priority)
+
     // --- Connection management ---
     constexpr int64_t HEARTBEAT_INTERVAL_US = 1'000'000;  // 1 s — send keepalive if idle
     constexpr int64_t CONNECTION_TIMEOUT_US = 10'000'000; // 10 s — disconnect if no recv

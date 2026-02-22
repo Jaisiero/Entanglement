@@ -1,5 +1,6 @@
 #pragma once
 
+#include "congestion_control.h"
 #include "udp_connection.h"
 #include "udp_socket.h"
 #include <atomic>
@@ -57,6 +58,10 @@ namespace entanglement
         void set_on_disconnected(on_disconnected callback);
 
         udp_connection &connection() { return m_connection; }
+
+        // Congestion control: application queries these to pace sends
+        bool can_send() const { return m_connection.can_send(); }
+        congestion_info congestion() const { return m_connection.congestion(); }
 
         void set_verbose(bool verbose) { m_verbose = verbose; }
         bool verbose() const { return m_verbose; }
