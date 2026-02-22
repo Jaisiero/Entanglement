@@ -8,8 +8,6 @@
 
 namespace entanglement {
 
-// Maximum UDP payload (typical safe MTU minus IP/UDP headers)
-constexpr size_t MAX_PACKET_SIZE = 1200;
 constexpr size_t MAX_PAYLOAD_SIZE = MAX_PACKET_SIZE - sizeof(packet_header);
 
 class udp_socket {
