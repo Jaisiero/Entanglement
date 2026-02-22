@@ -52,6 +52,15 @@ namespace entanglement
         uint16_t payload_size = 0;
     };
 
+    // --- Connection state ---
+
+    enum class connection_state : uint8_t
+    {
+        DISCONNECTED = 0,
+        CONNECTING,
+        CONNECTED,
+    };
+
     // --- Connection state per peer ---
 
     constexpr size_t SEQUENCE_BUFFER_SIZE = 1024;
@@ -88,6 +97,9 @@ namespace entanglement
         endpoint_key endpoint() const { return m_endpoint; }
         void set_endpoint(const endpoint_key &ep) { m_endpoint = ep; }
 
+        connection_state state() const { return m_state; }
+        void set_state(connection_state s) { m_state = s; }
+
         uint64_t local_sequence() const { return m_local_sequence; }
         uint64_t remote_sequence() const { return m_remote_sequence; }
 
@@ -99,6 +111,10 @@ namespace entanglement
         // Returns how many losses were detected.
         int collect_losses(std::chrono::steady_clock::time_point now, lost_packet_info *out, int max_count);
 
+        // Connection liveness
+        bool has_timed_out(std::chrono::steady_clock::time_point now) const;
+        bool needs_heartbeat(std::chrono::steady_clock::time_point now) const;
+
         // RTT queries (milliseconds)
         double srtt_ms() const { return m_srtt / 1000.0; }
         double rttvar_ms() const { return m_rttvar / 1000.0; }
@@ -107,7 +123,12 @@ namespace entanglement
 
     private:
         bool m_active = false;
+        connection_state m_state = connection_state::DISCONNECTED;
         endpoint_key m_endpoint{};
+
+        // Timestamps for heartbeat / timeout
+        std::chrono::steady_clock::time_point m_last_recv_time{};
+        std::chrono::steady_clock::time_point m_last_send_time{};
 
         // Sending: local sequence counter + buffer of sent packets
         uint64_t m_local_sequence = 1;

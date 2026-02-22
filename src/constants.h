@@ -24,4 +24,18 @@ namespace entanglement
     constexpr int64_t MAX_RTO_US = 2'000'000;   // 2 s maximum RTO
     constexpr int MAX_LOSSES_PER_UPDATE = 16;   // max loss notifications per update() call
 
+    // --- Connection management ---
+    constexpr int64_t HEARTBEAT_INTERVAL_US = 1'000'000; // 1 s — send keepalive if idle
+    constexpr int64_t CONNECTION_TIMEOUT_US = 10'000'000; // 10 s — disconnect if no recv
+
+    // --- Control packet types (first byte of FLAG_CONTROL payload) ---
+    enum control_type : uint8_t
+    {
+        CONTROL_CONNECTION_REQUEST = 0x01,
+        CONTROL_CONNECTION_ACCEPTED = 0x02,
+        CONTROL_CONNECTION_DENIED = 0x03,
+        CONTROL_DISCONNECT = 0x04,
+        CONTROL_HEARTBEAT = 0x05,
+    };
+
 } // namespace entanglement

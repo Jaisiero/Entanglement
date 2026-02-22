@@ -9,11 +9,17 @@ namespace entanglement
     void udp_connection::reset()
     {
         m_active = false;
+        m_state = connection_state::DISCONNECTED;
         m_endpoint = {};
         m_local_sequence = 1;
         m_remote_sequence = 0;
         m_recv_bitmap = 0;
         m_send_buffer.fill({});
+
+        // Reset timestamps
+        auto now = std::chrono::steady_clock::now();
+        m_last_recv_time = now;
+        m_last_send_time = now;
 
         // Reset RTT state
         m_rtt_initialized = false;
@@ -51,6 +57,7 @@ namespace entanglement
         entry.shard_id = header.shard_id;
         entry.payload_size = header.payload_size;
         entry.send_time = std::chrono::steady_clock::now();
+        m_last_send_time = entry.send_time;
     }
 
     // --- Receiving side ---
@@ -76,6 +83,9 @@ namespace entanglement
                 }
             }
         }
+
+        // Update receive timestamp
+        m_last_recv_time = std::chrono::steady_clock::now();
 
         // 2. Track this incoming sequence for our outgoing ACKs
         uint64_t seq = header.sequence;
@@ -207,6 +217,24 @@ namespace entanglement
         }
 
         return count;
+    }
+
+    // --- Connection liveness ---
+
+    bool udp_connection::has_timed_out(std::chrono::steady_clock::time_point now) const
+    {
+        if (m_state != connection_state::CONNECTED)
+            return false;
+        auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - m_last_recv_time).count();
+        return elapsed > CONNECTION_TIMEOUT_US;
+    }
+
+    bool udp_connection::needs_heartbeat(std::chrono::steady_clock::time_point now) const
+    {
+        if (m_state != connection_state::CONNECTED)
+            return false;
+        auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - m_last_send_time).count();
+        return elapsed > HEARTBEAT_INTERVAL_US;
     }
 
     // --- RTT estimation (RFC 6298 / Jacobson-Karels) ---

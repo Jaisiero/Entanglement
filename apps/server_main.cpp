@@ -13,7 +13,7 @@ int main()
         return 1;
     }
 
-    std::cout << "Entanglement Server v0.1.0" << std::endl;
+    std::cout << "Entanglement Server v0.2.0" << std::endl;
     std::cout << "Header size: " << sizeof(packet_header) << " bytes" << std::endl;
 
     constexpr uint16_t PORT = DEFAULT_PORT;
@@ -21,6 +21,15 @@ int main()
     server srv(PORT);
 
     int packet_count = 0;
+
+    srv.set_on_client_connected(
+        [](const endpoint_key & /*key*/, const std::string &addr, uint16_t port)
+        { std::cout << "[app] Client connected: " << addr << ":" << port << std::endl; });
+
+    srv.set_on_client_disconnected(
+        [](const endpoint_key & /*key*/, const std::string &addr, uint16_t port)
+        { std::cout << "[app] Client disconnected: " << addr << ":" << port << std::endl; });
+
     srv.set_on_packet_received(
         [&](const packet_header &hdr, const uint8_t *payload, size_t size, const std::string &addr, uint16_t port)
         {
@@ -54,6 +63,7 @@ int main()
     while (srv.is_running())
     {
         srv.poll();
+        srv.update();
     }
 
     std::cout << "[server] Total packets processed: " << packet_count << std::endl;

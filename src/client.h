@@ -9,9 +9,15 @@
 namespace entanglement
 {
 
-    // Callback invoked when a response packet is received from the server
+    // Callback: data packet received from server
     using on_response_received =
         std::function<void(const packet_header &header, const uint8_t *payload, size_t payload_size)>;
+
+    // Callback: reliable packet detected as lost
+    using on_packet_lost = std::function<void(const lost_packet_info &info)>;
+
+    // Callback: connection was lost (timeout or server kicked us)
+    using on_disconnected = std::function<void()>;
 
     class client
     {
@@ -23,35 +29,35 @@ namespace entanglement
         client(const client &) = delete;
         client &operator=(const client &) = delete;
 
-        // Initialize the client socket (binds to ephemeral port)
+        // Perform handshake with the server (blocking, ~5 s timeout with retries).
+        // Returns true if CONNECTION_ACCEPTED was received.
         bool connect();
+
+        // Send DISCONNECT and close the socket.
         void disconnect();
+
         bool is_connected() const { return m_connected.load(); }
 
-        // Send a packet to the server (header gets seq/ack filled automatically)
+        // Send a data packet (header gets seq/ack filled automatically)
         int send(packet_header &header, const void *payload = nullptr);
 
         // Send raw payload with auto-filled header fields
         int send_payload(const void *data, size_t size, uint8_t flags = 0, uint8_t channel_id = 0);
 
-        // Process incoming packets from the server (up to max_packets per call)
+        // Receive and dispatch incoming packets
         int poll(int max_packets = DEFAULT_MAX_POLL_PACKETS);
 
-        // Callback invoked for each reliable packet detected as lost.
-        // The application decides whether to resend (as a new packet via send()).
-        using on_packet_lost = std::function<void(const lost_packet_info &info)>;
-
-        // Detect timed-out reliable packets and notify via callback.
-        // Lost entries are deactivated — the app can resend as new packets.
+        // Check heartbeat/timeout and collect losses.
+        // Sends heartbeat if idle, triggers on_disconnected if timed out.
         // Returns the number of losses detected.
-        int update(on_packet_lost callback = nullptr);
+        int update(on_packet_lost loss_callback = nullptr);
 
-        // Set the response callback
+        // Callbacks
         void set_on_response(on_response_received callback);
+        void set_on_disconnected(on_disconnected callback);
 
         udp_connection &connection() { return m_connection; }
 
-        // Suppress internal cout messages (useful for multi-threaded tests)
         void set_verbose(bool verbose) { m_verbose = verbose; }
         bool verbose() const { return m_verbose; }
 
@@ -65,6 +71,13 @@ namespace entanglement
         std::atomic<bool> m_connected{false};
         bool m_verbose = true;
         on_response_received m_on_response;
+        on_disconnected m_on_disconnected;
+
+        // Send a control packet (FLAG_CONTROL + type byte)
+        void send_control(uint8_t control_type);
+
+        // Dispatch incoming control packet
+        void handle_control(uint8_t control_type);
     };
 
 } // namespace entanglement

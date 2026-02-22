@@ -31,13 +31,19 @@ namespace entanglement
 
         if (!m_socket.set_non_blocking(true))
         {
-            std::cerr << "[server] Failed to set non-blocking mode" << std::endl;
+            if (m_verbose)
+            {
+                std::cerr << "[server] Failed to set non-blocking mode" << std::endl;
+            }
             m_socket.close();
             return false;
         }
 
         m_running = true;
-        std::cout << "[server] Listening on " << m_bind_address << ":" << m_port << std::endl;
+        if (m_verbose)
+        {
+            std::cout << "[server] Listening on " << m_bind_address << ":" << m_port << std::endl;
+        }
         return true;
     }
 
@@ -48,8 +54,13 @@ namespace entanglement
         m_running = false;
         disconnect_all();
         m_socket.close();
-        std::cout << "[server] Stopped" << std::endl;
+        if (m_verbose)
+        {
+            std::cout << "[server] Stopped" << std::endl;
+        }
     }
+
+    // --- Packet processing ---
 
     int server::poll(int max_packets)
     {
@@ -68,24 +79,27 @@ namespace entanglement
             if (result <= 0)
                 break;
 
-            // Build endpoint key from the sender
             endpoint_key key{};
             inet_pton(AF_INET, sender_addr.c_str(), &key.address);
             key.port = sender_port;
 
-            // Find or create connection for this peer
-            udp_connection *conn = find_or_create(key);
-            if (!conn)
+            // Control packets are handled internally
+            if ((header.flags & FLAG_CONTROL) && header.payload_size >= 1)
             {
-                std::cerr << "[server] Connection pool full, dropping packet from " << sender_addr << ":" << sender_port
-                          << std::endl;
+                handle_control(key, header, payload[0], sender_addr, sender_port);
                 ++count;
                 continue;
             }
 
-            // Process seq/ack through the connection
-            bool is_new = conn->process_incoming(header);
+            // Data packets — only from connected peers
+            udp_connection *conn = find(key);
+            if (!conn || conn->state() != connection_state::CONNECTED)
+            {
+                ++count;
+                continue;
+            }
 
+            bool is_new = conn->process_incoming(header);
             if (is_new && m_on_packet_received)
             {
                 m_on_packet_received(header, payload, header.payload_size, sender_addr, sender_port);
@@ -96,26 +110,92 @@ namespace entanglement
         return count;
     }
 
+    int server::update()
+    {
+        if (!m_running)
+            return 0;
+
+        auto now = std::chrono::steady_clock::now();
+
+        // Fixed buffer for timed-out keys (can't modify m_index while iterating)
+        constexpr int MAX_TIMEOUTS = 32;
+        endpoint_key timed_out[MAX_TIMEOUTS];
+        int timeout_count = 0;
+        char addr_buf[16];
+
+        for (auto &[key, idx] : m_index)
+        {
+            auto &conn = (*m_pool)[idx];
+
+            if (conn.has_timed_out(now))
+            {
+                if (timeout_count < MAX_TIMEOUTS)
+                {
+                    timed_out[timeout_count++] = key;
+                }
+                continue;
+            }
+
+            if (conn.needs_heartbeat(now))
+            {
+                inet_ntop(AF_INET, &key.address, addr_buf, sizeof(addr_buf));
+                send_control_to(&conn, CONTROL_HEARTBEAT, addr_buf, key.port);
+            }
+        }
+
+        for (int i = 0; i < timeout_count; ++i)
+        {
+            inet_ntop(AF_INET, &timed_out[i].address, addr_buf, sizeof(addr_buf));
+            if (m_verbose)
+            {
+                std::cout << "[server] Client timed out: " << addr_buf << ":" << timed_out[i].port << std::endl;
+            }
+
+            if (m_on_client_disconnected)
+            {
+                m_on_client_disconnected(timed_out[i], addr_buf, timed_out[i].port);
+            }
+            disconnect_client(timed_out[i]);
+        }
+
+        return timeout_count;
+    }
+
+    // --- Callbacks ---
+
     void server::set_on_packet_received(on_packet_received callback)
     {
         m_on_packet_received = std::move(callback);
     }
 
+    void server::set_on_client_connected(on_client_connected callback)
+    {
+        m_on_client_connected = std::move(callback);
+    }
+
+    void server::set_on_client_disconnected(on_client_disconnected callback)
+    {
+        m_on_client_disconnected = std::move(callback);
+    }
+
+    // --- Sending ---
+
     int server::send_to(packet_header &header, const void *payload, const std::string &address, uint16_t port)
     {
-        // Find the connection to fill seq/ack
         endpoint_key key{};
         inet_pton(AF_INET, address.c_str(), &key.address);
         key.port = port;
 
         udp_connection *conn = find(key);
-        if (conn)
+        if (conn && conn->state() == connection_state::CONNECTED)
         {
             conn->prepare_header(header);
         }
 
         return m_socket.send_packet(header, payload, address, port);
     }
+
+    // --- Connection management ---
 
     void server::disconnect_client(const endpoint_key &key)
     {
@@ -138,14 +218,12 @@ namespace entanglement
 
     udp_connection *server::find_or_create(const endpoint_key &key)
     {
-        // Check existing
         auto it = m_index.find(key);
         if (it != m_index.end())
         {
             return &(*m_pool)[it->second];
         }
 
-        // Allocate new slot
         int slot = allocate_slot();
         if (slot < 0)
             return nullptr;
@@ -155,8 +233,6 @@ namespace entanglement
         conn.set_active(true);
         conn.set_endpoint(key);
         m_index[key] = static_cast<uint16_t>(slot);
-
-        std::cout << "[server] New connection (slot " << slot << "), total: " << m_index.size() << std::endl;
         return &conn;
     }
 
@@ -180,6 +256,109 @@ namespace entanglement
             }
         }
         return -1;
+    }
+
+    // --- Control packet handling ---
+
+    void server::handle_control(const endpoint_key &key, const packet_header &header, uint8_t control_type,
+                                const std::string &address, uint16_t port)
+    {
+        udp_connection *conn = find(key);
+
+        switch (control_type)
+        {
+        case CONTROL_CONNECTION_REQUEST:
+        {
+            if (conn)
+            {
+                // Already known — they missed our ACCEPTED; resend
+                conn->process_incoming(header);
+                send_control_to(conn, CONTROL_CONNECTION_ACCEPTED, address, port);
+                return;
+            }
+
+            // New connection
+            conn = find_or_create(key);
+            if (!conn)
+            {
+                // Pool full
+                send_raw_control(CONTROL_CONNECTION_DENIED, address, port);
+                if (m_verbose)
+                {
+                    std::cerr << "[server] Connection denied (pool full) to " << address << ":" << port << std::endl;
+                }
+                return;
+            }
+
+            conn->set_state(connection_state::CONNECTED);
+            conn->process_incoming(header);
+            send_control_to(conn, CONTROL_CONNECTION_ACCEPTED, address, port);
+
+            if (m_verbose)
+            {
+                std::cout << "[server] Client connected: " << address << ":" << port << " (slot " << m_index[key]
+                          << ", total: " << m_index.size() << ")" << std::endl;
+            }
+
+            if (m_on_client_connected)
+            {
+                m_on_client_connected(key, address, port);
+            }
+            break;
+        }
+
+        case CONTROL_DISCONNECT:
+        {
+            if (conn)
+            {
+                conn->process_incoming(header);
+
+                if (m_verbose)
+                {
+                    std::cout << "[server] Client disconnected: " << address << ":" << port << std::endl;
+                }
+
+                if (m_on_client_disconnected)
+                {
+                    m_on_client_disconnected(key, address, port);
+                }
+                disconnect_client(key);
+            }
+            break;
+        }
+
+        case CONTROL_HEARTBEAT:
+        {
+            if (conn)
+            {
+                conn->process_incoming(header);
+            }
+            break;
+        }
+        }
+    }
+
+    void server::send_control_to(udp_connection *conn, uint8_t control_type,
+                                 const std::string &address, uint16_t port)
+    {
+        packet_header header{};
+        header.flags = FLAG_CONTROL;
+        header.payload_size = 1;
+        conn->prepare_header(header);
+        m_socket.send_packet(header, &control_type, address, port);
+    }
+
+    void server::send_raw_control(uint8_t control_type, const std::string &address, uint16_t port)
+    {
+        packet_header header{};
+        header.magic = PROTOCOL_MAGIC;
+        header.version = PROTOCOL_VERSION;
+        header.flags = FLAG_CONTROL;
+        header.sequence = 0;
+        header.ack = 0;
+        header.ack_bitmap = 0;
+        header.payload_size = 1;
+        m_socket.send_packet(header, &control_type, address, port);
     }
 
 } // namespace entanglement
