@@ -57,7 +57,7 @@ int client::send_payload(const void* data, size_t size, uint8_t flags,
     return send(header, data);
 }
 
-int client::poll() {
+int client::poll(int max_packets) {
     if (!m_connected) return 0;
 
     int count = 0;
@@ -66,7 +66,7 @@ int client::poll() {
     std::string sender_addr;
     uint16_t sender_port = 0;
 
-    while (true) {
+    while (count < max_packets) {
         int result = m_socket.recv_packet(header, payload, MAX_PAYLOAD_SIZE,
                                           sender_addr, sender_port);
         if (result <= 0) break;

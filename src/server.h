@@ -30,8 +30,8 @@ public:
     bool is_running() const { return m_running.load(); }
 
     // Process pending packets (call from your game loop or a dedicated thread)
-    // Returns the number of packets processed
-    int poll();
+    // Returns the number of packets processed (up to max_packets per call)
+    int poll(int max_packets = DEFAULT_MAX_POLL_PACKETS);
 
     // Set the packet received callback
     void set_on_packet_received(on_packet_received callback);

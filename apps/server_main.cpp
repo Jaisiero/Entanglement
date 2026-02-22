@@ -14,7 +14,7 @@ int main() {
     std::cout << "Entanglement Server v0.1.0" << std::endl;
     std::cout << "Header size: " << sizeof(packet_header) << " bytes" << std::endl;
 
-    constexpr uint16_t PORT = 9876;
+    constexpr uint16_t PORT = DEFAULT_PORT;
 
     server srv(PORT);
     srv.set_on_packet_received([&](const packet_header& hdr, const uint8_t* payload,

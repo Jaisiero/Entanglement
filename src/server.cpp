@@ -33,7 +33,7 @@ void server::stop() {
     std::cout << "[server] Stopped" << std::endl;
 }
 
-int server::poll() {
+int server::poll(int max_packets) {
     if (!m_running) return 0;
 
     int count = 0;
@@ -42,8 +42,7 @@ int server::poll() {
     std::string sender_addr;
     uint16_t sender_port = 0;
 
-    // Drain all pending packets
-    while (true) {
+    while (count < max_packets) {
         int result = m_socket.recv_packet(header, payload, MAX_PAYLOAD_SIZE,
                                           sender_addr, sender_port);
         if (result <= 0) break;

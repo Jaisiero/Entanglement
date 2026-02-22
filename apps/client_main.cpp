@@ -15,7 +15,7 @@ int main() {
     std::cout << "Entanglement Client v0.1.0" << std::endl;
     std::cout << "Header size: " << sizeof(packet_header) << " bytes" << std::endl;
 
-    constexpr uint16_t PORT = 9876;
+    constexpr uint16_t PORT = DEFAULT_PORT;
 
     client cli("127.0.0.1", PORT);
     cli.set_on_response([](const packet_header& hdr, const uint8_t* payload, size_t size) {

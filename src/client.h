@@ -35,8 +35,8 @@ public:
     int send_payload(const void* data, size_t size, uint8_t flags = 0,
                      uint8_t channel_id = 0);
 
-    // Process incoming packets from the server
-    int poll();
+    // Process incoming packets from the server (up to max_packets per call)
+    int poll(int max_packets = DEFAULT_MAX_POLL_PACKETS);
 
     // Set the response callback
     void set_on_response(on_response_received callback);

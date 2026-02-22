@@ -1,11 +1,8 @@
 #pragma once
 
-#include <cstdint>
+#include "constants.h"
 
 namespace entanglement {
-
-constexpr uint16_t PROTOCOL_MAGIC   = 0xE7A9;
-constexpr uint8_t  PROTOCOL_VERSION = 1;
 
 enum packet_flags : uint8_t {
     FLAG_NONE        = 0,
