@@ -46,7 +46,7 @@ namespace entanglement
         setsockopt(m_socket, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char *>(&opt), sizeof(opt));
 
         // Increase receive buffer for high-throughput scenarios
-        int rcvbuf = 256 * 1024; // 256 KB
+        int rcvbuf = SOCKET_RECV_BUFFER_SIZE;
         setsockopt(m_socket, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char *>(&rcvbuf), sizeof(rcvbuf));
 
         sockaddr_in addr{};

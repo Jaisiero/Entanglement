@@ -1,5 +1,6 @@
 #pragma once
 
+#include "channel_manager.h"
 #include "udp_connection.h"
 #include "udp_socket.h"
 #include <array>
@@ -65,12 +66,17 @@ namespace entanglement
         void set_verbose(bool verbose) { m_verbose = verbose; }
         bool verbose() const { return m_verbose; }
 
+        // Channel configuration
+        channel_manager &channels() { return m_channels; }
+        const channel_manager &channels() const { return m_channels; }
+
     private:
         udp_socket m_socket;
         uint16_t m_port;
         std::string m_bind_address;
         std::atomic<bool> m_running{false};
         bool m_verbose = true;
+        channel_manager m_channels;
         on_packet_received m_on_packet_received;
         on_client_connected m_on_client_connected;
         on_client_disconnected m_on_client_disconnected;

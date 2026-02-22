@@ -39,7 +39,7 @@ namespace entanglement
         return m_local_sequence++;
     }
 
-    void udp_connection::prepare_header(packet_header &header)
+    void udp_connection::prepare_header(packet_header &header, bool reliable)
     {
         header.magic = PROTOCOL_MAGIC;
         header.version = PROTOCOL_VERSION;
@@ -55,6 +55,7 @@ namespace entanglement
         entry.sequence = seq;
         entry.acked = false;
         entry.active = true;
+        entry.reliable = reliable;
         entry.flags = header.flags;
         entry.channel_id = header.channel_id;
         entry.shard_id = header.shard_id;
@@ -77,7 +78,7 @@ namespace entanglement
             ack_packet(header.ack);
 
             // Process bitmap: bit N = ack - (N+1)
-            for (int i = 0; i < 32; ++i)
+            for (int i = 0; i < ACK_BITMAP_WIDTH; ++i)
             {
                 if (header.ack_bitmap & (1u << i))
                 {
@@ -112,7 +113,7 @@ namespace entanglement
             // New highest sequence: shift bitmap
             uint64_t shift = seq - m_remote_sequence;
 
-            if (shift <= 32)
+            if (shift <= ACK_BITMAP_WIDTH)
             {
                 m_recv_bitmap <<= shift;
                 // The old m_remote_sequence becomes bit (shift-1)
@@ -172,7 +173,7 @@ namespace entanglement
         }
 
         uint64_t diff = m_remote_sequence - sequence;
-        if (diff > 0 && diff <= 32)
+        if (diff > 0 && diff <= ACK_BITMAP_WIDTH)
         {
             return (m_recv_bitmap & (1u << (diff - 1))) != 0;
         }
@@ -184,7 +185,7 @@ namespace entanglement
     void udp_connection::record_received(uint64_t sequence)
     {
         uint64_t diff = m_remote_sequence - sequence;
-        if (diff > 0 && diff <= 32)
+        if (diff > 0 && diff <= ACK_BITMAP_WIDTH)
         {
             m_recv_bitmap |= (1u << (diff - 1));
         }
@@ -206,7 +207,7 @@ namespace entanglement
 
             if (!entry.active || entry.acked || entry.sequence != seq)
                 continue;
-            if (!(entry.flags & FLAG_RELIABLE))
+            if (!entry.reliable)
                 continue;
 
             auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - entry.send_time);
@@ -269,16 +270,14 @@ namespace entanglement
         {
             // RTTVAR = (1 - beta) * RTTVAR + beta * |SRTT - R|  (beta = 1/4)
             // SRTT   = (1 - alpha) * SRTT  + alpha * R          (alpha = 1/8)
-            constexpr double alpha = 0.125;
-            constexpr double beta = 0.25;
-
             double diff = std::abs(m_srtt - sample);
-            m_rttvar = (1.0 - beta) * m_rttvar + beta * diff;
-            m_srtt = (1.0 - alpha) * m_srtt + alpha * sample;
+            m_rttvar = (1.0 - RTT_BETA) * m_rttvar + RTT_BETA * diff;
+            m_srtt = (1.0 - RTT_ALPHA) * m_srtt + RTT_ALPHA * sample;
         }
 
-        // RTO = SRTT + max(G, 4 * RTTVAR), G = clock granularity (1 ms = 1000 us)
-        m_rto = static_cast<int64_t>(m_srtt + std::max(1000.0, 4.0 * m_rttvar));
+        // RTO = SRTT + max(G, K * RTTVAR)
+        m_rto = static_cast<int64_t>(
+            m_srtt + std::max(static_cast<double>(CLOCK_GRANULARITY_US), RTT_VARIANCE_MULTIPLIER * m_rttvar));
         m_rto = std::clamp(m_rto, MIN_RTO_US, MAX_RTO_US);
     }
 

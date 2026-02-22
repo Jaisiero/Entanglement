@@ -1,3 +1,4 @@
+#include "channel_manager.h"
 #include "client.h"
 #include "packet_header.h"
 #include "platform.h"
@@ -42,6 +43,9 @@ static client_stats run_client(int id, const char *server_ip, uint16_t port, int
 
     client cli(server_ip, port);
     cli.set_verbose(false); // Suppress internal cout — we print under mutex
+
+    // Register default gaming channels
+    cli.channels().register_defaults();
 
     std::atomic<int> responses{0};
 
@@ -128,7 +132,7 @@ static client_stats run_client(int id, const char *server_ip, uint16_t port, int
         const auto &msg = messages[sent];
 
         packet_header hdr{};
-        hdr.flags = FLAG_RELIABLE;
+        hdr.channel_id = channels::RELIABLE.id; // Use the reliable channel
         hdr.payload_size = static_cast<uint16_t>(msg.size());
         cli.send(hdr, msg.data());
 

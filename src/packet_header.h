@@ -8,14 +8,13 @@ namespace entanglement
     enum packet_flags : uint8_t
     {
         FLAG_NONE = 0,
-        FLAG_RELIABLE = 1 << 0,    // Guaranteed delivery via retransmission
-        FLAG_FRAGMENT = 1 << 1,    // Fragmented packet (part of a larger message)
-        FLAG_HAS_ACK = 1 << 2,     // Packet carries acknowledgment data
-        FLAG_CONTROL = 1 << 3,     // Control packet (handshake, disconnect, heartbeat)
-        FLAG_ORDERED = 1 << 4,     // Ordered delivery within channel
-        FLAG_PRIORITY = 1 << 5,    // High priority (physics, combat)
-        FLAG_COMPRESSED = 1 << 6,  // Payload is compressed
-        FLAG_SHARD_RELAY = 1 << 7, // Cross-shard relay (halo region forwarding)
+        FLAG_FRAGMENT = 1 << 0,    // Fragmented packet (part of a larger message)
+        FLAG_CONTROL = 1 << 1,     // Control packet (handshake, disconnect, heartbeat)
+        FLAG_COMPRESSED = 1 << 2,  // Payload is compressed
+        FLAG_SHARD_RELAY = 1 << 3, // Cross-shard relay (halo region forwarding)
+        // Bits 4–7 reserved for future use.
+        // Reliability, ordering, and priority are determined by channel_config,
+        // not by per-packet flags.
     };
 
 #pragma pack(push, 1)

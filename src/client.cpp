@@ -38,12 +38,11 @@ namespace entanglement
         // Handshake: send CONNECTION_REQUEST, wait for ACCEPTED with retries
         send_control(CONTROL_CONNECTION_REQUEST);
 
-        constexpr int MAX_ATTEMPTS = 10;
-        constexpr auto RETRY_INTERVAL = std::chrono::milliseconds(500);
+        auto retry_interval = std::chrono::milliseconds(HANDSHAKE_RETRY_INTERVAL_MS);
         auto last_attempt = std::chrono::steady_clock::now();
         int attempt = 0;
 
-        while (attempt < MAX_ATTEMPTS)
+        while (attempt < HANDSHAKE_MAX_ATTEMPTS)
         {
             poll();
 
@@ -67,12 +66,13 @@ namespace entanglement
             }
 
             auto now = std::chrono::steady_clock::now();
-            if (now - last_attempt >= RETRY_INTERVAL)
+            if (now - last_attempt >= retry_interval)
             {
                 ++attempt;
                 if (m_verbose && attempt > 1)
                 {
-                    std::cout << "[client] Retrying connection (" << attempt << "/" << MAX_ATTEMPTS << ")" << std::endl;
+                    std::cout << "[client] Retrying connection (" << attempt << "/" << HANDSHAKE_MAX_ATTEMPTS << ")"
+                              << std::endl;
                 }
                 send_control(CONTROL_CONNECTION_REQUEST);
                 last_attempt = now;
@@ -113,7 +113,8 @@ namespace entanglement
 
     int client::send(packet_header &header, const void *payload)
     {
-        m_connection.prepare_header(header);
+        bool reliable = m_channels.is_reliable(header.channel_id);
+        m_connection.prepare_header(header, reliable);
         return m_socket.send_packet(header, payload, m_server_address, m_server_port);
     }
 
@@ -227,8 +228,11 @@ namespace entanglement
     {
         packet_header header{};
         header.flags = FLAG_CONTROL;
+        header.channel_id = channels::CONTROL.id;
         header.payload_size = 1;
-        send(header, &control_type);
+        // Control channel is always reliable
+        m_connection.prepare_header(header, true);
+        m_socket.send_packet(header, &control_type, m_server_address, m_server_port);
     }
 
     void client::handle_control(uint8_t control_type)

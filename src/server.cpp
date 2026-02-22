@@ -118,8 +118,7 @@ namespace entanglement
         auto now = std::chrono::steady_clock::now();
 
         // Fixed buffer for timed-out keys (can't modify m_index while iterating)
-        constexpr int MAX_TIMEOUTS = 32;
-        endpoint_key timed_out[MAX_TIMEOUTS];
+        endpoint_key timed_out[MAX_TIMEOUTS_PER_UPDATE];
         int timeout_count = 0;
         char addr_buf[16];
 
@@ -129,7 +128,7 @@ namespace entanglement
 
             if (conn.has_timed_out(now))
             {
-                if (timeout_count < MAX_TIMEOUTS)
+                if (timeout_count < MAX_TIMEOUTS_PER_UPDATE)
                 {
                     timed_out[timeout_count++] = key;
                 }
@@ -189,7 +188,8 @@ namespace entanglement
         udp_connection *conn = find(key);
         if (conn && conn->state() == connection_state::CONNECTED)
         {
-            conn->prepare_header(header);
+            bool reliable = m_channels.is_reliable(header.channel_id);
+            conn->prepare_header(header, reliable);
         }
 
         return m_socket.send_packet(header, payload, address, port);
@@ -343,8 +343,10 @@ namespace entanglement
     {
         packet_header header{};
         header.flags = FLAG_CONTROL;
+        header.channel_id = channels::CONTROL.id;
         header.payload_size = 1;
-        conn->prepare_header(header);
+        // Control channel is always reliable
+        conn->prepare_header(header, true);
         m_socket.send_packet(header, &control_type, address, port);
     }
 

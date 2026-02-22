@@ -5,6 +5,7 @@
 // sending without a connection, double connect, timeout, etc.
 // ============================================================================
 
+#include "channel_manager.h"
 #include "client.h"
 #include "congestion_control.h"
 #include "server.h"
@@ -139,7 +140,7 @@ static bool test_send_before_connect()
     c.set_verbose(false);
 
     // Socket not bound — send should fail
-    int result = c.send_payload("hello", 5, FLAG_RELIABLE);
+    int result = c.send_payload("hello", 5, 0, channels::RELIABLE.id);
     TEST_ASSERT(result <= 0, "send_payload should fail when not connected");
 
     // Also try poll/update — should not crash
@@ -611,13 +612,13 @@ static bool test_loss_detection()
     conn.set_active(true);
     conn.set_state(connection_state::CONNECTED);
 
-    // Send 5 reliable packets
+    // Send 5 reliable packets (via channel mode)
     for (int i = 0; i < 5; ++i)
     {
         packet_header hdr{};
-        hdr.flags = FLAG_RELIABLE;
+        hdr.channel_id = 10; // We'll register a reliable channel with id 10
         hdr.payload_size = 10;
-        conn.prepare_header(hdr);
+        conn.prepare_header(hdr, true); // reliable = true
     }
 
     // Verify no losses immediately
@@ -634,7 +635,7 @@ static bool test_loss_detection()
     // Verify loss metadata
     for (int i = 0; i < count; ++i)
     {
-        TEST_ASSERT(lost[i].flags == FLAG_RELIABLE, "lost packet should have RELIABLE flag");
+        TEST_ASSERT(lost[i].channel_id == 10, "lost packet should have correct channel_id");
         TEST_ASSERT(lost[i].payload_size == 10, "lost packet should report correct payload_size");
     }
 
@@ -648,7 +649,7 @@ static bool test_loss_detection()
 // ============================================================================
 // TEST 14: Non-reliable packets are not tracked for loss
 // ============================================================================
-// Packets without FLAG_RELIABLE must not appear in collect_losses.
+// Packets on unreliable channels must not appear in collect_losses.
 // ============================================================================
 
 static bool test_unreliable_no_loss_tracking()
@@ -658,13 +659,13 @@ static bool test_unreliable_no_loss_tracking()
     conn.set_active(true);
     conn.set_state(connection_state::CONNECTED);
 
-    // Send 5 unreliable packets
+    // Send 5 unreliable packets (reliable = false)
     for (int i = 0; i < 5; ++i)
     {
         packet_header hdr{};
         hdr.flags = FLAG_NONE;
         hdr.payload_size = 10;
-        conn.prepare_header(hdr);
+        conn.prepare_header(hdr, false); // unreliable
     }
 
     // Jump beyond RTO
@@ -905,7 +906,7 @@ static bool test_header_integrity()
     conn.set_state(connection_state::CONNECTED);
 
     packet_header hdr{};
-    hdr.flags = FLAG_RELIABLE | FLAG_PRIORITY;
+    hdr.flags = FLAG_COMPRESSED; // Test a remaining valid flag
     hdr.shard_id = 42;
     hdr.channel_id = 7;
     hdr.payload_size = 100;
@@ -915,7 +916,7 @@ static bool test_header_integrity()
     TEST_ASSERT(hdr.magic == PROTOCOL_MAGIC, "magic should be set");
     TEST_ASSERT(hdr.version == PROTOCOL_VERSION, "version should be set");
     TEST_ASSERT(hdr.sequence == 1, "first sequence should be 1");
-    TEST_ASSERT(hdr.flags == (FLAG_RELIABLE | FLAG_PRIORITY), "flags should be preserved");
+    TEST_ASSERT(hdr.flags == FLAG_COMPRESSED, "flags should be preserved");
     TEST_ASSERT(hdr.shard_id == 42, "shard_id should be preserved");
     TEST_ASSERT(hdr.channel_id == 7, "channel_id should be preserved");
     TEST_ASSERT(hdr.payload_size == 100, "payload_size should be preserved");
@@ -1165,13 +1166,12 @@ static bool test_cc_connection_integration()
     auto ci = conn.congestion();
     TEST_ASSERT(ci.in_flight == 0, "in_flight should be 0 initially");
 
-    // Send INITIAL_CWND packets
+    // Send INITIAL_CWND packets (reliable via param)
     for (uint32_t i = 0; i < INITIAL_CWND; ++i)
     {
         packet_header hdr{};
-        hdr.flags = FLAG_RELIABLE;
         hdr.payload_size = 10;
-        conn.prepare_header(hdr);
+        conn.prepare_header(hdr, true); // reliable
     }
 
     ci = conn.congestion();
@@ -1192,6 +1192,365 @@ static bool test_cc_connection_integration()
     ci = conn.congestion();
     TEST_ASSERT(ci.in_flight == INITIAL_CWND - 1, "in_flight should decrease after ACK");
     TEST_ASSERT(conn.can_send(), "should be able to send after ACK frees a slot");
+
+    return true;
+}
+
+// ============================================================================
+// TEST 27: Channel registration and lookup
+// ============================================================================
+// Verify register, get, and mode queries on channel_manager.
+// ============================================================================
+
+static bool test_channel_registration()
+{
+    channel_manager cm;
+
+    TEST_ASSERT(cm.channel_count() == 0, "initially 0 channels");
+
+    // Register a reliable channel
+    channel_config cfg{10, channel_mode::RELIABLE, 200, "test_reliable"};
+    TEST_ASSERT(cm.register_channel(cfg), "should register successfully");
+    TEST_ASSERT(cm.channel_count() == 1, "should have 1 channel");
+    TEST_ASSERT(cm.is_registered(10), "channel 10 should be registered");
+    TEST_ASSERT(cm.is_reliable(10), "channel 10 should be reliable");
+    TEST_ASSERT(!cm.is_ordered(10), "channel 10 should NOT be ordered");
+    TEST_ASSERT(cm.priority(10) == 200, "channel 10 priority should be 200");
+
+    // Duplicate registration should fail
+    TEST_ASSERT(!cm.register_channel(cfg), "duplicate registration should fail");
+
+    // Unregistered channel queries
+    TEST_ASSERT(!cm.is_registered(99), "channel 99 should not be registered");
+    TEST_ASSERT(!cm.is_reliable(99), "unregistered channel should not be reliable");
+    TEST_ASSERT(cm.priority(99) == 0, "unregistered channel priority should be 0");
+    TEST_ASSERT(cm.get_channel(99) == nullptr, "get_channel should return nullptr for unregistered");
+
+    // Unregister
+    TEST_ASSERT(cm.unregister_channel(10), "should unregister successfully");
+    TEST_ASSERT(cm.channel_count() == 0, "should have 0 channels after unregister");
+    TEST_ASSERT(!cm.is_registered(10), "channel 10 should no longer be registered");
+
+    return true;
+}
+
+// ============================================================================
+// TEST 28: Channel mode queries (all three modes)
+// ============================================================================
+// Register one channel of each mode and verify queries.
+// ============================================================================
+
+static bool test_channel_modes()
+{
+    channel_manager cm;
+
+    cm.register_channel({0, channel_mode::UNRELIABLE, 10, "unreliable"});
+    cm.register_channel({1, channel_mode::RELIABLE, 100, "reliable"});
+    cm.register_channel({2, channel_mode::RELIABLE_ORDERED, 200, "ordered"});
+
+    // UNRELIABLE
+    TEST_ASSERT(!cm.is_reliable(0), "UNRELIABLE channel should not be reliable");
+    TEST_ASSERT(!cm.is_ordered(0), "UNRELIABLE channel should not be ordered");
+
+    // RELIABLE
+    TEST_ASSERT(cm.is_reliable(1), "RELIABLE channel should be reliable");
+    TEST_ASSERT(!cm.is_ordered(1), "RELIABLE channel should not be ordered");
+
+    // RELIABLE_ORDERED
+    TEST_ASSERT(cm.is_reliable(2), "RELIABLE_ORDERED channel should be reliable");
+    TEST_ASSERT(cm.is_ordered(2), "RELIABLE_ORDERED channel should be ordered");
+
+    return true;
+}
+
+// ============================================================================
+// TEST 29: Default channel presets
+// ============================================================================
+// Verify register_defaults() populates all 6 gaming presets.
+// ============================================================================
+
+static bool test_channel_defaults()
+{
+    channel_manager cm;
+    cm.register_defaults();
+
+    TEST_ASSERT(cm.channel_count() == 4, "should have 4 default channels");
+
+    // CONTROL — reliable ordered, priority 255
+    auto *ctrl = cm.get_channel(channels::CONTROL.id);
+    TEST_ASSERT(ctrl != nullptr, "CONTROL channel should exist");
+    TEST_ASSERT(ctrl->mode == channel_mode::RELIABLE_ORDERED, "CONTROL should be RELIABLE_ORDERED");
+    TEST_ASSERT(ctrl->priority == 255, "CONTROL priority should be 255");
+
+    // UNRELIABLE — unreliable, priority 64
+    TEST_ASSERT(!cm.is_reliable(channels::UNRELIABLE.id), "UNRELIABLE should be unreliable");
+    TEST_ASSERT(cm.priority(channels::UNRELIABLE.id) == 64, "UNRELIABLE priority should be 64");
+
+    // RELIABLE — reliable, priority 128
+    TEST_ASSERT(cm.is_reliable(channels::RELIABLE.id), "RELIABLE should be reliable");
+    TEST_ASSERT(!cm.is_ordered(channels::RELIABLE.id), "RELIABLE should NOT be ordered");
+    TEST_ASSERT(cm.priority(channels::RELIABLE.id) == 128, "RELIABLE priority should be 128");
+
+    // ORDERED — reliable ordered, priority 128
+    TEST_ASSERT(cm.is_ordered(channels::ORDERED.id), "ORDERED should be ordered");
+    TEST_ASSERT(cm.priority(channels::ORDERED.id) == 128, "ORDERED priority should be 128");
+
+    return true;
+}
+
+// ============================================================================
+// TEST 30: Channel-based loss detection
+// ============================================================================
+// Packets on a reliable channel should trigger loss detection.
+// Packets on an unreliable channel should NOT.
+// ============================================================================
+
+static bool test_channel_loss_detection()
+{
+    udp_connection conn;
+    conn.reset();
+    conn.set_active(true);
+    conn.set_state(connection_state::CONNECTED);
+
+    // Send 3 reliable packets (reliable = true)
+    for (int i = 0; i < 3; ++i)
+    {
+        packet_header hdr{};
+        hdr.channel_id = 10;
+        hdr.payload_size = 20;
+        conn.prepare_header(hdr, true);
+    }
+
+    // Send 3 unreliable packets (reliable = false)
+    for (int i = 0; i < 3; ++i)
+    {
+        packet_header hdr{};
+        hdr.channel_id = 20;
+        hdr.payload_size = 15;
+        conn.prepare_header(hdr, false);
+    }
+
+    // Jump beyond RTO
+    lost_packet_info lost[16];
+    auto future = std::chrono::steady_clock::now() + std::chrono::microseconds(INITIAL_RTO_US + 100'000);
+    int count = conn.collect_losses(future, lost, 16);
+
+    // Only the 3 reliable packets should appear
+    TEST_ASSERT(count == 3, "only reliable packets should trigger loss detection");
+    for (int i = 0; i < count; ++i)
+    {
+        TEST_ASSERT(lost[i].channel_id == 10, "lost packets should be from reliable channel");
+        TEST_ASSERT(lost[i].payload_size == 20, "lost packets should have correct payload_size");
+    }
+
+    return true;
+}
+
+// ============================================================================
+// TEST 31: Client + server channel integration
+// ============================================================================
+// Both sides register channels. Client sends on a reliable channel,
+// server echoes back. Verify end-to-end works with channel system.
+// ============================================================================
+
+static bool test_channel_echo_integration()
+{
+    server srv(9920);
+    srv.channels().register_defaults();
+    std::atomic<bool> stop_flag{false};
+
+    srv.set_on_packet_received(
+        [&](const packet_header &header, const uint8_t *payload, size_t payload_size, const std::string &addr,
+            uint16_t port)
+        {
+            // Echo back on the same channel
+            packet_header resp{};
+            resp.channel_id = header.channel_id;
+            resp.payload_size = static_cast<uint16_t>(payload_size);
+            srv.send_to(resp, payload, addr, port);
+        });
+
+    TEST_ASSERT(srv.start(), "server should start");
+
+    std::thread server_thread(
+        [&]()
+        {
+            while (!stop_flag.load())
+            {
+                srv.poll();
+                srv.update();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+
+    client c("127.0.0.1", 9920);
+    c.set_verbose(false);
+    c.channels().register_defaults();
+
+    std::atomic<int> responses{0};
+    std::string last_response;
+    c.set_on_response(
+        [&](const packet_header &hdr, const uint8_t *payload, size_t size)
+        {
+            last_response = std::string(reinterpret_cast<const char *>(payload), size);
+            responses++;
+        });
+
+    TEST_ASSERT(c.connect(), "client should connect");
+
+    // Send on RELIABLE channel
+    const char *msg = "ATTACK";
+    c.send_payload(msg, 6, 0, channels::RELIABLE.id);
+
+    // Wait for echo
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (responses.load() == 0 && std::chrono::steady_clock::now() < deadline)
+    {
+        c.poll();
+        c.update(nullptr);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    TEST_ASSERT(responses.load() >= 1, "should have received echo");
+    TEST_ASSERT(last_response == "ATTACK", "echo should match sent message");
+
+    c.disconnect();
+    stop_flag = true;
+    server_thread.join();
+    srv.stop();
+
+    return true;
+}
+
+// ============================================================================
+// TEST 32: Unreliable channel (MOVEMENT) does not track loss
+// ============================================================================
+// Client sends on MOVEMENT (unreliable). Even without ACK, no loss reported.
+// ============================================================================
+
+static bool test_channel_unreliable_no_loss()
+{
+    udp_connection conn;
+    conn.reset();
+    conn.set_active(true);
+    conn.set_state(connection_state::CONNECTED);
+
+    channel_manager cm;
+    cm.register_defaults();
+
+    // Send on UNRELIABLE channel
+    for (int i = 0; i < 5; ++i)
+    {
+        packet_header hdr{};
+        hdr.channel_id = channels::UNRELIABLE.id;
+        hdr.payload_size = 30;
+        bool reliable = cm.is_reliable(channels::UNRELIABLE.id);
+        conn.prepare_header(hdr, reliable);
+    }
+
+    // Jump beyond RTO
+    lost_packet_info lost[16];
+    auto future = std::chrono::steady_clock::now() + std::chrono::microseconds(INITIAL_RTO_US + 100'000);
+    int count = conn.collect_losses(future, lost, 16);
+    TEST_ASSERT(count == 0, "unreliable channel packets should not trigger loss");
+
+    return true;
+}
+
+// ============================================================================
+// TEST 33: open_channel assigns IDs automatically
+// ============================================================================
+
+static bool test_open_channel()
+{
+    channel_manager cm;
+    cm.register_defaults(); // occupies ids 0-3
+
+    // First open — should get id 4 (default hint=4)
+    int id1 = cm.open_channel(channel_mode::RELIABLE, 180, "combat");
+    TEST_ASSERT(id1 == 4, "first open_channel should get id 4");
+    TEST_ASSERT(cm.is_registered(4), "channel 4 should be registered");
+    TEST_ASSERT(cm.is_reliable(4), "channel 4 should be reliable");
+    TEST_ASSERT(!cm.is_ordered(4), "channel 4 should not be ordered");
+    TEST_ASSERT(cm.priority(4) == 180, "channel 4 priority should be 180");
+    TEST_ASSERT(cm.channel_count() == 5, "should have 5 channels after open");
+
+    // Second open — should get id 5
+    int id2 = cm.open_channel(channel_mode::UNRELIABLE, 50, "physics");
+    TEST_ASSERT(id2 == 5, "second open_channel should get id 5");
+
+    // Open with explicit hint
+    int id3 = cm.open_channel(channel_mode::RELIABLE_ORDERED, 200, "chat", 100);
+    TEST_ASSERT(id3 == 100, "open_channel with hint=100 should get id 100");
+    TEST_ASSERT(cm.is_ordered(100), "channel 100 should be ordered");
+
+    // Unregister and reopen — slot reuse
+    TEST_ASSERT(cm.unregister_channel(4), "should unregister channel 4");
+    int id4 = cm.open_channel(channel_mode::UNRELIABLE, 10, "reuse", 4);
+    TEST_ASSERT(id4 == 4, "reopened slot should get id 4 again");
+
+    return true;
+}
+
+// ============================================================================
+// TEST 34: unregistered channel defaults to unreliable
+// ============================================================================
+
+static bool test_unregistered_channel_is_unreliable()
+{
+    channel_manager cm;
+    cm.register_defaults();
+
+    TEST_ASSERT(!cm.is_registered(200), "channel 200 should not be registered");
+    TEST_ASSERT(!cm.is_reliable(200), "unregistered channel should not be reliable");
+    TEST_ASSERT(!cm.is_ordered(200), "unregistered channel should not be ordered");
+
+    // Packets sent on unregistered channel — no loss detection
+    udp_connection conn;
+    conn.reset();
+    conn.set_active(true);
+    conn.set_state(connection_state::CONNECTED);
+
+    for (int i = 0; i < 3; ++i)
+    {
+        packet_header hdr{};
+        hdr.channel_id = 200;
+        hdr.payload_size = 10;
+        conn.prepare_header(hdr, false); // unreliable
+    }
+
+    lost_packet_info lost[16];
+    auto future = std::chrono::steady_clock::now() + std::chrono::microseconds(INITIAL_RTO_US + 100'000);
+    int count = conn.collect_losses(future, lost, 16);
+    TEST_ASSERT(count == 0, "unregistered channel should not trigger loss detection");
+
+    return true;
+}
+
+// ============================================================================
+// TEST 35: open_channel saturation — all 256 slots full
+// ============================================================================
+
+static bool test_open_channel_saturation()
+{
+    channel_manager cm;
+
+    // Fill every slot manually
+    for (int i = 0; i < static_cast<int>(MAX_CHANNELS); ++i)
+    {
+        channel_config cfg{};
+        cfg.id = static_cast<uint8_t>(i);
+        cfg.mode = channel_mode::UNRELIABLE;
+        cfg.priority = 1;
+        cfg.name = "fill";
+        TEST_ASSERT(cm.register_channel(cfg), "register should succeed for all slots");
+    }
+
+    TEST_ASSERT(cm.channel_count() == static_cast<int>(MAX_CHANNELS), "all 256 slots should be full");
+
+    // open_channel must fail
+    int id = cm.open_channel(channel_mode::RELIABLE, 128, "overflow");
+    TEST_ASSERT(id == -1, "open_channel should return -1 when saturated");
 
     return true;
 }
@@ -1231,6 +1590,17 @@ int main()
     register_test("CC loss multiplicative decrease", test_cc_loss_decrease);
     register_test("CC pacing interval", test_cc_pacing_interval);
     register_test("CC connection integration", test_cc_connection_integration);
+
+    // -- Channel system --
+    register_test("Channel registration and lookup", test_channel_registration);
+    register_test("Channel mode queries", test_channel_modes);
+    register_test("Channel default presets", test_channel_defaults);
+    register_test("Channel-based loss detection", test_channel_loss_detection);
+    register_test("Channel echo integration", test_channel_echo_integration);
+    register_test("Channel unreliable no loss", test_channel_unreliable_no_loss);
+    register_test("Open channel dynamic", test_open_channel);
+    register_test("Unregistered channel unreliable", test_unregistered_channel_is_unreliable);
+    register_test("Open channel saturation", test_open_channel_saturation);
 
     std::cout << "========================================" << std::endl;
     std::cout << " Entanglement Test Battery" << std::endl;

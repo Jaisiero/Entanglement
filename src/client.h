@@ -1,5 +1,6 @@
 #pragma once
 
+#include "channel_manager.h"
 #include "congestion_control.h"
 #include "udp_connection.h"
 #include "udp_socket.h"
@@ -59,6 +60,10 @@ namespace entanglement
 
         udp_connection &connection() { return m_connection; }
 
+        // Channel configuration
+        channel_manager &channels() { return m_channels; }
+        const channel_manager &channels() const { return m_channels; }
+
         // Congestion control: application queries these to pace sends
         bool can_send() const { return m_connection.can_send(); }
         congestion_info congestion() const { return m_connection.congestion(); }
@@ -71,6 +76,7 @@ namespace entanglement
     private:
         udp_socket m_socket;
         udp_connection m_connection;
+        channel_manager m_channels;
         std::string m_server_address;
         uint16_t m_server_port;
         std::atomic<bool> m_connected{false};

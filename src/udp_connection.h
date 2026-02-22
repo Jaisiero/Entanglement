@@ -35,6 +35,7 @@ namespace entanglement
         uint64_t sequence = 0;
         bool acked = false;
         bool active = false;
+        bool reliable = false; // Derived from channel_mode, used by collect_losses
         uint8_t flags = 0;
         uint8_t channel_id = 0;
         uint16_t shard_id = 0;
@@ -64,8 +65,6 @@ namespace entanglement
 
     // --- Connection state per peer ---
 
-    constexpr size_t SEQUENCE_BUFFER_SIZE = 1024;
-
     class udp_connection
     {
     public:
@@ -81,7 +80,8 @@ namespace entanglement
 
         // Fill header with current ack state before sending.
         // Registers the packet in the send buffer for ACK tracking / loss detection.
-        void prepare_header(packet_header &header);
+        // 'reliable' should be derived from channel_config (not a per-packet flag).
+        void prepare_header(packet_header &header, bool reliable = false);
 
         // --- Receiving side ---
 

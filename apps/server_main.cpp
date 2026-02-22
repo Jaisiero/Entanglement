@@ -19,6 +19,7 @@ int main()
     constexpr uint16_t PORT = DEFAULT_PORT;
 
     server srv(PORT);
+    srv.channels().register_defaults();
 
     int packet_count = 0;
 
