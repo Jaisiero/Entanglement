@@ -22,13 +22,11 @@ int main()
 
     int packet_count = 0;
 
-    srv.set_on_client_connected(
-        [](const endpoint_key & /*key*/, const std::string &addr, uint16_t port)
-        { std::cout << "[app] Client connected: " << addr << ":" << port << std::endl; });
+    srv.set_on_client_connected([](const endpoint_key & /*key*/, const std::string &addr, uint16_t port)
+                                { std::cout << "[app] Client connected: " << addr << ":" << port << std::endl; });
 
-    srv.set_on_client_disconnected(
-        [](const endpoint_key & /*key*/, const std::string &addr, uint16_t port)
-        { std::cout << "[app] Client disconnected: " << addr << ":" << port << std::endl; });
+    srv.set_on_client_disconnected([](const endpoint_key & /*key*/, const std::string &addr, uint16_t port)
+                                   { std::cout << "[app] Client disconnected: " << addr << ":" << port << std::endl; });
 
     srv.set_on_packet_received(
         [&](const packet_header &hdr, const uint8_t *payload, size_t size, const std::string &addr, uint16_t port)

@@ -267,79 +267,79 @@ namespace entanglement
 
         switch (control_type)
         {
-        case CONTROL_CONNECTION_REQUEST:
-        {
-            if (conn)
+            case CONTROL_CONNECTION_REQUEST:
             {
-                // Already known — they missed our ACCEPTED; resend
+                if (conn)
+                {
+                    // Already known — they missed our ACCEPTED; resend
+                    conn->process_incoming(header);
+                    send_control_to(conn, CONTROL_CONNECTION_ACCEPTED, address, port);
+                    return;
+                }
+
+                // New connection
+                conn = find_or_create(key);
+                if (!conn)
+                {
+                    // Pool full
+                    send_raw_control(CONTROL_CONNECTION_DENIED, address, port);
+                    if (m_verbose)
+                    {
+                        std::cerr << "[server] Connection denied (pool full) to " << address << ":" << port
+                                  << std::endl;
+                    }
+                    return;
+                }
+
+                conn->set_state(connection_state::CONNECTED);
                 conn->process_incoming(header);
                 send_control_to(conn, CONTROL_CONNECTION_ACCEPTED, address, port);
-                return;
-            }
-
-            // New connection
-            conn = find_or_create(key);
-            if (!conn)
-            {
-                // Pool full
-                send_raw_control(CONTROL_CONNECTION_DENIED, address, port);
-                if (m_verbose)
-                {
-                    std::cerr << "[server] Connection denied (pool full) to " << address << ":" << port << std::endl;
-                }
-                return;
-            }
-
-            conn->set_state(connection_state::CONNECTED);
-            conn->process_incoming(header);
-            send_control_to(conn, CONTROL_CONNECTION_ACCEPTED, address, port);
-
-            if (m_verbose)
-            {
-                std::cout << "[server] Client connected: " << address << ":" << port << " (slot " << m_index[key]
-                          << ", total: " << m_index.size() << ")" << std::endl;
-            }
-
-            if (m_on_client_connected)
-            {
-                m_on_client_connected(key, address, port);
-            }
-            break;
-        }
-
-        case CONTROL_DISCONNECT:
-        {
-            if (conn)
-            {
-                conn->process_incoming(header);
 
                 if (m_verbose)
                 {
-                    std::cout << "[server] Client disconnected: " << address << ":" << port << std::endl;
+                    std::cout << "[server] Client connected: " << address << ":" << port << " (slot " << m_index[key]
+                              << ", total: " << m_index.size() << ")" << std::endl;
                 }
 
-                if (m_on_client_disconnected)
+                if (m_on_client_connected)
                 {
-                    m_on_client_disconnected(key, address, port);
+                    m_on_client_connected(key, address, port);
                 }
-                disconnect_client(key);
+                break;
             }
-            break;
-        }
 
-        case CONTROL_HEARTBEAT:
-        {
-            if (conn)
+            case CONTROL_DISCONNECT:
             {
-                conn->process_incoming(header);
+                if (conn)
+                {
+                    conn->process_incoming(header);
+
+                    if (m_verbose)
+                    {
+                        std::cout << "[server] Client disconnected: " << address << ":" << port << std::endl;
+                    }
+
+                    if (m_on_client_disconnected)
+                    {
+                        m_on_client_disconnected(key, address, port);
+                    }
+                    disconnect_client(key);
+                }
+                break;
             }
-            break;
-        }
+
+            case CONTROL_HEARTBEAT:
+            {
+                if (conn)
+                {
+                    conn->process_incoming(header);
+                }
+                break;
+            }
         }
     }
 
-    void server::send_control_to(udp_connection *conn, uint8_t control_type,
-                                 const std::string &address, uint16_t port)
+    void server::send_control_to(udp_connection *conn, uint8_t control_type, const std::string &address, uint16_t port)
     {
         packet_header header{};
         header.flags = FLAG_CONTROL;

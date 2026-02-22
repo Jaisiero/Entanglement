@@ -96,8 +96,7 @@ namespace entanglement
             return;
 
         // Send clean disconnect notification
-        if (m_connection.state() == connection_state::CONNECTED ||
-            m_connection.state() == connection_state::CONNECTING)
+        if (m_connection.state() == connection_state::CONNECTED || m_connection.state() == connection_state::CONNECTING)
         {
             send_control(CONTROL_DISCONNECT);
         }
@@ -236,39 +235,39 @@ namespace entanglement
     {
         switch (control_type)
         {
-        case CONTROL_CONNECTION_ACCEPTED:
-            if (m_connection.state() == connection_state::CONNECTING)
-            {
-                m_connection.set_state(connection_state::CONNECTED);
-                m_connected = true;
-            }
-            break;
+            case CONTROL_CONNECTION_ACCEPTED:
+                if (m_connection.state() == connection_state::CONNECTING)
+                {
+                    m_connection.set_state(connection_state::CONNECTED);
+                    m_connected = true;
+                }
+                break;
 
-        case CONTROL_CONNECTION_DENIED:
-            if (m_verbose)
-            {
-                std::cerr << "[client] Connection denied by server" << std::endl;
-            }
-            m_connection.set_state(connection_state::DISCONNECTED);
-            m_connected = false;
-            break;
+            case CONTROL_CONNECTION_DENIED:
+                if (m_verbose)
+                {
+                    std::cerr << "[client] Connection denied by server" << std::endl;
+                }
+                m_connection.set_state(connection_state::DISCONNECTED);
+                m_connected = false;
+                break;
 
-        case CONTROL_DISCONNECT:
-            if (m_verbose)
-            {
-                std::cout << "[client] Server disconnected us" << std::endl;
-            }
-            m_connection.set_state(connection_state::DISCONNECTED);
-            m_connected = false;
-            if (m_on_disconnected)
-            {
-                m_on_disconnected();
-            }
-            break;
+            case CONTROL_DISCONNECT:
+                if (m_verbose)
+                {
+                    std::cout << "[client] Server disconnected us" << std::endl;
+                }
+                m_connection.set_state(connection_state::DISCONNECTED);
+                m_connected = false;
+                if (m_on_disconnected)
+                {
+                    m_on_disconnected();
+                }
+                break;
 
-        case CONTROL_HEARTBEAT:
-            // process_incoming already updated timestamps
-            break;
+            case CONTROL_HEARTBEAT:
+                // process_incoming already updated timestamps
+                break;
         }
     }
 

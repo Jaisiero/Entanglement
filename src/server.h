@@ -18,8 +18,7 @@ namespace entanglement
                            const std::string &sender_address, uint16_t sender_port)>;
 
     // Callback: a client completed the handshake
-    using on_client_connected =
-        std::function<void(const endpoint_key &key, const std::string &address, uint16_t port)>;
+    using on_client_connected = std::function<void(const endpoint_key &key, const std::string &address, uint16_t port)>;
 
     // Callback: a client disconnected (explicit or timeout)
     using on_client_disconnected =
@@ -89,8 +88,7 @@ namespace entanglement
                             const std::string &address, uint16_t port);
 
         // Send a control packet through an established connection
-        void send_control_to(udp_connection *conn, uint8_t control_type,
-                             const std::string &address, uint16_t port);
+        void send_control_to(udp_connection *conn, uint8_t control_type, const std::string &address, uint16_t port);
 
         // Send a control packet without a connection (e.g. CONNECTION_DENIED)
         void send_raw_control(uint8_t control_type, const std::string &address, uint16_t port);

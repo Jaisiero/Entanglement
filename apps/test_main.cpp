@@ -1,8 +1,8 @@
 // ============================================================================
 // Entanglement — Test Battery for Failure Scenarios
 // ============================================================================
-// Batería de tests que verifican el comportamiento del protocolo ante
-// situaciones de fallo: envío sin conexión, doble connect, timeout, etc.
+// Tests that verify protocol behavior under failure conditions:
+// sending without a connection, double connect, timeout, etc.
 // ============================================================================
 
 #include "client.h"
@@ -101,15 +101,17 @@ struct test_server_ctx
     {
         if (!srv.start())
             return false;
-        thread = std::thread([this]() {
-            while (!stop_flag.load())
+        thread = std::thread(
+            [this]()
             {
-                srv.poll();
-                srv.update();
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
-            srv.stop();
-        });
+                while (!stop_flag.load())
+                {
+                    srv.poll();
+                    srv.update();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                srv.stop();
+            });
         return true;
     }
 
@@ -126,8 +128,8 @@ struct test_server_ctx
 // ============================================================================
 // TEST 1: Send data before connecting
 // ============================================================================
-// El cliente intenta enviar paquetes de datos sin haber llamado a connect().
-// Esperamos que send_payload devuelva error (socket no abierto).
+// The client attempts to send data packets without having called connect().
+// We expect send_payload to return an error (socket not open).
 // ============================================================================
 
 static bool test_send_before_connect()
@@ -152,8 +154,8 @@ static bool test_send_before_connect()
 // ============================================================================
 // TEST 2: Connect to non-existent server (timeout)
 // ============================================================================
-// No hay ningún servidor escuchando. connect() debe devolver false tras
-// agotar los reintentos (~5 s). Verificamos que no se queda colgado.
+// No server is listening. connect() must return false after exhausting
+// retries (~5 s). We verify it does not hang.
 // ============================================================================
 
 static bool test_connect_no_server()
@@ -178,9 +180,9 @@ static bool test_connect_no_server()
 // ============================================================================
 // TEST 3: Double connect
 // ============================================================================
-// El cliente conecta al servidor, luego intenta conectar de nuevo.
-// El segundo connect debería fallar (socket ya cerrado/resetado) o al menos
-// no dejar el sistema en un estado corrupto.
+// The client connects to the server, then attempts to connect again.
+// The second connect should fail (socket already closed/reset) or at least
+// not leave the system in a corrupt state.
 // ============================================================================
 
 static bool test_double_connect()
@@ -214,7 +216,7 @@ static bool test_double_connect()
 // ============================================================================
 // TEST 4: Double disconnect
 // ============================================================================
-// Dos llamadas consecutivas a disconnect() no deben causar crash ni UB.
+// Two consecutive calls to disconnect() must not cause a crash or UB.
 // ============================================================================
 
 static bool test_double_disconnect()
@@ -240,8 +242,8 @@ static bool test_double_disconnect()
 // ============================================================================
 // TEST 5: Send after disconnect
 // ============================================================================
-// El cliente envía datos después de haberse desconectado.
-// Debería fallar silenciosamente (socket cerrado).
+// The client sends data after having disconnected.
+// It should fail silently (socket closed).
 // ============================================================================
 
 static bool test_send_after_disconnect()
@@ -265,9 +267,9 @@ static bool test_send_after_disconnect()
 // ============================================================================
 // TEST 6: Server denies connection when pool is full
 // ============================================================================
-// Llenamos el pool del servidor con MAX_CONNECTIONS clientes falsos y luego
-// intentamos conectar uno más. Debe recibir CONNECTION_DENIED.
-// (Usamos un pool pequeño simulado — llenamos las 1024 ranuras directamente.)
+// We fill the server pool with MAX_CONNECTIONS fake clients and then
+// attempt to connect one more. It should receive CONNECTION_DENIED.
+// (We use a simulated small pool — filling the 1024 slots directly.)
 // ============================================================================
 
 static bool test_connection_denied_pool_full()
@@ -292,19 +294,19 @@ static bool test_connection_denied_pool_full()
     std::atomic<bool> stop_flag{false};
     std::atomic<int> connected_count{0};
 
-    srv.set_on_client_connected([&](const endpoint_key &, const std::string &, uint16_t) {
-        connected_count++;
-    });
+    srv.set_on_client_connected([&](const endpoint_key &, const std::string &, uint16_t) { connected_count++; });
 
     // Run server loop in background
-    std::thread server_thread([&]() {
-        while (!stop_flag.load())
+    std::thread server_thread(
+        [&]()
         {
-            srv.poll();
-            srv.update();
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-    });
+            while (!stop_flag.load())
+            {
+                srv.poll();
+                srv.update();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
 
     // Connect 3 clients (just verify the accept path)
     constexpr int N = 3;
@@ -337,9 +339,9 @@ static bool test_connection_denied_pool_full()
 // ============================================================================
 // TEST 7: Client detects server timeout
 // ============================================================================
-// El cliente conecta al servidor, luego el servidor se detiene (deja de
-// enviar heartbeat). El cliente debe detectar el timeout tras ~10 s.
-// Para acelerar: usamos update() con reloj rápido verificando has_timed_out().
+// The client connects to the server, then the server stops (stops sending
+// heartbeats). The client must detect the timeout after ~10 s.
+// To speed up: we use the unit-level has_timed_out() check with a future timestamp.
 // ============================================================================
 
 static bool test_client_timeout_detection()
@@ -376,9 +378,9 @@ static bool test_client_timeout_detection()
 // ============================================================================
 // TEST 8: Server detects client disappearance
 // ============================================================================
-// Un cliente conecta y luego simplemente desaparece (sin enviar DISCONNECT).
-// El servidor debería detectar el timeout vía update().
-// Verificamos con has_timed_out() en la connection del servidor.
+// A client connects and then simply disappears (without sending DISCONNECT).
+// The server should detect the timeout via update().
+// We verify with has_timed_out() on the server's connection.
 // ============================================================================
 
 static bool test_server_timeout_detection()
@@ -390,24 +392,27 @@ static bool test_server_timeout_detection()
     std::atomic<bool> client_connected{false};
     endpoint_key client_key{};
 
-    srv.set_on_client_connected([&](const endpoint_key &key, const std::string &, uint16_t) {
-        client_key = key;
-        client_connected = true;
-    });
+    srv.set_on_client_connected(
+        [&](const endpoint_key &key, const std::string &, uint16_t)
+        {
+            client_key = key;
+            client_connected = true;
+        });
 
     std::atomic<bool> client_timed_out{false};
-    srv.set_on_client_disconnected([&](const endpoint_key &, const std::string &, uint16_t) {
-        client_timed_out = true;
-    });
+    srv.set_on_client_disconnected([&](const endpoint_key &, const std::string &, uint16_t)
+                                   { client_timed_out = true; });
 
-    std::thread server_thread([&]() {
-        while (!stop_flag.load())
+    std::thread server_thread(
+        [&]()
         {
-            srv.poll();
-            srv.update();
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-    });
+            while (!stop_flag.load())
+            {
+                srv.poll();
+                srv.update();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
 
     // Connect a client then immediately destroy it (no DISCONNECT sent if we force-close).
     {
@@ -449,7 +454,7 @@ static bool test_server_timeout_detection()
 // ============================================================================
 // TEST 9: Heartbeat keeps connection alive
 // ============================================================================
-// Verificamos que una conexión activa (con heartbeats) NO marca timeout.
+// We verify that an active connection (with heartbeats) does NOT trigger timeout.
 // ============================================================================
 
 static bool test_heartbeat_keeps_alive()
@@ -480,8 +485,8 @@ static bool test_heartbeat_keeps_alive()
 // ============================================================================
 // TEST 10: Duplicate packet detection
 // ============================================================================
-// Verificamos que process_incoming detecta duplicados correctamente.
-// Test unitario a nivel de udp_connection.
+// We verify that process_incoming correctly detects duplicates.
+// Unit test at the udp_connection level.
 // ============================================================================
 
 static bool test_duplicate_detection()
@@ -518,8 +523,8 @@ static bool test_duplicate_detection()
 // ============================================================================
 // TEST 11: Sequence wrap in send buffer
 // ============================================================================
-// Verificamos que el buffer circular de envío funciona cuando la secuencia
-// supera SEQUENCE_BUFFER_SIZE.
+// We verify that the circular send buffer works correctly when the sequence
+// number exceeds SEQUENCE_BUFFER_SIZE.
 // ============================================================================
 
 static bool test_sequence_buffer_wrap()
@@ -541,8 +546,7 @@ static bool test_sequence_buffer_wrap()
         TEST_ASSERT(hdr.sequence == i + 1, "sequence should increment");
     }
 
-    TEST_ASSERT(conn.local_sequence() == SEQUENCE_BUFFER_SIZE + 101,
-                "local_sequence should be BUFFER_SIZE + 101");
+    TEST_ASSERT(conn.local_sequence() == SEQUENCE_BUFFER_SIZE + 101, "local_sequence should be BUFFER_SIZE + 101");
 
     return true;
 }
@@ -550,8 +554,8 @@ static bool test_sequence_buffer_wrap()
 // ============================================================================
 // TEST 12: RTT estimation converges
 // ============================================================================
-// Enviamos paquetes y recibimos ACKs simulados para verificar que el RTT
-// converge a un valor estable.
+// We send packets and receive simulated ACKs to verify that the RTT
+// converges to a stable value.
 // ============================================================================
 
 static bool test_rtt_convergence()
@@ -578,8 +582,8 @@ static bool test_rtt_convergence()
     ack_hdr.magic = PROTOCOL_MAGIC;
     ack_hdr.version = PROTOCOL_VERSION;
     ack_hdr.flags = 0;
-    ack_hdr.sequence = 1; // remote seq
-    ack_hdr.ack = 20;     // acking our seq 20
+    ack_hdr.sequence = 1;            // remote seq
+    ack_hdr.ack = 20;                // acking our seq 20
     ack_hdr.ack_bitmap = 0xFFFFFFFF; // all 32 previous are acked too
     ack_hdr.payload_size = 0;
 
@@ -595,8 +599,8 @@ static bool test_rtt_convergence()
 // ============================================================================
 // TEST 13: Loss detection for reliable packets
 // ============================================================================
-// Enviamos paquetes reliable, no los ackamos, y verificamos que
-// collect_losses los reporta tras expirar el RTO.
+// We send reliable packets, do not ACK them, and verify that
+// collect_losses reports them after the RTO expires.
 // ============================================================================
 
 static bool test_loss_detection()
@@ -643,7 +647,7 @@ static bool test_loss_detection()
 // ============================================================================
 // TEST 14: Non-reliable packets are not tracked for loss
 // ============================================================================
-// Los paquetes sin FLAG_RELIABLE no deben aparecer en collect_losses.
+// Packets without FLAG_RELIABLE must not appear in collect_losses.
 // ============================================================================
 
 static bool test_unreliable_no_loss_tracking()
@@ -674,8 +678,8 @@ static bool test_unreliable_no_loss_tracking()
 // ============================================================================
 // TEST 15: Clean connect → send → receive → disconnect cycle
 // ============================================================================
-// Ciclo completo: el cliente envía un mensaje, el servidor lo recibe y
-// responde con un echo, el cliente recibe la respuesta.
+// Full cycle: the client sends a message, the server receives it and
+// replies with an echo, the client receives the response.
 // ============================================================================
 
 static bool test_full_echo_cycle()
@@ -685,8 +689,9 @@ static bool test_full_echo_cycle()
     std::atomic<int> echo_count{0};
 
     srv.set_on_packet_received(
-        [&](const packet_header &header, const uint8_t *payload, size_t payload_size,
-            const std::string &addr, uint16_t port) {
+        [&](const packet_header &header, const uint8_t *payload, size_t payload_size, const std::string &addr,
+            uint16_t port)
+        {
             // Echo back
             packet_header resp{};
             resp.flags = header.flags;
@@ -696,24 +701,28 @@ static bool test_full_echo_cycle()
 
     TEST_ASSERT(srv.start(), "server should start");
 
-    std::thread server_thread([&]() {
-        while (!stop_flag.load())
+    std::thread server_thread(
+        [&]()
         {
-            srv.poll();
-            srv.update();
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-    });
+            while (!stop_flag.load())
+            {
+                srv.poll();
+                srv.update();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
 
     client c("127.0.0.1", 9909);
     c.set_verbose(false);
 
     std::atomic<int> responses{0};
     std::string last_response;
-    c.set_on_response([&](const packet_header &, const uint8_t *payload, size_t size) {
-        last_response = std::string(reinterpret_cast<const char *>(payload), size);
-        responses++;
-    });
+    c.set_on_response(
+        [&](const packet_header &, const uint8_t *payload, size_t size)
+        {
+            last_response = std::string(reinterpret_cast<const char *>(payload), size);
+            responses++;
+        });
 
     TEST_ASSERT(c.connect(), "client should connect");
 
@@ -744,7 +753,7 @@ static bool test_full_echo_cycle()
 // ============================================================================
 // TEST 16: connection_state transitions
 // ============================================================================
-// Verificamos la máquina de estados: DISCONNECTED → CONNECTING → CONNECTED → DISCONNECTED
+// We verify the state machine: DISCONNECTED → CONNECTING → CONNECTED → DISCONNECTED
 // ============================================================================
 
 static bool test_connection_state_transitions()
@@ -769,7 +778,7 @@ static bool test_connection_state_transitions()
 // ============================================================================
 // TEST 17: needs_heartbeat and has_timed_out timing
 // ============================================================================
-// Test unitario que verifica los umbrales de heartbeat (1 s) y timeout (10 s).
+// Unit test that verifies heartbeat (1 s) and timeout (10 s) thresholds.
 // ============================================================================
 
 static bool test_heartbeat_timeout_thresholds()
@@ -824,8 +833,8 @@ static bool test_heartbeat_timeout_thresholds()
 // ============================================================================
 // TEST 18: Server on_client_disconnected callback fires
 // ============================================================================
-// Verificamos que el callback de desconexión se dispara cuando un cliente
-// envía DISCONNECT.
+// We verify that the disconnection callback fires when a client
+// sends DISCONNECT.
 // ============================================================================
 
 static bool test_server_disconnect_callback()
@@ -835,23 +844,22 @@ static bool test_server_disconnect_callback()
     std::atomic<bool> connect_fired{false};
     std::atomic<bool> disconnect_fired{false};
 
-    srv.set_on_client_connected([&](const endpoint_key &, const std::string &, uint16_t) {
-        connect_fired = true;
-    });
-    srv.set_on_client_disconnected([&](const endpoint_key &, const std::string &, uint16_t) {
-        disconnect_fired = true;
-    });
+    srv.set_on_client_connected([&](const endpoint_key &, const std::string &, uint16_t) { connect_fired = true; });
+    srv.set_on_client_disconnected([&](const endpoint_key &, const std::string &, uint16_t)
+                                   { disconnect_fired = true; });
 
     TEST_ASSERT(srv.start(), "server should start");
 
-    std::thread server_thread([&]() {
-        while (!stop_flag.load())
+    std::thread server_thread(
+        [&]()
         {
-            srv.poll();
-            srv.update();
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-    });
+            while (!stop_flag.load())
+            {
+                srv.poll();
+                srv.update();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
 
     client c("127.0.0.1", 9910);
     c.set_verbose(false);
@@ -885,7 +893,7 @@ static bool test_server_disconnect_callback()
 // ============================================================================
 // TEST 19: Packet header integrity
 // ============================================================================
-// Verificamos que prepare_header rellena correctamente los campos del header.
+// We verify that prepare_header correctly fills all header fields.
 // ============================================================================
 
 static bool test_header_integrity()
@@ -925,8 +933,8 @@ static bool test_header_integrity()
 // ============================================================================
 // TEST 20: Multiple clients connect and disconnect independently
 // ============================================================================
-// Tres clientes se conectan al mismo servidor. Uno se desconecta, los otros
-// dos siguen activos. Verificamos contadores de conexión.
+// Three clients connect to the same server. One disconnects, the other
+// two remain active. We verify connection counters.
 // ============================================================================
 
 static bool test_multiple_clients_independent()
@@ -936,23 +944,21 @@ static bool test_multiple_clients_independent()
     std::atomic<int> connect_count{0};
     std::atomic<int> disconnect_count{0};
 
-    srv.set_on_client_connected([&](const endpoint_key &, const std::string &, uint16_t) {
-        connect_count++;
-    });
-    srv.set_on_client_disconnected([&](const endpoint_key &, const std::string &, uint16_t) {
-        disconnect_count++;
-    });
+    srv.set_on_client_connected([&](const endpoint_key &, const std::string &, uint16_t) { connect_count++; });
+    srv.set_on_client_disconnected([&](const endpoint_key &, const std::string &, uint16_t) { disconnect_count++; });
 
     TEST_ASSERT(srv.start(), "server should start");
 
-    std::thread server_thread([&]() {
-        while (!stop_flag.load())
+    std::thread server_thread(
+        [&]()
         {
-            srv.poll();
-            srv.update();
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-    });
+            while (!stop_flag.load())
+            {
+                srv.poll();
+                srv.update();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
 
     client c1("127.0.0.1", 9911);
     client c2("127.0.0.1", 9911);
@@ -998,7 +1004,7 @@ static bool test_multiple_clients_independent()
 }
 
 // ============================================================================
-// Registra todos los tests y ejecuta
+// Register all tests and run
 // ============================================================================
 
 int main()

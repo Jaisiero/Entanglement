@@ -9,7 +9,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# Recopilar fuentes en src/ (librería del protocolo)
+# Collect sources in src/ (protocol library)
 file(GLOB_RECURSE LIB_SOURCES CONFIGURE_DEPENDS "src/*.cpp")
 
 add_library(entanglement_core STATIC ${LIB_SOURCES})
@@ -20,7 +20,7 @@ if(WIN32)
     target_link_libraries(entanglement_core PUBLIC ws2_32)
 endif()
 
-# Ejecutables
+# Executables
 add_executable(EntanglementServer apps/server_main.cpp)
 target_link_libraries(EntanglementServer PRIVATE entanglement_core)
 
