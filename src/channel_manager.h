@@ -3,6 +3,7 @@
 #include "constants.h"
 #include <array>
 #include <cstdint>
+#include <cstring>
 
 namespace entanglement
 {
@@ -23,17 +24,31 @@ namespace entanglement
         uint8_t id = 0;
         channel_mode mode = channel_mode::UNRELIABLE;
         uint8_t priority = 0; // Higher = more important (0–255)
-        const char *name = "";
+        char name[MAX_CHANNEL_NAME] = {};
     };
+
+    // constexpr helper to build a channel_config with a string literal name
+    constexpr channel_config make_channel_config(uint8_t id, channel_mode mode, uint8_t priority, const char *src)
+    {
+        channel_config cfg{};
+        cfg.id = id;
+        cfg.mode = mode;
+        cfg.priority = priority;
+        for (size_t i = 0; i < MAX_CHANNEL_NAME - 1 && src[i] != '\0'; ++i)
+        {
+            cfg.name[i] = src[i];
+        }
+        return cfg;
+    }
 
     // --- Predefined base channels (one per delivery mode) ---
 
     namespace channels
     {
-        constexpr channel_config CONTROL = {0, channel_mode::RELIABLE_ORDERED, 255, "control"};
-        constexpr channel_config UNRELIABLE = {1, channel_mode::UNRELIABLE, 64, "unreliable"};
-        constexpr channel_config RELIABLE = {2, channel_mode::RELIABLE, 128, "reliable"};
-        constexpr channel_config ORDERED = {3, channel_mode::RELIABLE_ORDERED, 128, "ordered"};
+        constexpr channel_config CONTROL = make_channel_config(0, channel_mode::RELIABLE_ORDERED, 255, "control");
+        constexpr channel_config UNRELIABLE = make_channel_config(1, channel_mode::UNRELIABLE, 64, "unreliable");
+        constexpr channel_config RELIABLE = make_channel_config(2, channel_mode::RELIABLE, 128, "reliable");
+        constexpr channel_config ORDERED = make_channel_config(3, channel_mode::RELIABLE_ORDERED, 128, "ordered");
     } // namespace channels
 
     // --- Channel manager ---

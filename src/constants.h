@@ -49,7 +49,8 @@ namespace entanglement
     constexpr int MAX_TIMEOUTS_PER_UPDATE = 32;           // max timeouts processed per server update
 
     // --- Channel limits ---
-    constexpr size_t MAX_CHANNELS = 256; // Matches uint8_t channel_id range (0–255)
+    constexpr size_t MAX_CHANNELS = 256;    // Matches uint8_t channel_id range (0–255)
+    constexpr size_t MAX_CHANNEL_NAME = 32; // Max channel name length (including null terminator)
 
     // --- Control packet types (first byte of FLAG_CONTROL payload) ---
     enum control_type : uint8_t

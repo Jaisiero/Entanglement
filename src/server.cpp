@@ -350,13 +350,23 @@ namespace entanglement
 
                 conn->process_incoming(header);
 
-                // Payload: [type(1)][channel_id(1)][mode(1)][priority(1)] = 4 bytes
+                // Payload: [type(1)][channel_id(1)][mode(1)][priority(1)][name(up to 32)] = 4+ bytes
                 if (payload_size < 4)
                     break;
 
                 uint8_t ch_id = payload[1];
                 auto ch_mode = static_cast<channel_mode>(payload[2]);
                 uint8_t ch_priority = payload[3];
+
+                // Extract name from payload (bytes 4..35)
+                char ch_name[MAX_CHANNEL_NAME] = {};
+                if (payload_size > 4)
+                {
+                    size_t name_len = payload_size - 4;
+                    if (name_len > MAX_CHANNEL_NAME - 1)
+                        name_len = MAX_CHANNEL_NAME - 1;
+                    std::memcpy(ch_name, &payload[4], name_len);
+                }
 
                 // Validate mode
                 if (payload[2] > static_cast<uint8_t>(channel_mode::RELIABLE_ORDERED))
@@ -374,7 +384,12 @@ namespace entanglement
                     // Register on server side (ignore if already registered — idempotent)
                     if (!m_channels.is_registered(ch_id))
                     {
-                        m_channels.register_channel({ch_id, ch_mode, ch_priority, "remote"});
+                        channel_config cfg{};
+                        cfg.id = ch_id;
+                        cfg.mode = ch_mode;
+                        cfg.priority = ch_priority;
+                        std::memcpy(cfg.name, ch_name, MAX_CHANNEL_NAME);
+                        m_channels.register_channel(cfg);
                     }
                 }
 

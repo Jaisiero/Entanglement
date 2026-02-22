@@ -22,7 +22,15 @@ namespace entanglement
             uint8_t id = static_cast<uint8_t>((static_cast<size_t>(hint) + i) % MAX_CHANNELS);
             if (!m_registered[id])
             {
-                channel_config cfg{id, mode, priority, name};
+                channel_config cfg{};
+                cfg.id = id;
+                cfg.mode = mode;
+                cfg.priority = priority;
+                if (name)
+                {
+                    std::strncpy(cfg.name, name, MAX_CHANNEL_NAME - 1);
+                    cfg.name[MAX_CHANNEL_NAME - 1] = '\0';
+                }
                 register_channel(cfg);
                 return static_cast<int>(id);
             }

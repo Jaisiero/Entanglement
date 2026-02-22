@@ -314,17 +314,23 @@ namespace entanglement
         if (id < 0)
             return -1;
 
-        // Build CHANNEL_OPEN payload: [type(1)][channel_id(1)][mode(1)][priority(1)]
-        uint8_t open_payload[4] = {
-            CONTROL_CHANNEL_OPEN,
-            static_cast<uint8_t>(id),
-            static_cast<uint8_t>(mode),
-            priority,
-        };
+        // Build CHANNEL_OPEN payload: [type(1)][channel_id(1)][mode(1)][priority(1)][name(up to 32)]
+        uint8_t open_payload[4 + MAX_CHANNEL_NAME] = {};
+        open_payload[0] = CONTROL_CHANNEL_OPEN;
+        open_payload[1] = static_cast<uint8_t>(id);
+        open_payload[2] = static_cast<uint8_t>(mode);
+        open_payload[3] = priority;
+
+        // Copy name into payload bytes [4..35]
+        if (name)
+        {
+            std::strncpy(reinterpret_cast<char *>(&open_payload[4]), name, MAX_CHANNEL_NAME - 1);
+        }
+        size_t open_size = 4 + MAX_CHANNEL_NAME;
 
         m_pending_channel_id = id;
         m_channel_ack_status = CHANNEL_STATUS_REJECTED; // pessimistic default
-        send_control_payload(open_payload, sizeof(open_payload));
+        send_control_payload(open_payload, open_size);
 
         // Wait for ACK with retries (synchronous, like the handshake)
         auto retry_interval = std::chrono::milliseconds(CHANNEL_OPEN_RETRY_INTERVAL_MS);
@@ -362,7 +368,7 @@ namespace entanglement
             if (now - last_attempt >= retry_interval)
             {
                 ++attempt;
-                send_control_payload(open_payload, sizeof(open_payload));
+                send_control_payload(open_payload, open_size);
                 last_attempt = now;
             }
 

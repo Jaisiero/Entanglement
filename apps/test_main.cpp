@@ -1209,7 +1209,7 @@ static bool test_channel_registration()
     TEST_ASSERT(cm.channel_count() == 0, "initially 0 channels");
 
     // Register a reliable channel
-    channel_config cfg{10, channel_mode::RELIABLE, 200, "test_reliable"};
+    channel_config cfg = make_channel_config(10, channel_mode::RELIABLE, 200, "test_reliable");
     TEST_ASSERT(cm.register_channel(cfg), "should register successfully");
     TEST_ASSERT(cm.channel_count() == 1, "should have 1 channel");
     TEST_ASSERT(cm.is_registered(10), "channel 10 should be registered");
@@ -1244,9 +1244,9 @@ static bool test_channel_modes()
 {
     channel_manager cm;
 
-    cm.register_channel({0, channel_mode::UNRELIABLE, 10, "unreliable"});
-    cm.register_channel({1, channel_mode::RELIABLE, 100, "reliable"});
-    cm.register_channel({2, channel_mode::RELIABLE_ORDERED, 200, "ordered"});
+    cm.register_channel(make_channel_config(0, channel_mode::UNRELIABLE, 10, "unreliable"));
+    cm.register_channel(make_channel_config(1, channel_mode::RELIABLE, 100, "reliable"));
+    cm.register_channel(make_channel_config(2, channel_mode::RELIABLE_ORDERED, 200, "ordered"));
 
     // UNRELIABLE
     TEST_ASSERT(!cm.is_reliable(0), "UNRELIABLE channel should not be reliable");
@@ -1542,7 +1542,7 @@ static bool test_open_channel_saturation()
         cfg.id = static_cast<uint8_t>(i);
         cfg.mode = channel_mode::UNRELIABLE;
         cfg.priority = 1;
-        cfg.name = "fill";
+        std::strncpy(cfg.name, "fill", MAX_CHANNEL_NAME - 1);
         TEST_ASSERT(cm.register_channel(cfg), "register should succeed for all slots");
     }
 
@@ -1735,6 +1735,71 @@ static bool test_channel_negotiation_selective()
     return true;
 }
 
+// ============================================================================
+// TEST 39: Channel name synchronized to server via CHANNEL_OPEN
+// ============================================================================
+
+static bool test_channel_name_sync()
+{
+    server srv(9925);
+    srv.channels().register_defaults();
+    std::atomic<bool> stop_flag{false};
+
+    TEST_ASSERT(srv.start(), "server should start");
+
+    std::thread server_thread(
+        [&]()
+        {
+            while (!stop_flag.load())
+            {
+                srv.poll();
+                srv.update();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+
+    client c("127.0.0.1", 9925);
+    c.set_verbose(false);
+    c.channels().register_defaults();
+    TEST_ASSERT(c.connect(), "client should connect");
+
+    // Open a channel with a specific name
+    int ch_id = c.open_channel(channel_mode::RELIABLE, 180, "combat_spells");
+    TEST_ASSERT(ch_id >= 4, "open_channel should succeed");
+
+    // Verify client side has the name
+    const channel_config *client_cfg = c.channels().get_channel(static_cast<uint8_t>(ch_id));
+    TEST_ASSERT(client_cfg != nullptr, "client channel config should exist");
+    TEST_ASSERT(std::strcmp(client_cfg->name, "combat_spells") == 0, "client channel name should be 'combat_spells'");
+
+    // Give server time to process the CHANNEL_OPEN
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    // Verify server side has the same name
+    const channel_config *server_cfg = srv.channels().get_channel(static_cast<uint8_t>(ch_id));
+    TEST_ASSERT(server_cfg != nullptr, "server channel config should exist");
+    TEST_ASSERT(std::strcmp(server_cfg->name, "combat_spells") == 0, "server channel name should be 'combat_spells'");
+    TEST_ASSERT(server_cfg->mode == channel_mode::RELIABLE, "server channel mode should match");
+    TEST_ASSERT(server_cfg->priority == 180, "server channel priority should match");
+
+    // Open a second channel with a different name
+    int ch_id2 = c.open_channel(channel_mode::RELIABLE_ORDERED, 200, "guild_chat");
+    TEST_ASSERT(ch_id2 >= 0, "second open_channel should succeed");
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    const channel_config *srv_cfg2 = srv.channels().get_channel(static_cast<uint8_t>(ch_id2));
+    TEST_ASSERT(srv_cfg2 != nullptr, "server should have second channel");
+    TEST_ASSERT(std::strcmp(srv_cfg2->name, "guild_chat") == 0, "server name should be 'guild_chat'");
+
+    c.disconnect();
+    stop_flag = true;
+    server_thread.join();
+    srv.stop();
+
+    return true;
+}
+
 int main()
 {
     platform_init();
@@ -1784,6 +1849,7 @@ int main()
     register_test("Channel negotiation accepted", test_channel_negotiation_accepted);
     register_test("Channel negotiation rejected", test_channel_negotiation_rejected);
     register_test("Channel negotiation selective", test_channel_negotiation_selective);
+    register_test("Channel name sync", test_channel_name_sync);
 
     std::cout << "========================================" << std::endl;
     std::cout << " Entanglement Test Battery" << std::endl;
