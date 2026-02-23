@@ -1834,14 +1834,14 @@ static bool test_fragment_reassembler_basic()
     size_t complete_size = 0;
 
     ra.set_on_allocate(
-        [&](uint32_t, uint8_t, uint8_t, size_t) -> uint8_t *
+        [&](const endpoint_key &, uint32_t, uint8_t, uint8_t, size_t) -> uint8_t *
         {
             alloc_called = true;
             return app_buffer.data();
         });
 
     ra.set_on_complete(
-        [&](uint32_t msg_id, uint8_t ch_id, uint8_t *data, size_t total)
+        [&](const endpoint_key &, uint32_t msg_id, uint8_t ch_id, uint8_t *data, size_t total)
         {
             complete_called = true;
             complete_size = total;
@@ -1892,8 +1892,9 @@ static bool test_fragment_reassembler_out_of_order()
     std::vector<uint8_t> app_buffer(msg_size, 0);
     bool complete = false;
 
-    ra.set_on_allocate([&](uint32_t, uint8_t, uint8_t, size_t) -> uint8_t * { return app_buffer.data(); });
-    ra.set_on_complete([&](uint32_t, uint8_t, uint8_t *, size_t) { complete = true; });
+    ra.set_on_allocate([&](const endpoint_key &, uint32_t, uint8_t, uint8_t, size_t) -> uint8_t *
+                       { return app_buffer.data(); });
+    ra.set_on_complete([&](const endpoint_key &, uint32_t, uint8_t, uint8_t *, size_t) { complete = true; });
 
     endpoint_key ep{};
     uint8_t fcount = 3;
@@ -1926,8 +1927,9 @@ static bool test_fragment_duplicate_ignored()
     std::vector<uint8_t> app_buffer(MAX_FRAGMENT_PAYLOAD * 2, 0);
     bool complete = false;
 
-    ra.set_on_allocate([&](uint32_t, uint8_t, uint8_t, size_t) -> uint8_t * { return app_buffer.data(); });
-    ra.set_on_complete([&](uint32_t, uint8_t, uint8_t *, size_t) { complete = true; });
+    ra.set_on_allocate([&](const endpoint_key &, uint32_t, uint8_t, uint8_t, size_t) -> uint8_t *
+                       { return app_buffer.data(); });
+    ra.set_on_complete([&](const endpoint_key &, uint32_t, uint8_t, uint8_t *, size_t) { complete = true; });
 
     endpoint_key ep{};
     std::vector<uint8_t> data(MAX_FRAGMENT_PAYLOAD * 2, 0xAB);
@@ -1958,10 +1960,10 @@ static bool test_fragment_app_rejects()
     fragment_reassembler ra;
 
     // Return nullptr to reject
-    ra.set_on_allocate([](uint32_t, uint8_t, uint8_t, size_t) -> uint8_t * { return nullptr; });
+    ra.set_on_allocate([](const endpoint_key &, uint32_t, uint8_t, uint8_t, size_t) -> uint8_t * { return nullptr; });
 
     bool complete = false;
-    ra.set_on_complete([&](uint32_t, uint8_t, uint8_t *, size_t) { complete = true; });
+    ra.set_on_complete([&](const endpoint_key &, uint32_t, uint8_t, uint8_t *, size_t) { complete = true; });
 
     endpoint_key ep{};
     uint8_t data[100] = {};
@@ -2139,7 +2141,7 @@ static bool test_fragmented_e2e()
     size_t srv_complete_size = 0;
 
     srv.set_on_allocate_message(
-        [&](uint32_t, uint8_t, uint8_t frag_count, size_t max_size) -> uint8_t *
+        [&](const endpoint_key &, uint32_t, uint8_t, uint8_t frag_count, size_t max_size) -> uint8_t *
         {
             srv_alloc_called = true;
             srv_buffer.resize(max_size, 0);
@@ -2147,7 +2149,7 @@ static bool test_fragmented_e2e()
         });
 
     srv.set_on_message_complete(
-        [&](uint32_t, uint8_t, uint8_t *, size_t total)
+        [&](const endpoint_key &, uint32_t, uint8_t, uint8_t *, size_t total)
         {
             srv_complete = true;
             srv_complete_size = total;
@@ -2216,14 +2218,14 @@ static bool test_fragmented_echo_e2e()
     uint16_t srv_echo_port = 0;
 
     srv.set_on_allocate_message(
-        [&](uint32_t, uint8_t, uint8_t, size_t max_size) -> uint8_t *
+        [&](const endpoint_key &, uint32_t, uint8_t, uint8_t, size_t max_size) -> uint8_t *
         {
             srv_buffer.resize(max_size, 0);
             return srv_buffer.data();
         });
 
     srv.set_on_message_complete(
-        [&](uint32_t, uint8_t channel_id, uint8_t *data, size_t total)
+        [&](const endpoint_key &, uint32_t, uint8_t channel_id, uint8_t *data, size_t total)
         {
             // Echo the complete message back
             srv.send_payload_to(data, total, channel_id, srv_echo_addr, srv_echo_port);
@@ -2260,14 +2262,14 @@ static bool test_fragmented_echo_e2e()
     size_t client_complete_size = 0;
 
     c.set_on_allocate_message(
-        [&](uint32_t, uint8_t, uint8_t, size_t max_size) -> uint8_t *
+        [&](const endpoint_key &, uint32_t, uint8_t, uint8_t, size_t max_size) -> uint8_t *
         {
             client_buffer.resize(max_size, 0);
             return client_buffer.data();
         });
 
     c.set_on_message_complete(
-        [&](uint32_t, uint8_t, uint8_t *, size_t total)
+        [&](const endpoint_key &, uint32_t, uint8_t, uint8_t *, size_t total)
         {
             client_complete_size = total;
             client_complete = true;
@@ -2323,11 +2325,12 @@ static bool test_reassembly_timeout()
     bool expired_check_failed = false;
     uint32_t expired_msg_id = 0;
 
-    ra.set_on_allocate([&](uint32_t, uint8_t, uint8_t, size_t) -> uint8_t * { return app_buffer.data(); });
-    ra.set_on_complete([&](uint32_t, uint8_t, uint8_t *, size_t)
+    ra.set_on_allocate([&](const endpoint_key &, uint32_t, uint8_t, uint8_t, size_t) -> uint8_t *
+                       { return app_buffer.data(); });
+    ra.set_on_complete([&](const endpoint_key &, uint32_t, uint8_t, uint8_t *, size_t)
                        { TEST_ASSERT(false, "on_complete should NOT fire for expired message"); });
     ra.set_on_expired(
-        [&](uint32_t msg_id, uint8_t, uint8_t *buf)
+        [&](const endpoint_key &, uint32_t msg_id, uint8_t, uint8_t *buf)
         {
             expired_callback = true;
             expired_msg_id = msg_id;
@@ -2372,15 +2375,15 @@ static bool test_message_id_wrap_protection()
     bool expired_called = false;
 
     ra.set_on_allocate(
-        [&](uint32_t, uint8_t, uint8_t frag_count, size_t) -> uint8_t *
+        [&](const endpoint_key &, uint32_t, uint8_t, uint8_t frag_count, size_t) -> uint8_t *
         {
             alloc_count++;
             return (alloc_count == 1) ? buf1.data() : buf2.data();
         });
 
     bool complete = false;
-    ra.set_on_complete([&](uint32_t, uint8_t, uint8_t *, size_t) { complete = true; });
-    ra.set_on_expired([&](uint32_t, uint8_t, uint8_t *) { expired_called = true; });
+    ra.set_on_complete([&](const endpoint_key &, uint32_t, uint8_t, uint8_t *, size_t) { complete = true; });
+    ra.set_on_expired([&](const endpoint_key &, uint32_t, uint8_t, uint8_t *) { expired_called = true; });
 
     endpoint_key ep{};
 
@@ -2422,13 +2425,13 @@ static bool test_scatter_gather_e2e()
     size_t srv_complete_size = 0;
 
     srv.set_on_allocate_message(
-        [&](uint32_t, uint8_t, uint8_t, size_t max_size) -> uint8_t *
+        [&](const endpoint_key &, uint32_t, uint8_t, uint8_t, size_t max_size) -> uint8_t *
         {
             srv_buffer.resize(max_size, 0);
             return srv_buffer.data();
         });
     srv.set_on_message_complete(
-        [&](uint32_t, uint8_t, uint8_t *, size_t total)
+        [&](const endpoint_key &, uint32_t, uint8_t, uint8_t *, size_t total)
         {
             srv_complete = true;
             srv_complete_size = total;
@@ -2495,11 +2498,12 @@ static bool test_set_on_message_expired_e2e()
     uint16_t expired_msg_id = 0;
     uint8_t expired_ch_id = 255;
 
-    srv.set_on_allocate_message([&](uint32_t, uint8_t, uint8_t, size_t) -> uint8_t * { return srv_buffer.data(); });
-    srv.set_on_message_complete([&](uint32_t, uint8_t, uint8_t *, size_t)
+    srv.set_on_allocate_message([&](const endpoint_key &, uint32_t, uint8_t, uint8_t, size_t) -> uint8_t *
+                                { return srv_buffer.data(); });
+    srv.set_on_message_complete([&](const endpoint_key &, uint32_t, uint8_t, uint8_t *, size_t)
                                 { TEST_ASSERT(false, "on_complete should NOT fire for expired message"); });
     srv.set_on_message_expired(
-        [&](uint32_t msg_id, uint8_t ch_id, uint8_t *buf)
+        [&](const endpoint_key &, uint32_t msg_id, uint8_t ch_id, uint8_t *buf)
         {
             expired_msg_id = msg_id;
             expired_ch_id = ch_id;

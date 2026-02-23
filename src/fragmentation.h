@@ -64,14 +64,15 @@ namespace entanglement
     // Called when the first fragment of a new message arrives.
     // The app must return a pointer to a buffer of at least max_total_size bytes,
     // or nullptr to reject the message (all subsequent fragments are silently dropped).
-    using on_allocate_message = std::function<uint8_t *(uint32_t message_id, uint8_t channel_id, uint8_t fragment_count,
-                                                        size_t max_total_size)>;
+    using on_allocate_message =
+        std::function<uint8_t *(const endpoint_key &sender, uint32_t message_id, uint8_t channel_id,
+                                uint8_t fragment_count, size_t max_total_size)>;
 
     // Called when all fragments of a message have arrived.
     // 'data' is the same pointer the app returned from on_allocate_message.
     // 'total_size' is the exact number of bytes written (last fragment may be smaller).
-    using on_message_complete =
-        std::function<void(uint32_t message_id, uint8_t channel_id, uint8_t *data, size_t total_size)>;
+    using on_message_complete = std::function<void(const endpoint_key &sender, uint32_t message_id, uint8_t channel_id,
+                                                   uint8_t *data, size_t total_size)>;
 
     // Called when all fragments of a sent message have been ACKed.
     // The sender can now release its source buffer.
@@ -79,7 +80,8 @@ namespace entanglement
 
     // Called when an incomplete fragmented message is expired (timeout).
     // The app should release the buffer it provided via on_allocate_message.
-    using on_message_expired = std::function<void(uint32_t message_id, uint8_t channel_id, uint8_t *app_buffer)>;
+    using on_message_expired =
+        std::function<void(const endpoint_key &sender, uint32_t message_id, uint8_t channel_id, uint8_t *app_buffer)>;
 
     // -----------------------------------------------------------------------
     // RECEIVER SIDE — reassembly_entry tracks one incoming fragmented message.

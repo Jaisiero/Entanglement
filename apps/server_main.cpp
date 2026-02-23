@@ -1,16 +1,21 @@
 // ============================================================================
-// Entanglement — Soak Test Server
+// Entanglement — Soak Test Server v2.0
 // ============================================================================
-// Receives messages from soak-test clients, tracks per-channel statistics,
-// verifies ordering for RELIABLE_ORDERED channels, detects gaps and
-// duplicates, echoes every message back, and prints a comprehensive
-// summary when clients disconnect or on Ctrl+C.
+// Receives both simple and fragmented messages from soak-test clients,
+// tracks per-channel statistics for each type, verifies ordering for
+// RELIABLE_ORDERED channels, detects gaps/duplicates, echoes every
+// message back, and prints a comprehensive summary.
+//
+// Simple messages   → set_on_packet_received   → echo via send_to
+// Fragmented messages → set_on_message_complete → echo via send_payload_to
 // ============================================================================
 
 #include "channel_manager.h"
+#include "endpoint_key.h"
 #include "packet_header.h"
 #include "platform.h"
 #include "server.h"
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -26,24 +31,25 @@
 
 using namespace entanglement;
 
-// --- Soak message payload (must match client) ---
+// --- Soak message payload (must match client — first 9 bytes of every payload) ---
 #pragma pack(push, 1)
 struct soak_msg
 {
-    uint32_t msg_id;         // Sequential per-channel message ID (0-based)
-    uint32_t total_expected; // Total messages the client will send on this channel
+    uint32_t msg_id;         // Sequential per-stream message ID (0-based)
+    uint32_t total_expected; // Total messages the client will send (0 = time-based)
     uint8_t channel_id;      // Channel this was sent on (for cross-check)
 };
 #pragma pack(pop)
 
 static constexpr size_t SOAK_MSG_SIZE = sizeof(soak_msg);
 
-// --- Per-channel receive statistics ---
-struct channel_recv_stats
+// --- Per-stream receive statistics ---
+// A "stream" is (channel_id, is_fragmented). We track 6 streams: 3 channels × 2 types.
+struct stream_recv_stats
 {
     uint8_t channel_id = 0;
     channel_mode mode = channel_mode::UNRELIABLE;
-    std::string name;
+    std::string label; // e.g. "reliable-simple" or "ordered-frag"
     uint32_t total_expected = 0;
 
     int unique_received = 0;
@@ -52,13 +58,9 @@ struct channel_recv_stats
     uint32_t highest_msg_id = 0;
     uint32_t last_ordered_id = UINT32_MAX;
 
-    // Sequence tracking
-    uint64_t min_sequence = UINT64_MAX;
-    uint64_t max_sequence = 0;
-
     std::set<uint32_t> received_ids;
 
-    void record(uint32_t mid, uint64_t seq)
+    void record(uint32_t mid)
     {
         if (received_ids.count(mid))
         {
@@ -69,22 +71,15 @@ struct channel_recv_stats
         ++unique_received;
         if (mid > highest_msg_id)
             highest_msg_id = mid;
-        if (seq < min_sequence)
-            min_sequence = seq;
-        if (seq > max_sequence)
-            max_sequence = seq;
 
         if (mode == channel_mode::RELIABLE_ORDERED)
         {
             if (last_ordered_id != UINT32_MAX && mid <= last_ordered_id)
-            {
                 ++out_of_order_count;
-            }
             last_ordered_id = mid;
         }
     }
 
-    // Effective expected: use total_expected if known, else highest_msg_id+1
     uint32_t effective_expected() const
     {
         if (total_expected > 0)
@@ -96,13 +91,9 @@ struct channel_recv_stats
     {
         std::vector<uint32_t> missing;
         uint32_t expected = effective_expected();
-        if (expected == 0)
-            return missing;
         for (uint32_t i = 0; i < expected; ++i)
-        {
             if (!received_ids.count(i))
                 missing.push_back(i);
-        }
         return missing;
     }
 };
@@ -112,20 +103,41 @@ struct client_recv_stats
 {
     std::string address;
     uint16_t port = 0;
-    int total_data_packets = 0;
+    int total_simple_packets = 0;
+    int total_frag_messages = 0;
     int total_invalid_format = 0;
-    int total_echoes_sent = 0;
-    std::unordered_map<uint8_t, channel_recv_stats> channels;
+    int total_simple_echoes = 0;
+    int total_frag_echoes = 0;
+    int total_expired = 0;
+
+    // simple_streams[channel_id] and frag_streams[channel_id]
+    std::unordered_map<uint8_t, stream_recv_stats> simple_streams;
+    std::unordered_map<uint8_t, stream_recv_stats> frag_streams;
+
     std::chrono::steady_clock::time_point first_packet_time;
     std::chrono::steady_clock::time_point last_packet_time;
     bool has_packets = false;
+
+    void touch()
+    {
+        auto now = std::chrono::steady_clock::now();
+        if (!has_packets)
+        {
+            first_packet_time = now;
+            has_packets = true;
+        }
+        last_packet_time = now;
+    }
 };
 
 // --- Global state ---
 static std::atomic<bool> g_running{true};
 static std::unordered_map<std::string, client_recv_stats> g_client_stats;
-static int g_total_data_packets = 0;
-static int g_total_echoes_sent = 0;
+static std::unordered_map<endpoint_key, std::pair<std::string, uint16_t>, endpoint_key_hash> g_endpoint_addr;
+static int g_total_simple_packets = 0;
+static int g_total_frag_messages = 0;
+static int g_total_simple_echoes = 0;
+static int g_total_frag_echoes = 0;
 static bool g_had_clients = false;
 
 static std::string make_client_key(const std::string &addr, uint16_t p)
@@ -139,73 +151,82 @@ static void signal_handler(int /*sig*/)
     g_running = false;
 }
 
-// --- Print per-channel stats block ---
-static void print_channel_stats(const channel_recv_stats &cs)
+// --- Resolve endpoint_key to (address, port) ---
+static bool resolve_endpoint(const endpoint_key &ek, std::string &addr, uint16_t &port)
 {
-    const char *mode_str = "UNKNOWN";
-    switch (cs.mode)
-    {
-        case channel_mode::UNRELIABLE:
-            mode_str = "UNRELIABLE";
-            break;
-        case channel_mode::RELIABLE:
-            mode_str = "RELIABLE";
-            break;
-        case channel_mode::RELIABLE_ORDERED:
-            mode_str = "RELIABLE_ORDERED";
-            break;
-    }
+    auto it = g_endpoint_addr.find(ek);
+    if (it == g_endpoint_addr.end())
+        return false;
+    addr = it->second.first;
+    port = it->second.second;
+    return true;
+}
 
-    uint32_t eff_expected = cs.effective_expected();
-    char pct_buf[32] = "N/A";
-    if (eff_expected > 0)
-        std::snprintf(pct_buf, sizeof(pct_buf), "%.4f%%", 100.0 * cs.unique_received / eff_expected);
-
-    std::cout << "  Channel: " << cs.name << " (id=" << static_cast<int>(cs.channel_id) << ", " << mode_str << ")"
-              << std::endl;
-    std::cout << "    Unique messages received: " << cs.unique_received << " / " << eff_expected << " (" << pct_buf
-              << ")" << std::endl;
-    std::cout << "    Duplicates received:      " << cs.duplicate_count << std::endl;
-    if (cs.min_sequence != UINT64_MAX)
+// --- Initialize a stream_recv_stats entry ---
+static void init_stream(stream_recv_stats &s, uint8_t ch_id, bool fragmented, const server &srv)
+{
+    s.channel_id = ch_id;
+    const auto *cfg = srv.channels().get_channel(ch_id);
+    if (cfg)
     {
-        std::cout << "    Sequence range:           [" << cs.min_sequence << " .. " << cs.max_sequence
-                  << "] (span=" << (cs.max_sequence - cs.min_sequence + 1) << ")" << std::endl;
-    }
-
-    if (cs.mode == channel_mode::RELIABLE_ORDERED)
-    {
-        std::cout << "    Ordering violations:      " << cs.out_of_order_count << std::endl;
-    }
-
-    auto missing = cs.missing_ids();
-    if (missing.empty())
-    {
-        std::cout << "    Missing IDs:              none" << std::endl;
+        s.mode = cfg->mode;
+        s.label = cfg->name;
     }
     else
     {
-        std::cout << "    Missing IDs:              " << missing.size() << " total";
+        s.label = "ch" + std::to_string(ch_id);
+    }
+    s.label += fragmented ? "-frag" : "-simple";
+}
+
+// --- Format helpers ---
+static const char *mode_str(channel_mode m)
+{
+    switch (m)
+    {
+        case channel_mode::UNRELIABLE:
+            return "UNRELIABLE";
+        case channel_mode::RELIABLE:
+            return "RELIABLE";
+        case channel_mode::RELIABLE_ORDERED:
+            return "RELIABLE_ORDERED";
+    }
+    return "UNKNOWN";
+}
+
+static void print_stream_stats(const stream_recv_stats &s)
+{
+    uint32_t eff = s.effective_expected();
+    char pct[32] = "N/A";
+    if (eff > 0)
+        std::snprintf(pct, sizeof(pct), "%.4f%%", 100.0 * s.unique_received / eff);
+
+    std::cout << "  Stream: " << s.label << " (id=" << static_cast<int>(s.channel_id) << ", " << mode_str(s.mode) << ")"
+              << std::endl;
+    std::cout << "    Unique received:     " << s.unique_received << " / " << eff << " (" << pct << ")" << std::endl;
+    std::cout << "    Duplicates:          " << s.duplicate_count << std::endl;
+
+    if (s.mode == channel_mode::RELIABLE_ORDERED)
+        std::cout << "    Order violations:    " << s.out_of_order_count << std::endl;
+
+    auto missing = s.missing_ids();
+    if (missing.empty())
+    {
+        std::cout << "    Missing IDs:         none" << std::endl;
+    }
+    else
+    {
+        std::cout << "    Missing IDs:         " << missing.size();
         if (missing.size() <= 20)
         {
             std::cout << " [";
             for (size_t i = 0; i < missing.size(); ++i)
             {
-                if (i > 0)
+                if (i)
                     std::cout << ", ";
                 std::cout << missing[i];
             }
             std::cout << "]";
-        }
-        else
-        {
-            std::cout << " (first 20: [";
-            for (size_t i = 0; i < 20; ++i)
-            {
-                if (i > 0)
-                    std::cout << ", ";
-                std::cout << missing[i];
-            }
-            std::cout << ", ...])";
         }
         std::cout << std::endl;
     }
@@ -215,36 +236,47 @@ static void print_channel_stats(const channel_recv_stats &cs)
 static void print_client_stats(const client_recv_stats &cs)
 {
     std::cout << "\n--- Client: " << cs.address << ":" << cs.port << " ---" << std::endl;
-    std::cout << "  Total data packets received: " << cs.total_data_packets << std::endl;
-    std::cout << "  Invalid format packets:      " << cs.total_invalid_format << std::endl;
-    std::cout << "  Echoes sent back:            " << cs.total_echoes_sent << std::endl;
+    std::cout << "  Simple packets received:     " << cs.total_simple_packets << std::endl;
+    std::cout << "  Fragmented messages received: " << cs.total_frag_messages << std::endl;
+    std::cout << "  Invalid format:              " << cs.total_invalid_format << std::endl;
+    std::cout << "  Simple echoes sent:          " << cs.total_simple_echoes << std::endl;
+    std::cout << "  Fragmented echoes sent:      " << cs.total_frag_echoes << std::endl;
+    std::cout << "  Expired (incomplete) frags:  " << cs.total_expired << std::endl;
 
     if (cs.has_packets)
     {
-        auto duration =
-            std::chrono::duration_cast<std::chrono::milliseconds>(cs.last_packet_time - cs.first_packet_time);
-        std::cout << "  Duration (first..last pkt):  " << duration.count() << " ms" << std::endl;
-
-        if (duration.count() > 0)
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(cs.last_packet_time - cs.first_packet_time);
+        std::cout << "  Duration (first..last):      " << ms.count() << " ms" << std::endl;
+        if (ms.count() > 0)
         {
-            double rate = 1000.0 * cs.total_data_packets / duration.count();
-            std::cout << "  Receive throughput:          " << std::fixed << std::setprecision(1) << rate << " pkt/s"
+            double rate = 1000.0 * (cs.total_simple_packets + cs.total_frag_messages) / ms.count();
+            std::cout << "  Receive throughput:          " << std::fixed << std::setprecision(1) << rate << " msg/s"
                       << std::endl;
         }
     }
 
+    // Collect and sort all stream ids
+    std::set<uint8_t> all_ids;
+    for (auto &[id, _] : cs.simple_streams)
+        all_ids.insert(id);
+    for (auto &[id, _] : cs.frag_streams)
+        all_ids.insert(id);
+
     std::cout << std::endl;
-
-    // Print channels sorted by id
-    std::vector<uint8_t> ch_ids;
-    for (auto &[id, _] : cs.channels)
-        ch_ids.push_back(id);
-    std::sort(ch_ids.begin(), ch_ids.end());
-
-    for (uint8_t id : ch_ids)
+    for (uint8_t id : all_ids)
     {
-        print_channel_stats(cs.channels.at(id));
-        std::cout << std::endl;
+        auto sit = cs.simple_streams.find(id);
+        if (sit != cs.simple_streams.end())
+        {
+            print_stream_stats(sit->second);
+            std::cout << std::endl;
+        }
+        auto fit = cs.frag_streams.find(id);
+        if (fit != cs.frag_streams.end())
+        {
+            print_stream_stats(fit->second);
+            std::cout << std::endl;
+        }
     }
 }
 
@@ -254,44 +286,49 @@ static void print_aggregate_stats()
     std::cout << "\n=============================================" << std::endl;
     std::cout << " ENTANGLEMENT SOAK TEST — SERVER SUMMARY" << std::endl;
     std::cout << "=============================================" << std::endl;
+    std::cout << "Simple packets received:     " << g_total_simple_packets << std::endl;
+    std::cout << "Fragmented messages received: " << g_total_frag_messages << std::endl;
+    std::cout << "Simple echoes sent:          " << g_total_simple_echoes << std::endl;
+    std::cout << "Fragmented echoes sent:      " << g_total_frag_echoes << std::endl;
 
-    std::cout << "Total data packets received (all clients): " << g_total_data_packets << std::endl;
-    std::cout << "Total echoes sent back:                     " << g_total_echoes_sent << std::endl;
-
-    bool all_reliable_ok = true;
-    bool all_ordered_ok = true;
+    bool all_simple_reliable_ok = true;
+    bool all_simple_ordered_ok = true;
+    bool all_frag_reliable_ok = true;
+    bool all_frag_ordered_ok = true;
 
     for (auto &[key, cs] : g_client_stats)
     {
         print_client_stats(cs);
 
-        for (auto &[ch_id, ch] : cs.channels)
+        // Simple streams
+        for (auto &[ch_id, s] : cs.simple_streams)
         {
-            if (ch.mode == channel_mode::RELIABLE || ch.mode == channel_mode::RELIABLE_ORDERED)
-            {
-                if (ch.unique_received < static_cast<int>(ch.total_expected))
-                {
-                    all_reliable_ok = false;
-                }
-            }
-            if (ch.mode == channel_mode::RELIABLE_ORDERED && ch.out_of_order_count > 0)
-            {
-                all_ordered_ok = false;
-            }
+            if (s.mode == channel_mode::RELIABLE || s.mode == channel_mode::RELIABLE_ORDERED)
+                if (s.unique_received < static_cast<int>(s.effective_expected()))
+                    all_simple_reliable_ok = false;
+            if (s.mode == channel_mode::RELIABLE_ORDERED && s.out_of_order_count > 0)
+                all_simple_ordered_ok = false;
+        }
+        // Frag streams
+        for (auto &[ch_id, s] : cs.frag_streams)
+        {
+            if (s.mode == channel_mode::RELIABLE || s.mode == channel_mode::RELIABLE_ORDERED)
+                if (s.unique_received < static_cast<int>(s.effective_expected()))
+                    all_frag_reliable_ok = false;
+            if (s.mode == channel_mode::RELIABLE_ORDERED && s.out_of_order_count > 0)
+                all_frag_ordered_ok = false;
         }
     }
 
     std::cout << "=============================================\n" << std::endl;
 
-    if (all_reliable_ok)
-        std::cout << "  VERDICT: ALL RELIABLE MESSAGES RECEIVED   [PASS]" << std::endl;
-    else
-        std::cout << "  VERDICT: SOME RELIABLE MESSAGES MISSING   [FAIL]" << std::endl;
+    // Simple verdicts
+    std::cout << "  SIMPLE RELIABLE DELIVERY:     " << (all_simple_reliable_ok ? "[PASS]" : "[FAIL]") << std::endl;
+    std::cout << "  SIMPLE ORDERED INTACT:        " << (all_simple_ordered_ok ? "[PASS]" : "[FAIL]") << std::endl;
 
-    if (all_ordered_ok)
-        std::cout << "  VERDICT: ORDERED DELIVERY INTACT          [PASS]" << std::endl;
-    else
-        std::cout << "  VERDICT: ORDERING VIOLATIONS DETECTED     [FAIL]" << std::endl;
+    // Fragmented verdicts (no retransmission → report as info)
+    std::cout << "  FRAG RELIABLE DELIVERY:       " << (all_frag_reliable_ok ? "[PASS]" : "[WARN]") << std::endl;
+    std::cout << "  FRAG ORDERED INTACT:          " << (all_frag_ordered_ok ? "[PASS]" : "[WARN]") << std::endl;
 
     std::cout << "\n=============================================" << std::endl;
 }
@@ -313,10 +350,11 @@ int main(int argc, char *argv[])
     std::signal(SIGINT, signal_handler);
 
     std::cout << "=============================================" << std::endl;
-    std::cout << " Entanglement Soak Test Server v1.0" << std::endl;
+    std::cout << " Entanglement Soak Test Server v2.0" << std::endl;
     std::cout << " Port: " << port << std::endl;
     std::cout << " Header size: " << sizeof(packet_header) << " bytes" << std::endl;
-    std::cout << " Soak payload: " << SOAK_MSG_SIZE << " bytes" << std::endl;
+    std::cout << " Soak payload (simple): " << SOAK_MSG_SIZE << " bytes" << std::endl;
+    std::cout << " Max fragment payload:  " << MAX_FRAGMENT_PAYLOAD << " bytes" << std::endl;
     std::cout << "=============================================" << std::endl;
 
     server srv(port);
@@ -324,8 +362,9 @@ int main(int argc, char *argv[])
 
     // --- Client connected ---
     srv.set_on_client_connected(
-        [&](const endpoint_key & /*key*/, const std::string &addr, uint16_t p)
+        [&](const endpoint_key &ek, const std::string &addr, uint16_t p)
         {
+            g_endpoint_addr[ek] = {addr, p};
             std::string ck = make_client_key(addr, p);
             auto &cs = g_client_stats[ck];
             cs.address = addr;
@@ -336,81 +375,46 @@ int main(int argc, char *argv[])
 
     // --- Client disconnected ---
     srv.set_on_client_disconnected(
-        [&](const endpoint_key & /*key*/, const std::string &addr, uint16_t p)
+        [&](const endpoint_key &ek, const std::string &addr, uint16_t p)
         {
-            std::string ck = make_client_key(addr, p);
             std::cout << "[server] Client disconnected: " << addr << ":" << p << std::endl;
-            auto it = g_client_stats.find(ck);
+            auto it = g_client_stats.find(make_client_key(addr, p));
             if (it != g_client_stats.end())
-            {
                 print_client_stats(it->second);
-            }
+            g_endpoint_addr.erase(ek);
         });
 
-    // --- Packet received ---
+    // =========================================================================
+    // SIMPLE MESSAGES → on_packet_received
+    // =========================================================================
     srv.set_on_packet_received(
         [&](const packet_header &hdr, const uint8_t *payload, size_t size, const std::string &addr, uint16_t p)
         {
-            ++g_total_data_packets;
+            ++g_total_simple_packets;
 
             std::string ck = make_client_key(addr, p);
             auto &cs = g_client_stats[ck];
-            ++cs.total_data_packets;
+            ++cs.total_simple_packets;
+            cs.touch();
 
-            auto now = std::chrono::steady_clock::now();
-            if (!cs.has_packets)
-            {
-                cs.first_packet_time = now;
-                cs.has_packets = true;
-            }
-            cs.last_packet_time = now;
-
-            // Parse soak message
             if (size >= SOAK_MSG_SIZE)
             {
                 soak_msg msg;
                 std::memcpy(&msg, payload, SOAK_MSG_SIZE);
 
                 uint8_t ch_id = hdr.channel_id;
+                auto &st = cs.simple_streams[ch_id];
+                if (st.label.empty())
+                    init_stream(st, ch_id, false, srv);
+                if (st.total_expected == 0)
+                    st.total_expected = msg.total_expected;
+                st.record(msg.msg_id);
 
-                // Initialize channel stats if needed
-                if (cs.channels.find(ch_id) == cs.channels.end())
+                // Verbose: first 5, every 5000
+                if (st.unique_received <= 5 || st.unique_received % 5000 == 0)
                 {
-                    auto &ch = cs.channels[ch_id];
-                    ch.channel_id = ch_id;
-
-                    const auto *cfg = srv.channels().get_channel(ch_id);
-                    if (cfg)
-                    {
-                        ch.mode = cfg->mode;
-                        ch.name = cfg->name;
-                    }
-                    else
-                    {
-                        ch.name = "ch" + std::to_string(ch_id);
-                    }
-                }
-
-                auto &ch = cs.channels[ch_id];
-                if (ch.total_expected == 0)
-                    ch.total_expected = msg.total_expected;
-
-                ch.record(msg.msg_id, hdr.sequence);
-
-                // Verbose logging: first 5, every 1000, last 5
-                bool verbose = false;
-                if (ch.unique_received <= 5)
-                    verbose = true;
-                else if (ch.unique_received % 1000 == 0)
-                    verbose = true;
-                else if (msg.total_expected > 0 && msg.msg_id >= msg.total_expected - 5)
-                    verbose = true;
-
-                if (verbose)
-                {
-                    std::cout << "[recv] " << addr << ":" << p << " ch=" << ch.name << " msg_id=" << msg.msg_id << "/"
-                              << msg.total_expected << " seq=" << hdr.sequence << " ack=" << hdr.ack
-                              << " (unique=" << ch.unique_received << ")" << std::endl;
+                    std::cout << "[simple] " << addr << ":" << p << " " << st.label << " msg=" << msg.msg_id
+                              << " (unique=" << st.unique_received << ")" << std::endl;
                 }
             }
             else
@@ -418,16 +422,87 @@ int main(int argc, char *argv[])
                 ++cs.total_invalid_format;
             }
 
-            // Echo back on same channel
+            // Echo back
             packet_header reply{};
             reply.flags = hdr.flags;
             reply.shard_id = hdr.shard_id;
             reply.channel_id = hdr.channel_id;
             reply.payload_size = static_cast<uint16_t>(size);
             srv.send_to(reply, payload, addr, p);
-            ++cs.total_echoes_sent;
-            ++g_total_echoes_sent;
+            ++cs.total_simple_echoes;
+            ++g_total_simple_echoes;
         });
+
+    // =========================================================================
+    // FRAGMENTED MESSAGES → reassembler callbacks
+    // =========================================================================
+
+    // Allocate reassembly buffer
+    srv.set_on_allocate_message([&](const endpoint_key & /*sender*/, uint32_t /*msg_id*/, uint8_t /*ch_id*/,
+                                    uint8_t /*frag_count*/,
+                                    size_t max_size) -> uint8_t * { return new uint8_t[max_size]; });
+
+    // Message fully reassembled — track stats and echo back
+    srv.set_on_message_complete(
+        [&](const endpoint_key &sender, uint32_t /*protocol_msg_id*/, uint8_t ch_id, uint8_t *data, size_t total_size)
+        {
+            ++g_total_frag_messages;
+
+            std::string addr;
+            uint16_t p = 0;
+            if (!resolve_endpoint(sender, addr, p))
+            {
+                delete[] data;
+                return;
+            }
+
+            std::string ck = make_client_key(addr, p);
+            auto &cs = g_client_stats[ck];
+            ++cs.total_frag_messages;
+            cs.touch();
+
+            if (total_size >= SOAK_MSG_SIZE)
+            {
+                soak_msg msg;
+                std::memcpy(&msg, data, SOAK_MSG_SIZE);
+
+                auto &st = cs.frag_streams[ch_id];
+                if (st.label.empty())
+                    init_stream(st, ch_id, true, srv);
+                if (st.total_expected == 0)
+                    st.total_expected = msg.total_expected;
+                st.record(msg.msg_id);
+
+                if (st.unique_received <= 5 || st.unique_received % 5000 == 0)
+                {
+                    std::cout << "[frag]   " << addr << ":" << p << " " << st.label << " msg=" << msg.msg_id
+                              << " size=" << total_size << " (unique=" << st.unique_received << ")" << std::endl;
+                }
+            }
+
+            // Echo entire reassembled payload back (auto-fragments)
+            srv.send_payload_to(data, total_size, ch_id, addr, p);
+            ++cs.total_frag_echoes;
+            ++g_total_frag_echoes;
+
+            delete[] data;
+        });
+
+    // Incomplete message expired
+    srv.set_on_message_expired(
+        [&](const endpoint_key &sender, uint32_t /*msg_id*/, uint8_t /*ch_id*/, uint8_t *buf)
+        {
+            std::string addr;
+            uint16_t p = 0;
+            if (resolve_endpoint(sender, addr, p))
+            {
+                auto &cs = g_client_stats[make_client_key(addr, p)];
+                ++cs.total_expired;
+            }
+            delete[] buf;
+        });
+
+    // =========================================================================
 
     if (!srv.start())
     {
@@ -437,7 +512,6 @@ int main(int argc, char *argv[])
 
     std::cout << "[server] Waiting for clients... (Ctrl+C to stop)" << std::endl;
 
-    // Main loop with auto-stop on idle
     auto idle_start = std::chrono::steady_clock::now();
     constexpr auto IDLE_TIMEOUT = std::chrono::seconds(5);
 
@@ -449,11 +523,8 @@ int main(int argc, char *argv[])
         auto now = std::chrono::steady_clock::now();
 
         if (srv.connection_count() > 0)
-        {
             idle_start = now;
-        }
 
-        // Auto-stop: if we had clients and all disconnected, wait IDLE_TIMEOUT then stop
         if (g_had_clients && srv.connection_count() == 0)
         {
             if (now - idle_start > IDLE_TIMEOUT)

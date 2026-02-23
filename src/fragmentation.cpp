@@ -23,7 +23,7 @@ namespace entanglement
             if (entry->fragment_count != fhdr.fragment_count)
             {
                 if (m_on_expired)
-                    m_on_expired(entry->message_id, entry->channel_id, entry->app_buffer);
+                    m_on_expired(entry->sender, entry->message_id, entry->channel_id, entry->app_buffer);
                 entry->reset();
                 entry = nullptr; // fall through to allocate new
             }
@@ -40,7 +40,7 @@ namespace entanglement
             uint8_t *buf = nullptr;
             if (m_on_allocate)
             {
-                buf = m_on_allocate(fhdr.message_id, channel_id, fhdr.fragment_count, max_size);
+                buf = m_on_allocate(sender, fhdr.message_id, channel_id, fhdr.fragment_count, max_size);
             }
 
             if (!buf)
@@ -88,7 +88,7 @@ namespace entanglement
         // All fragments received — notify app
         if (m_on_complete)
         {
-            m_on_complete(entry->message_id, entry->channel_id, entry->app_buffer, entry->total_size());
+            m_on_complete(entry->sender, entry->message_id, entry->channel_id, entry->app_buffer, entry->total_size());
         }
 
         entry->reset();
@@ -126,7 +126,7 @@ namespace entanglement
             if (elapsed > timeout_us)
             {
                 if (m_on_expired)
-                    m_on_expired(e.message_id, e.channel_id, e.app_buffer);
+                    m_on_expired(e.sender, e.message_id, e.channel_id, e.app_buffer);
                 e.reset();
                 ++evicted;
             }
