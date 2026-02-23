@@ -921,14 +921,25 @@ static bool test_header_integrity()
     TEST_ASSERT(hdr.shard_id == 42, "shard_id should be preserved");
     TEST_ASSERT(hdr.channel_id == 7, "channel_id should be preserved");
     TEST_ASSERT(hdr.payload_size == 100, "payload_size should be preserved");
+    TEST_ASSERT(hdr.channel_sequence == 1, "first channel_sequence on ch7 should be 1");
 
-    // Second packet
+    // Second packet on same channel — channel_sequence increments
     packet_header hdr2{};
     hdr2.flags = 0;
+    hdr2.channel_id = 7;
     hdr2.payload_size = 0;
     conn.prepare_header(hdr2);
 
     TEST_ASSERT(hdr2.sequence == 2, "second sequence should be 2");
+    TEST_ASSERT(hdr2.channel_sequence == 2, "second channel_sequence on ch7 should be 2");
+
+    // Third packet on a DIFFERENT channel — independent counter
+    packet_header hdr3{};
+    hdr3.channel_id = 3;
+    conn.prepare_header(hdr3);
+
+    TEST_ASSERT(hdr3.sequence == 3, "third global sequence should be 3");
+    TEST_ASSERT(hdr3.channel_sequence == 1, "first channel_sequence on ch3 should be 1");
 
     return true;
 }
@@ -1819,23 +1830,23 @@ static bool test_fragment_reassembler_basic()
     std::vector<uint8_t> app_buffer(MAX_FRAGMENT_PAYLOAD * 3, 0);
     bool alloc_called = false;
     bool complete_called = false;
+    bool complete_check_failed = false;
     size_t complete_size = 0;
 
     ra.set_on_allocate(
-        [&](uint16_t, uint8_t, uint8_t, size_t) -> uint8_t *
+        [&](uint32_t, uint8_t, uint8_t, size_t) -> uint8_t *
         {
             alloc_called = true;
             return app_buffer.data();
         });
 
     ra.set_on_complete(
-        [&](uint16_t msg_id, uint8_t ch_id, uint8_t *data, size_t total)
+        [&](uint32_t msg_id, uint8_t ch_id, uint8_t *data, size_t total)
         {
             complete_called = true;
             complete_size = total;
-            TEST_ASSERT(msg_id == 42, "message_id should be 42");
-            TEST_ASSERT(ch_id == 5, "channel_id should be 5");
-            TEST_ASSERT(data == app_buffer.data(), "data pointer should be app buffer");
+            if (msg_id != 42 || ch_id != 5 || data != app_buffer.data())
+                complete_check_failed = true;
         });
 
     endpoint_key ep{0x7F000001, 1234};
@@ -1857,6 +1868,7 @@ static bool test_fragment_reassembler_basic()
     done = ra.process_fragment(ep, 5, fh2, original.data() + 2 * MAX_FRAGMENT_PAYLOAD, 100);
     TEST_ASSERT(done, "complete after frag 2");
     TEST_ASSERT(complete_called, "on_complete should have been called");
+    TEST_ASSERT(!complete_check_failed, "on_complete: msg_id, ch_id or data pointer mismatch");
     TEST_ASSERT(complete_size == msg_size, "total size should match");
     TEST_ASSERT(std::memcmp(app_buffer.data(), original.data(), msg_size) == 0, "reassembled data should match");
     TEST_ASSERT(ra.pending_count() == 0, "no pending after completion");
@@ -1880,8 +1892,8 @@ static bool test_fragment_reassembler_out_of_order()
     std::vector<uint8_t> app_buffer(msg_size, 0);
     bool complete = false;
 
-    ra.set_on_allocate([&](uint16_t, uint8_t, uint8_t, size_t) -> uint8_t * { return app_buffer.data(); });
-    ra.set_on_complete([&](uint16_t, uint8_t, uint8_t *, size_t) { complete = true; });
+    ra.set_on_allocate([&](uint32_t, uint8_t, uint8_t, size_t) -> uint8_t * { return app_buffer.data(); });
+    ra.set_on_complete([&](uint32_t, uint8_t, uint8_t *, size_t) { complete = true; });
 
     endpoint_key ep{};
     uint8_t fcount = 3;
@@ -1914,8 +1926,8 @@ static bool test_fragment_duplicate_ignored()
     std::vector<uint8_t> app_buffer(MAX_FRAGMENT_PAYLOAD * 2, 0);
     bool complete = false;
 
-    ra.set_on_allocate([&](uint16_t, uint8_t, uint8_t, size_t) -> uint8_t * { return app_buffer.data(); });
-    ra.set_on_complete([&](uint16_t, uint8_t, uint8_t *, size_t) { complete = true; });
+    ra.set_on_allocate([&](uint32_t, uint8_t, uint8_t, size_t) -> uint8_t * { return app_buffer.data(); });
+    ra.set_on_complete([&](uint32_t, uint8_t, uint8_t *, size_t) { complete = true; });
 
     endpoint_key ep{};
     std::vector<uint8_t> data(MAX_FRAGMENT_PAYLOAD * 2, 0xAB);
@@ -1946,10 +1958,10 @@ static bool test_fragment_app_rejects()
     fragment_reassembler ra;
 
     // Return nullptr to reject
-    ra.set_on_allocate([](uint16_t, uint8_t, uint8_t, size_t) -> uint8_t * { return nullptr; });
+    ra.set_on_allocate([](uint32_t, uint8_t, uint8_t, size_t) -> uint8_t * { return nullptr; });
 
     bool complete = false;
-    ra.set_on_complete([&](uint16_t, uint8_t, uint8_t *, size_t) { complete = true; });
+    ra.set_on_complete([&](uint32_t, uint8_t, uint8_t *, size_t) { complete = true; });
 
     endpoint_key ep{};
     uint8_t data[100] = {};
@@ -2010,7 +2022,7 @@ static bool test_pending_message_ack_tracking()
     conn.set_active(true);
     conn.set_state(connection_state::CONNECTED);
 
-    uint16_t msg_id = conn.next_message_id();
+    uint32_t msg_id = conn.next_message_id();
     uint8_t frag_count = 3;
 
     // Send 3 fragments
@@ -2033,11 +2045,13 @@ static bool test_pending_message_ack_tracking()
 
     // Track callback
     bool acked_callback = false;
+    bool acked_check_failed = false;
     conn.set_on_message_acked(
-        [&](uint16_t id)
+        [&](uint32_t id)
         {
             acked_callback = true;
-            TEST_ASSERT(id == msg_id, "acked message_id should match");
+            if (id != msg_id)
+                acked_check_failed = true;
         });
 
     // Simulate remote ACKing all 3 sequences (seq 1, 2, 3)
@@ -2053,6 +2067,7 @@ static bool test_pending_message_ack_tracking()
 
     TEST_ASSERT(conn.is_message_acked(msg_id), "message should be acked after all fragments ACKed");
     TEST_ASSERT(acked_callback, "on_message_acked should have fired");
+    TEST_ASSERT(!acked_check_failed, "acked message_id should match");
 
     return true;
 }
@@ -2124,7 +2139,7 @@ static bool test_fragmented_e2e()
     size_t srv_complete_size = 0;
 
     srv.set_on_allocate_message(
-        [&](uint16_t, uint8_t, uint8_t frag_count, size_t max_size) -> uint8_t *
+        [&](uint32_t, uint8_t, uint8_t frag_count, size_t max_size) -> uint8_t *
         {
             srv_alloc_called = true;
             srv_buffer.resize(max_size, 0);
@@ -2132,7 +2147,7 @@ static bool test_fragmented_e2e()
         });
 
     srv.set_on_message_complete(
-        [&](uint16_t, uint8_t, uint8_t *, size_t total)
+        [&](uint32_t, uint8_t, uint8_t *, size_t total)
         {
             srv_complete = true;
             srv_complete_size = total;
@@ -2201,14 +2216,14 @@ static bool test_fragmented_echo_e2e()
     uint16_t srv_echo_port = 0;
 
     srv.set_on_allocate_message(
-        [&](uint16_t, uint8_t, uint8_t, size_t max_size) -> uint8_t *
+        [&](uint32_t, uint8_t, uint8_t, size_t max_size) -> uint8_t *
         {
             srv_buffer.resize(max_size, 0);
             return srv_buffer.data();
         });
 
     srv.set_on_message_complete(
-        [&](uint16_t, uint8_t channel_id, uint8_t *data, size_t total)
+        [&](uint32_t, uint8_t channel_id, uint8_t *data, size_t total)
         {
             // Echo the complete message back
             srv.send_payload_to(data, total, channel_id, srv_echo_addr, srv_echo_port);
@@ -2245,14 +2260,14 @@ static bool test_fragmented_echo_e2e()
     size_t client_complete_size = 0;
 
     c.set_on_allocate_message(
-        [&](uint16_t, uint8_t, uint8_t, size_t max_size) -> uint8_t *
+        [&](uint32_t, uint8_t, uint8_t, size_t max_size) -> uint8_t *
         {
             client_buffer.resize(max_size, 0);
             return client_buffer.data();
         });
 
     c.set_on_message_complete(
-        [&](uint16_t, uint8_t, uint8_t *, size_t total)
+        [&](uint32_t, uint8_t, uint8_t *, size_t total)
         {
             client_complete_size = total;
             client_complete = true;
@@ -2263,7 +2278,7 @@ static bool test_fragmented_echo_e2e()
     // Sender ACK tracking: verify the app knows when it can release the send buffer
     // NOTE: registered after connect() because connect() calls reset() internally.
     std::atomic<bool> send_acked{false};
-    c.set_on_message_acked([&](uint16_t) { send_acked = true; });
+    c.set_on_message_acked([&](uint32_t) { send_acked = true; });
 
     // Send 4000-byte message
     const size_t msg_size = 4000;
@@ -2305,17 +2320,19 @@ static bool test_reassembly_timeout()
 
     std::vector<uint8_t> app_buffer(MAX_FRAGMENT_PAYLOAD * 3, 0);
     bool expired_callback = false;
-    uint16_t expired_msg_id = 0;
+    bool expired_check_failed = false;
+    uint32_t expired_msg_id = 0;
 
-    ra.set_on_allocate([&](uint16_t, uint8_t, uint8_t, size_t) -> uint8_t * { return app_buffer.data(); });
-    ra.set_on_complete([&](uint16_t, uint8_t, uint8_t *, size_t)
+    ra.set_on_allocate([&](uint32_t, uint8_t, uint8_t, size_t) -> uint8_t * { return app_buffer.data(); });
+    ra.set_on_complete([&](uint32_t, uint8_t, uint8_t *, size_t)
                        { TEST_ASSERT(false, "on_complete should NOT fire for expired message"); });
     ra.set_on_expired(
-        [&](uint16_t msg_id, uint8_t, uint8_t *buf)
+        [&](uint32_t msg_id, uint8_t, uint8_t *buf)
         {
             expired_callback = true;
             expired_msg_id = msg_id;
-            TEST_ASSERT(buf == app_buffer.data(), "expired callback should provide app buffer");
+            if (buf != app_buffer.data())
+                expired_check_failed = true;
         });
 
     endpoint_key ep{};
@@ -2334,6 +2351,7 @@ static bool test_reassembly_timeout()
     TEST_ASSERT(evicted == 1, "should evict 1 entry");
     TEST_ASSERT(ra.pending_count() == 0, "no pending after cleanup");
     TEST_ASSERT(expired_callback, "on_expired should have fired");
+    TEST_ASSERT(!expired_check_failed, "expired callback should provide app buffer");
     TEST_ASSERT(expired_msg_id == 10, "expired message_id should match");
 
     return true;
@@ -2354,15 +2372,15 @@ static bool test_message_id_wrap_protection()
     bool expired_called = false;
 
     ra.set_on_allocate(
-        [&](uint16_t, uint8_t, uint8_t frag_count, size_t) -> uint8_t *
+        [&](uint32_t, uint8_t, uint8_t frag_count, size_t) -> uint8_t *
         {
             alloc_count++;
             return (alloc_count == 1) ? buf1.data() : buf2.data();
         });
 
     bool complete = false;
-    ra.set_on_complete([&](uint16_t, uint8_t, uint8_t *, size_t) { complete = true; });
-    ra.set_on_expired([&](uint16_t, uint8_t, uint8_t *) { expired_called = true; });
+    ra.set_on_complete([&](uint32_t, uint8_t, uint8_t *, size_t) { complete = true; });
+    ra.set_on_expired([&](uint32_t, uint8_t, uint8_t *) { expired_called = true; });
 
     endpoint_key ep{};
 
@@ -2404,13 +2422,13 @@ static bool test_scatter_gather_e2e()
     size_t srv_complete_size = 0;
 
     srv.set_on_allocate_message(
-        [&](uint16_t, uint8_t, uint8_t, size_t max_size) -> uint8_t *
+        [&](uint32_t, uint8_t, uint8_t, size_t max_size) -> uint8_t *
         {
             srv_buffer.resize(max_size, 0);
             return srv_buffer.data();
         });
     srv.set_on_message_complete(
-        [&](uint16_t, uint8_t, uint8_t *, size_t total)
+        [&](uint32_t, uint8_t, uint8_t *, size_t total)
         {
             srv_complete = true;
             srv_complete_size = total;
@@ -2473,19 +2491,21 @@ static bool test_set_on_message_expired_e2e()
 
     std::vector<uint8_t> srv_buffer(MAX_FRAGMENT_PAYLOAD * 3, 0);
     std::atomic<bool> expired_fired{false};
+    bool expired_check_failed = false;
     uint16_t expired_msg_id = 0;
     uint8_t expired_ch_id = 255;
 
-    srv.set_on_allocate_message([&](uint16_t, uint8_t, uint8_t, size_t) -> uint8_t * { return srv_buffer.data(); });
-    srv.set_on_message_complete([&](uint16_t, uint8_t, uint8_t *, size_t)
+    srv.set_on_allocate_message([&](uint32_t, uint8_t, uint8_t, size_t) -> uint8_t * { return srv_buffer.data(); });
+    srv.set_on_message_complete([&](uint32_t, uint8_t, uint8_t *, size_t)
                                 { TEST_ASSERT(false, "on_complete should NOT fire for expired message"); });
     srv.set_on_message_expired(
-        [&](uint16_t msg_id, uint8_t ch_id, uint8_t *buf)
+        [&](uint32_t msg_id, uint8_t ch_id, uint8_t *buf)
         {
             expired_msg_id = msg_id;
             expired_ch_id = ch_id;
             expired_fired.store(true);
-            TEST_ASSERT(buf == srv_buffer.data(), "expired callback should provide app buffer");
+            if (buf != srv_buffer.data())
+                expired_check_failed = true;
         });
 
     TEST_ASSERT(srv.start(), "server should start");
@@ -2530,6 +2550,7 @@ static bool test_set_on_message_expired_e2e()
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
     TEST_ASSERT(expired_fired.load(), "set_on_message_expired should have fired via server.update()");
+    TEST_ASSERT(!expired_check_failed, "expired callback should provide app buffer");
     TEST_ASSERT(expired_msg_id == 42, "expired message_id should be 42");
     TEST_ASSERT(expired_ch_id == channels::RELIABLE.id, "expired channel_id should match");
 

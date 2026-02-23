@@ -127,7 +127,7 @@ namespace entanglement
         void send_raw_control(uint8_t control_type, const std::string &address, uint16_t port);
 
         // Send a single fragment to a client (called from send_payload_to)
-        int send_fragment_to(udp_connection *conn, uint16_t message_id, uint8_t index, uint8_t count, const void *data,
+        int send_fragment_to(udp_connection *conn, uint32_t message_id, uint8_t index, uint8_t count, const void *data,
                              size_t size, uint8_t flags, uint8_t channel_id, const std::string &address, uint16_t port);
     };
 

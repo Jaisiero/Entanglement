@@ -31,6 +31,9 @@ namespace entanglement
         // Reset congestion control
         m_cc.reset();
 
+        // Reset per-channel sequences
+        std::memset(m_channel_sequences, 0, sizeof(m_channel_sequences));
+
         // Reset fragmentation state (preserve callback — it's app config, not session state)
         m_next_message_id = 1;
         for (auto &pm : m_pending_messages)
@@ -53,6 +56,7 @@ namespace entanglement
         header.sequence = seq;
         header.ack = m_remote_sequence;
         header.ack_bitmap = m_recv_bitmap;
+        header.channel_sequence = ++m_channel_sequences[header.channel_id];
 
         // Register metadata in send buffer (no payload copy)
         size_t index = seq % SEQUENCE_BUFFER_SIZE;
@@ -256,6 +260,23 @@ namespace entanglement
             // The application may resend as a new packet if it chooses.
             entry.active = false;
 
+            // Track fragment loss in pending_message so zombie entries get cleaned up
+            if (entry.message_id != 0)
+            {
+                for (auto &pm : m_pending_messages)
+                {
+                    if (pm.active && pm.message_id == entry.message_id)
+                    {
+                        pm.lost_count++;
+                        if (pm.is_abandoned())
+                        {
+                            pm.reset(); // Free the slot — all fragments resolved
+                        }
+                        break;
+                    }
+                }
+            }
+
             // Notify congestion controller
             m_cc.on_packet_lost();
             m_cc.update_pacing(m_srtt);
@@ -284,7 +305,7 @@ namespace entanglement
 
     // --- Fragmentation (sender side) ---
 
-    bool udp_connection::register_pending_message(uint16_t message_id, uint8_t fragment_count)
+    bool udp_connection::register_pending_message(uint32_t message_id, uint8_t fragment_count)
     {
         for (auto &pm : m_pending_messages)
         {
@@ -300,7 +321,7 @@ namespace entanglement
         return false; // all slots full
     }
 
-    bool udp_connection::is_message_acked(uint16_t message_id) const
+    bool udp_connection::is_message_acked(uint32_t message_id) const
     {
         for (const auto &pm : m_pending_messages)
         {

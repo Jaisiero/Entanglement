@@ -123,7 +123,7 @@ namespace entanglement
         void handle_control(const uint8_t *payload, size_t payload_size);
 
         // Send a single fragment (called from send_payload for fragmented paths)
-        int send_fragment(uint16_t message_id, uint8_t index, uint8_t count, const void *data, size_t size,
+        int send_fragment(uint32_t message_id, uint8_t index, uint8_t count, const void *data, size_t size,
                           uint8_t flags, uint8_t channel_id);
     };
 

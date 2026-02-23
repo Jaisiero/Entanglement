@@ -20,19 +20,20 @@ namespace entanglement
 #pragma pack(push, 1)
     struct packet_header
     {
-        uint16_t magic;        // Protocol magic identifier
-        uint8_t version;       // Protocol version
-        uint8_t flags;         // Packet flags
-        uint16_t shard_id;     // Shard identifier
-        uint8_t channel_id;    // Channel identifier
-        uint8_t reserved;      // Reserved (alignment)
-        uint64_t sequence;     // Sequence number
-        uint64_t ack;          // Acknowledgment number
-        uint32_t ack_bitmap;   // Selective ACK bitmap
-        uint16_t payload_size; // Payload size in bytes
+        uint16_t magic;            // Protocol magic identifier
+        uint8_t version;           // Protocol version
+        uint8_t flags;             // Packet flags
+        uint16_t shard_id;         // Shard identifier
+        uint8_t channel_id;        // Channel identifier
+        uint8_t reserved;          // Reserved for future use
+        uint64_t sequence;         // Global sequence number (ACK / loss / RTT)
+        uint64_t ack;              // Acknowledgment number
+        uint32_t ack_bitmap;       // Selective ACK bitmap
+        uint32_t channel_sequence; // Per-channel sequence (ordering / dedup)
+        uint16_t payload_size;     // Payload size in bytes
     };
 #pragma pack(pop)
 
-    static_assert(sizeof(packet_header) == 30, "packet_header must be 30 bytes");
+    static_assert(sizeof(packet_header) == 34, "packet_header must be 34 bytes");
 
 } // namespace entanglement

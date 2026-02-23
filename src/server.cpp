@@ -250,7 +250,7 @@ namespace entanglement
         if (fragment_count == 0)
             return -1;
 
-        uint16_t message_id = conn->next_message_id();
+        uint32_t message_id = conn->next_message_id();
         int total_sent = 0;
 
         for (uint8_t i = 0; i < fragment_count; ++i)
@@ -269,7 +269,7 @@ namespace entanglement
         return total_sent;
     }
 
-    int server::send_fragment_to(udp_connection *conn, uint16_t message_id, uint8_t index, uint8_t count,
+    int server::send_fragment_to(udp_connection *conn, uint32_t message_id, uint8_t index, uint8_t count,
                                  const void *data, size_t size, uint8_t flags, uint8_t channel_id,
                                  const std::string &address, uint16_t port)
     {

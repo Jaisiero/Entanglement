@@ -74,12 +74,12 @@ namespace entanglement
     constexpr size_t MAX_GATHER_SEGMENTS = 2; // Max payload segments per send_packet_gather (header excluded)
 
     // --- Fragmentation ---
-    constexpr size_t FRAGMENT_HEADER_SIZE = 4; // [message_id(2)][index(1)][count(1)]
-    constexpr size_t PACKET_HEADER_SIZE = 30;  // Must match sizeof(packet_header)
+    constexpr size_t FRAGMENT_HEADER_SIZE = 6; // [message_id(4)][index(1)][count(1)]
+    constexpr size_t PACKET_HEADER_SIZE = 34;  // Must match sizeof(packet_header)
     constexpr size_t MAX_FRAGMENT_PAYLOAD =
         MAX_PACKET_SIZE - PACKET_HEADER_SIZE - FRAGMENT_HEADER_SIZE; // ~1166 bytes user data per fragment
-    constexpr size_t MAX_PENDING_FRAGMENTED_MESSAGES = 32;           // sender: concurrent fragmented sends tracked
-    constexpr size_t MAX_INCOMING_FRAGMENTED_MESSAGES = 32;          // receiver: concurrent reassemblies tracked
+    constexpr size_t MAX_PENDING_FRAGMENTED_MESSAGES = 64;           // sender: concurrent fragmented sends tracked
+    constexpr size_t MAX_INCOMING_FRAGMENTED_MESSAGES = 64;          // receiver: concurrent reassemblies tracked
     constexpr int64_t REASSEMBLY_TIMEOUT_US = 5'000'000;             // 5 s — expire incomplete messages
 
 } // namespace entanglement

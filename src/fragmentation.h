@@ -19,7 +19,7 @@ namespace entanglement
 #pragma pack(push, 1)
     struct fragment_header
     {
-        uint16_t message_id;
+        uint32_t message_id;
         uint8_t fragment_index;
         uint8_t fragment_count;
     };
@@ -36,9 +36,10 @@ namespace entanglement
     struct pending_message
     {
         bool active = false;
-        uint16_t message_id = 0;
+        uint32_t message_id = 0;
         uint8_t fragment_count = 0;
         uint8_t acked_count = 0;
+        uint8_t lost_count = 0; // fragments reported lost (to detect zombie entries)
 
         void reset()
         {
@@ -46,9 +47,13 @@ namespace entanglement
             message_id = 0;
             fragment_count = 0;
             acked_count = 0;
+            lost_count = 0;
         }
 
         bool is_complete() const { return acked_count == fragment_count; }
+
+        // A message is abandoned when all its fragments are either ACKed or lost
+        bool is_abandoned() const { return (acked_count + lost_count) >= fragment_count; }
     };
 
     // -----------------------------------------------------------------------
@@ -59,22 +64,22 @@ namespace entanglement
     // Called when the first fragment of a new message arrives.
     // The app must return a pointer to a buffer of at least max_total_size bytes,
     // or nullptr to reject the message (all subsequent fragments are silently dropped).
-    using on_allocate_message = std::function<uint8_t *(uint16_t message_id, uint8_t channel_id, uint8_t fragment_count,
+    using on_allocate_message = std::function<uint8_t *(uint32_t message_id, uint8_t channel_id, uint8_t fragment_count,
                                                         size_t max_total_size)>;
 
     // Called when all fragments of a message have arrived.
     // 'data' is the same pointer the app returned from on_allocate_message.
     // 'total_size' is the exact number of bytes written (last fragment may be smaller).
     using on_message_complete =
-        std::function<void(uint16_t message_id, uint8_t channel_id, uint8_t *data, size_t total_size)>;
+        std::function<void(uint32_t message_id, uint8_t channel_id, uint8_t *data, size_t total_size)>;
 
     // Called when all fragments of a sent message have been ACKed.
     // The sender can now release its source buffer.
-    using on_message_acked = std::function<void(uint16_t message_id)>;
+    using on_message_acked = std::function<void(uint32_t message_id)>;
 
     // Called when an incomplete fragmented message is expired (timeout).
     // The app should release the buffer it provided via on_allocate_message.
-    using on_message_expired = std::function<void(uint16_t message_id, uint8_t channel_id, uint8_t *app_buffer)>;
+    using on_message_expired = std::function<void(uint32_t message_id, uint8_t channel_id, uint8_t *app_buffer)>;
 
     // -----------------------------------------------------------------------
     // RECEIVER SIDE — reassembly_entry tracks one incoming fragmented message.
@@ -84,7 +89,7 @@ namespace entanglement
     struct reassembly_entry
     {
         bool active = false;
-        uint16_t message_id = 0;
+        uint32_t message_id = 0;
         endpoint_key sender{};
         uint8_t channel_id = 0;
         uint8_t fragment_count = 0;
@@ -160,7 +165,7 @@ namespace entanglement
         on_message_complete m_on_complete;
         on_message_expired m_on_expired;
 
-        reassembly_entry *find_entry(const endpoint_key &sender, uint16_t message_id);
+        reassembly_entry *find_entry(const endpoint_key &sender, uint32_t message_id);
         reassembly_entry *allocate_entry();
     };
 

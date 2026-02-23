@@ -24,7 +24,7 @@ namespace entanglement
         uint8_t channel_id = 0;
         uint16_t shard_id = 0;
         uint16_t payload_size = 0;
-        uint16_t message_id = 0;    // Non-zero if this packet is a fragment
+        uint32_t message_id = 0;    // Non-zero if this packet is a fragment
         uint8_t fragment_index = 0; // Which fragment within the message
         std::chrono::steady_clock::time_point send_time{};
     };
@@ -38,7 +38,7 @@ namespace entanglement
         uint8_t channel_id = 0;
         uint16_t shard_id = 0;
         uint16_t payload_size = 0;
-        uint16_t message_id = 0;    // Non-zero if this was a fragment
+        uint32_t message_id = 0;    // Non-zero if this was a fragment
         uint8_t fragment_index = 0; // Which fragment within the message
     };
 
@@ -117,15 +117,15 @@ namespace entanglement
         // --- Fragmentation (sender side) ---
 
         // Get a new monotonic message_id for a fragmented send
-        uint16_t next_message_id() { return m_next_message_id++; }
+        uint32_t next_message_id() { return m_next_message_id++; }
 
         // Register a fragmented send for ACK tracking.
         // Call after all fragments have been sent via prepare_header.
         // Returns false if the pending table is full.
-        bool register_pending_message(uint16_t message_id, uint8_t fragment_count);
+        bool register_pending_message(uint32_t message_id, uint8_t fragment_count);
 
         // Query whether a fragmented message has been fully ACKed
-        bool is_message_acked(uint16_t message_id) const;
+        bool is_message_acked(uint32_t message_id) const;
 
         // Set callback for when all fragments of a message are ACKed
         void set_on_message_acked(on_message_acked cb) { m_on_message_acked = std::move(cb); }
@@ -161,9 +161,12 @@ namespace entanglement
         uint32_t m_rtt_sample_count = 0;
 
         // Fragmentation (sender side)
-        uint16_t m_next_message_id = 1; // 0 = not a fragment
+        uint32_t m_next_message_id = 1; // 0 = not a fragment
         pending_message m_pending_messages[MAX_PENDING_FRAGMENTED_MESSAGES]{};
         on_message_acked m_on_message_acked;
+
+        // Per-channel sequence counters (indexed by channel_id)
+        uint32_t m_channel_sequences[MAX_CHANNELS]{};
 
         // Congestion control algorithm instance
         congestion_control m_cc;

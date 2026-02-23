@@ -141,7 +141,7 @@ namespace entanglement
         if (fragment_count == 0)
             return -1;
 
-        uint16_t message_id = m_connection.next_message_id();
+        uint32_t message_id = m_connection.next_message_id();
         int total_sent = 0;
 
         for (uint8_t i = 0; i < fragment_count; ++i)
@@ -161,7 +161,7 @@ namespace entanglement
         return total_sent;
     }
 
-    int client::send_fragment(uint16_t message_id, uint8_t index, uint8_t count, const void *data, size_t size,
+    int client::send_fragment(uint32_t message_id, uint8_t index, uint8_t count, const void *data, size_t size,
                               uint8_t flags, uint8_t channel_id)
     {
         // Build fragment header on stack (4 bytes)

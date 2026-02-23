@@ -95,7 +95,7 @@ namespace entanglement
         return true;
     }
 
-    reassembly_entry *fragment_reassembler::find_entry(const endpoint_key &sender, uint16_t message_id)
+    reassembly_entry *fragment_reassembler::find_entry(const endpoint_key &sender, uint32_t message_id)
     {
         for (auto &e : m_entries)
         {
