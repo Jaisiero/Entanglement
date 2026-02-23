@@ -26,6 +26,7 @@ namespace entanglement
         uint16_t payload_size = 0;
         uint32_t message_id = 0;    // Non-zero if this packet is a fragment
         uint8_t fragment_index = 0; // Which fragment within the message
+        uint8_t fragment_count = 0; // Total fragments in the message (0 if not a fragment)
         std::chrono::steady_clock::time_point send_time{};
     };
 
@@ -40,6 +41,7 @@ namespace entanglement
         uint16_t payload_size = 0;
         uint32_t message_id = 0;    // Non-zero if this was a fragment
         uint8_t fragment_index = 0; // Which fragment within the message
+        uint8_t fragment_count = 0; // Total fragments in the message
     };
 
     // --- Connection state ---
@@ -136,6 +138,21 @@ namespace entanglement
         congestion_info congestion() const { return m_cc.info(); }
         congestion_control &cc() { return m_cc; }
 
+        // --- Fragment reassembly (receiver side, per-connection) ---
+
+        fragment_reassembler &reassembler() { return m_reassembler; }
+        const fragment_reassembler &reassembler() const { return m_reassembler; }
+
+        // --- Fragment flow control (backpressure) ---
+
+        // Sender side: remote peer told us to throttle fragmented sends
+        bool is_fragment_backpressured() const { return m_fragment_backpressured; }
+        void set_fragment_backpressured(bool bp) { m_fragment_backpressured = bp; }
+
+        // Receiver side: we already sent CONTROL_BACKPRESSURE to sender
+        bool backpressure_sent() const { return m_backpressure_sent; }
+        void set_backpressure_sent(bool sent) { m_backpressure_sent = sent; }
+
     private:
         bool m_active = false;
         connection_state m_state = connection_state::DISCONNECTED;
@@ -170,6 +187,13 @@ namespace entanglement
 
         // Congestion control algorithm instance
         congestion_control m_cc;
+
+        // Fragment reassembly (receiver side) — per-connection pool
+        fragment_reassembler m_reassembler;
+
+        // Fragment flow control (backpressure)
+        bool m_fragment_backpressured = false; // sender side: remote told us to throttle
+        bool m_backpressure_sent = false;      // receiver side: we sent throttle signal
 
         // Helper: mark a sent packet as acked.
         // take_rtt_sample: true for primary ACK (header.ack), false for bitmap entries

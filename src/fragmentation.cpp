@@ -4,14 +4,14 @@
 namespace entanglement
 {
 
-    bool fragment_reassembler::process_fragment(const endpoint_key &sender, uint8_t channel_id,
-                                                const fragment_header &fhdr, const uint8_t *frag_data,
-                                                size_t frag_data_size)
+    fragment_result fragment_reassembler::process_fragment(const endpoint_key &sender, uint8_t channel_id,
+                                                           const fragment_header &fhdr, const uint8_t *frag_data,
+                                                           size_t frag_data_size)
     {
         if (fhdr.fragment_count == 0 || fhdr.fragment_index >= fhdr.fragment_count)
-            return false;
+            return fragment_result::invalid;
         if (frag_data_size == 0 || frag_data_size > MAX_FRAGMENT_PAYLOAD)
-            return false;
+            return fragment_result::invalid;
 
         // Find or create entry
         reassembly_entry *entry = find_entry(sender, fhdr.message_id);
@@ -32,8 +32,22 @@ namespace entanglement
         if (!entry)
         {
             entry = allocate_entry();
+
+            // Layer 3a: try aggressive cleanup (half timeout) to free stale slots
             if (!entry)
-                return false; // all slots full
+            {
+                cleanup_stale(std::chrono::steady_clock::now(), m_reassembly_timeout_us / 2);
+                entry = allocate_entry();
+            }
+
+            // Layer 3b: evict entry with least progress
+            if (!entry)
+            {
+                entry = try_evict_least_progress();
+            }
+
+            if (!entry)
+                return fragment_result::slots_full; // all slots truly full
 
             // Ask the app for a buffer
             size_t max_size = static_cast<size_t>(fhdr.fragment_count) * MAX_FRAGMENT_PAYLOAD;
@@ -46,7 +60,7 @@ namespace entanglement
             if (!buf)
             {
                 // App rejected — leave slot unused
-                return false;
+                return fragment_result::rejected;
             }
 
             entry->active = true;
@@ -63,11 +77,11 @@ namespace entanglement
 
         // Consistency check (after wrap protection, counts always match here)
         if (entry->fragment_count != fhdr.fragment_count)
-            return false;
+            return fragment_result::invalid;
 
         // Duplicate fragment
         if (entry->has_fragment(fhdr.fragment_index))
-            return false;
+            return fragment_result::duplicate;
 
         // Write fragment data directly into app-provided buffer (single memcpy — the only one)
         size_t offset = static_cast<size_t>(fhdr.fragment_index) * MAX_FRAGMENT_PAYLOAD;
@@ -83,7 +97,7 @@ namespace entanglement
 
         // Check completion
         if (!entry->is_complete())
-            return false;
+            return fragment_result::accepted;
 
         // All fragments received — notify app
         if (m_on_complete)
@@ -92,7 +106,7 @@ namespace entanglement
         }
 
         entry->reset();
-        return true;
+        return fragment_result::completed;
     }
 
     reassembly_entry *fragment_reassembler::find_entry(const endpoint_key &sender, uint32_t message_id)
@@ -132,6 +146,60 @@ namespace entanglement
             }
         }
         return evicted;
+    }
+
+    void fragment_reassembler::clear()
+    {
+        for (auto &e : m_entries)
+        {
+            if (e.active)
+            {
+                if (m_on_expired)
+                    m_on_expired(e.sender, e.message_id, e.channel_id, e.app_buffer);
+                e.reset();
+            }
+        }
+    }
+
+    int fragment_reassembler::usage_percent() const
+    {
+        size_t count = pending_count();
+        if (MAX_INCOMING_FRAGMENTED_MESSAGES == 0)
+            return 0;
+        return static_cast<int>((count * 100) / MAX_INCOMING_FRAGMENTED_MESSAGES);
+    }
+
+    reassembly_entry *fragment_reassembler::try_evict_least_progress()
+    {
+        reassembly_entry *victim = nullptr;
+        float worst_progress = 2.0f; // > 1.0 means no victim found yet
+
+        for (auto &e : m_entries)
+        {
+            if (!e.active)
+                continue;
+            float progress = (e.fragment_count > 0)
+                                 ? static_cast<float>(e.received_count) / static_cast<float>(e.fragment_count)
+                                 : 0.0f;
+            if (progress < worst_progress)
+            {
+                worst_progress = progress;
+                victim = &e;
+            }
+        }
+
+        if (victim)
+        {
+            // Notify via on_evicted (preferred) or fall back to on_expired
+            if (m_on_evicted)
+                m_on_evicted(victim->sender, victim->message_id, victim->channel_id, victim->app_buffer,
+                             victim->received_count, victim->fragment_count);
+            else if (m_on_expired)
+                m_on_expired(victim->sender, victim->message_id, victim->channel_id, victim->app_buffer);
+            victim->reset();
+        }
+
+        return victim;
     }
 
 } // namespace entanglement

@@ -27,7 +27,7 @@ namespace entanglement
     constexpr int64_t INITIAL_RTO_US = 200'000; // 200 ms initial retransmission timeout
     constexpr int64_t MIN_RTO_US = 50'000;      // 50 ms minimum RTO
     constexpr int64_t MAX_RTO_US = 2'000'000;   // 2 s maximum RTO
-    constexpr int MAX_LOSSES_PER_UPDATE = 16;   // max loss notifications per update() call
+    constexpr int MAX_LOSSES_PER_UPDATE = 64;   // max loss notifications per update() call
 
     // --- RTT estimation (RFC 6298 / Jacobson-Karels) ---
     constexpr double RTT_ALPHA = 0.125;             // SRTT smoothing factor (1/8)
@@ -62,6 +62,7 @@ namespace entanglement
         CONTROL_HEARTBEAT = 0x05,
         CONTROL_CHANNEL_OPEN = 0x06, // Client requests opening a channel
         CONTROL_CHANNEL_ACK = 0x07,  // Server responds to channel open
+        CONTROL_BACKPRESSURE = 0x08, // Flow control: receiver tells sender to throttle/resume
     };
 
     // --- Channel negotiation ---
@@ -69,6 +70,10 @@ namespace entanglement
     constexpr uint8_t CHANNEL_STATUS_REJECTED = 0x01;
     constexpr int CHANNEL_OPEN_MAX_ATTEMPTS = 5;            // retries before giving up
     constexpr int64_t CHANNEL_OPEN_RETRY_INTERVAL_MS = 200; // ms between retries
+
+    // --- Fragment flow control (backpressure) ---
+    constexpr int BACKPRESSURE_HIGH_WATERMARK = 75; // percent: send throttle signal to sender
+    constexpr int BACKPRESSURE_LOW_WATERMARK = 50;  // percent: send relief signal to sender
 
     // --- Scatter-gather I/O ---
     constexpr size_t MAX_GATHER_SEGMENTS = 2; // Max payload segments per send_packet_gather (header excluded)
@@ -79,7 +84,7 @@ namespace entanglement
     constexpr size_t MAX_FRAGMENT_PAYLOAD =
         MAX_PACKET_SIZE - PACKET_HEADER_SIZE - FRAGMENT_HEADER_SIZE; // ~1166 bytes user data per fragment
     constexpr size_t MAX_PENDING_FRAGMENTED_MESSAGES = 64;           // sender: concurrent fragmented sends tracked
-    constexpr size_t MAX_INCOMING_FRAGMENTED_MESSAGES = 64;          // receiver: concurrent reassemblies tracked
-    constexpr int64_t REASSEMBLY_TIMEOUT_US = 5'000'000;             // 5 s — expire incomplete messages
+    constexpr size_t MAX_INCOMING_FRAGMENTED_MESSAGES = 64;          // receiver: per-connection concurrent reassemblies
+    constexpr int64_t REASSEMBLY_TIMEOUT_US = 15'000'000;            // 15 s — accommodate fragment retransmissions
 
 } // namespace entanglement

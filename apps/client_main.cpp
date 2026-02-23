@@ -1,8 +1,8 @@
 // ============================================================================
-// Entanglement — Soak Test Client v3.0  (Simple + Fragmented)
+// Entanglement — Soak Test Client v4.0  (Simple + Fragmented, Full Retransmit)
 // ============================================================================
 //
-// Usage: EntanglementClient [server_ip] [port] [-t <minutes>] [-c <clients>]
+// Usage: EntanglementClient [-s ip] [-p port] [-t min] [-c clients] [-d drop%]
 //
 // Sends both SIMPLE (9-byte) and FRAGMENTED (2500-byte) messages on all
 // three default channels, giving 6 independent streams:
@@ -16,11 +16,10 @@
 //   ordered-frag           RELIABLE_ORDERED  fragmented
 //   unreliable-frag        UNRELIABLE        fragmented
 //
-// Simple messages are retransmitted on loss.  Fragmented messages are NOT
-// retransmitted (the library does not provide per-fragment retransmit and
-// resending the whole message would create a new protocol message_id).
-// The verdict for fragmented reliable streams is therefore [PASS]/[WARN]
-// based on a delivery threshold (≥ 99.5%).
+// Both simple and fragmented reliable messages are retransmitted on loss.
+// The library reports per-fragment loss metadata (message_id, fragment_index,
+// fragment_count) and the app retransmits individual fragments using stored
+// payloads — no intermediate buffers inside the library.
 //
 // Tracks ACKs, losses, echoes, ordering, and per-stream sequence numbers.
 // ============================================================================
@@ -206,6 +205,13 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
 
     std::unordered_map<uint64_t, sent_msg_info> seq_to_msg; // simple retransmission tracking
 
+    // --- Fragment retransmission state ---
+    // Library message_id → full payload (app stores for retransmit)
+    std::unordered_map<uint32_t, std::vector<uint8_t>> frag_payloads;
+    // Per-fragment retry counter: key = (message_id << 8) | fragment_index
+    std::unordered_map<uint64_t, int> frag_retries;
+    constexpr int MAX_FRAG_RETRIES = 10;
+
     client cli(server_ip, port);
     cli.set_verbose(false);
     cli.channels().register_defaults();
@@ -270,7 +276,38 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
             auto it = frag_idx.find(info.channel_id);
             if (it != frag_idx.end())
                 ++result.streams[it->second].losses_detected;
-            // No retransmission for fragmented messages
+
+            if (!cli.channels().is_reliable(info.channel_id))
+                return;
+
+            // Check retry limit
+            uint64_t frag_key = (static_cast<uint64_t>(info.message_id) << 8) | info.fragment_index;
+            int &retries = frag_retries[frag_key];
+            if (retries >= MAX_FRAG_RETRIES)
+                return;
+            ++retries;
+
+            // Look up stored payload
+            auto pit = frag_payloads.find(info.message_id);
+            if (pit == frag_payloads.end())
+                return; // payload not found (shouldn't happen)
+
+            const auto &payload = pit->second;
+            size_t offset = static_cast<size_t>(info.fragment_index) * MAX_FRAGMENT_PAYLOAD;
+            if (offset >= payload.size())
+                return; // safety check
+            size_t chunk = (std::min)(MAX_FRAGMENT_PAYLOAD, payload.size() - offset);
+
+            cli.send_fragment(info.message_id, info.fragment_index, info.fragment_count, payload.data() + offset, chunk,
+                              0, info.channel_id);
+
+            if (it != frag_idx.end())
+            {
+                ++result.streams[it->second].retransmissions;
+                ++result.streams[it->second].total_packets;
+            }
+            ++result.total_retransmissions;
+            ++result.total_data_packets_sent;
             return;
         }
 
@@ -408,10 +445,16 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
             uint32_t msg_id = static_cast<uint32_t>(frag_sent[ch_index]);
 
             build_frag_payload(frag_buf, msg_id, 0, ch_id);
-            int sent_bytes = cli.send_payload(frag_buf.data(), frag_buf.size(), 0, ch_id);
+
+            uint32_t lib_message_id = 0;
+            int sent_bytes = cli.send_payload(frag_buf.data(), frag_buf.size(), 0, ch_id, &lib_message_id);
 
             if (sent_bytes > 0)
             {
+                // Store payload for potential fragment retransmission
+                if (lib_message_id != 0)
+                    frag_payloads[lib_message_id] = frag_buf;
+
                 ++frag_sent[ch_index];
                 // Each fragmented message generates ceil(2500/1160)=3 packets
                 result.total_data_packets_sent += 3;
@@ -456,10 +499,11 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
     }
 
     // --- Drain echoes + detect remaining losses ---
-    int expected_simple_reliable = result.streams[S_REL].messages_sent + result.streams[S_ORD].messages_sent;
+    int expected_reliable = result.streams[S_REL].messages_sent + result.streams[S_ORD].messages_sent +
+                            result.streams[F_REL].messages_sent + result.streams[F_ORD].messages_sent;
 
     auto drain_start = std::chrono::steady_clock::now();
-    constexpr auto MAX_DRAIN = std::chrono::seconds(15);
+    constexpr auto MAX_DRAIN = std::chrono::seconds(20);
 
     while (true)
     {
@@ -470,10 +514,11 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
         if (now - drain_start > MAX_DRAIN)
             break;
 
-        int confirmed = result.streams[S_REL].echoes_received + result.streams[S_ORD].echoes_received;
-        if (confirmed >= expected_simple_reliable)
+        int confirmed = result.streams[S_REL].echoes_received + result.streams[S_ORD].echoes_received +
+                        result.streams[F_REL].echoes_received + result.streams[F_ORD].echoes_received;
+        if (confirmed >= expected_reliable)
         {
-            // Give a bit more time for fragmented echoes
+            // Give a bit more time for remaining echoes
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
             cli.poll();
             cli.update(on_loss);
@@ -543,8 +588,7 @@ static void print_stream(const stream_send_stats &s)
     std::cout << "    Echoes received:        " << s.echoes_received << " / " << s.messages_sent << " ("
               << fmt_pct(s.echoes_received, s.messages_sent) << ")" << std::endl;
     std::cout << "    Losses detected:        " << s.losses_detected << std::endl;
-    if (!s.fragmented)
-        std::cout << "    Retransmissions:        " << s.retransmissions << std::endl;
+    std::cout << "    Retransmissions:        " << s.retransmissions << std::endl;
 
     if (s.mode == channel_mode::RELIABLE || s.mode == channel_mode::RELIABLE_ORDERED)
     {
@@ -650,7 +694,7 @@ int main(int argc, char *argv[])
     int duration_seconds = duration_minutes * 60;
 
     std::cout << "=============================================" << std::endl;
-    std::cout << " Entanglement Soak Test Client v3.0" << std::endl;
+    std::cout << " Entanglement Soak Test Client v4.0" << std::endl;
     std::cout << " Server:    " << server_ip << ":" << server_port << std::endl;
     std::cout << " Duration:  " << duration_minutes << " min (" << duration_seconds << "s)" << std::endl;
     std::cout << " Clients:   " << num_clients << std::endl;
@@ -801,26 +845,22 @@ int main(int argc, char *argv[])
     std::cout << "  SIMPLE UNRELIABLE DELIVERY:               "
               << fmt_pct(agg_stream_echo[S_UNR], agg_stream_sent[S_UNR]) << std::endl;
 
-    // Frag verdicts (no retransmission → use a softer threshold)
+    // Frag verdicts (with retransmission — same standard as simple)
     int64_t frag_rel_sent = agg_stream_sent[F_REL] + agg_stream_sent[F_ORD];
     int64_t frag_rel_echo = agg_stream_echo[F_REL] + agg_stream_echo[F_ORD];
-    double frag_del_pct = frag_rel_sent > 0 ? 100.0 * frag_rel_echo / frag_rel_sent : 100.0;
-    bool frag_rel_pass = (frag_del_pct >= 99.5);
+    bool frag_rel_pass = (frag_rel_echo == frag_rel_sent);
     bool frag_ord_pass = (agg_stream_violations[F_ORD] == 0);
 
-    char frag_pct_buf[32];
-    std::snprintf(frag_pct_buf, sizeof(frag_pct_buf), "%.4f%%", frag_del_pct);
-
     if (frag_rel_pass)
-        std::cout << "  FRAG RELIABLE DELIVERED (" << frag_pct_buf << "):  [PASS]" << std::endl;
+        std::cout << "  FRAG RELIABLE DELIVERED:                 [PASS]" << std::endl;
     else
-        std::cout << "  FRAG RELIABLE DELIVERED (" << frag_pct_buf << "):  [WARN] (" << (frag_rel_sent - frag_rel_echo)
+        std::cout << "  FRAG RELIABLE DELIVERED:                 [FAIL] (" << (frag_rel_sent - frag_rel_echo)
                   << " missing)" << std::endl;
 
     if (frag_ord_pass)
         std::cout << "  FRAG ORDERED INTACT:                     [PASS]" << std::endl;
     else
-        std::cout << "  FRAG ORDERED INTACT:                     [WARN] (" << agg_stream_violations[F_ORD]
+        std::cout << "  FRAG ORDERED INTACT:                     [FAIL] (" << agg_stream_violations[F_ORD]
                   << " violations)" << std::endl;
 
     std::cout << "  FRAG UNRELIABLE DELIVERY:                "
@@ -829,5 +869,5 @@ int main(int argc, char *argv[])
     std::cout << "\n=============================================" << std::endl;
 
     platform_shutdown();
-    return (simple_rel_pass && simple_ord_pass) ? 0 : 1;
+    return (simple_rel_pass && simple_ord_pass && frag_rel_pass && frag_ord_pass) ? 0 : 1;
 }

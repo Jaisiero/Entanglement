@@ -1854,19 +1854,19 @@ static bool test_fragment_reassembler_basic()
 
     // Fragment 0
     fragment_header fh0{42, 0, fcount};
-    bool done = ra.process_fragment(ep, 5, fh0, original.data(), MAX_FRAGMENT_PAYLOAD);
-    TEST_ASSERT(!done, "not complete after frag 0");
+    auto done = ra.process_fragment(ep, 5, fh0, original.data(), MAX_FRAGMENT_PAYLOAD);
+    TEST_ASSERT(done != fragment_result::completed, "not complete after frag 0");
     TEST_ASSERT(alloc_called, "on_allocate should have been called");
 
     // Fragment 1
     fragment_header fh1{42, 1, fcount};
     done = ra.process_fragment(ep, 5, fh1, original.data() + MAX_FRAGMENT_PAYLOAD, MAX_FRAGMENT_PAYLOAD);
-    TEST_ASSERT(!done, "not complete after frag 1");
+    TEST_ASSERT(done != fragment_result::completed, "not complete after frag 1");
 
     // Fragment 2 (last, smaller)
     fragment_header fh2{42, 2, fcount};
     done = ra.process_fragment(ep, 5, fh2, original.data() + 2 * MAX_FRAGMENT_PAYLOAD, 100);
-    TEST_ASSERT(done, "complete after frag 2");
+    TEST_ASSERT(done == fragment_result::completed, "complete after frag 2");
     TEST_ASSERT(complete_called, "on_complete should have been called");
     TEST_ASSERT(!complete_check_failed, "on_complete: msg_id, ch_id or data pointer mismatch");
     TEST_ASSERT(complete_size == msg_size, "total size should match");
@@ -1938,14 +1938,14 @@ static bool test_fragment_duplicate_ignored()
     ra.process_fragment(ep, 0, fh0, data.data(), MAX_FRAGMENT_PAYLOAD);
 
     // Duplicate frag 0
-    bool done = ra.process_fragment(ep, 0, fh0, data.data(), MAX_FRAGMENT_PAYLOAD);
-    TEST_ASSERT(!done, "duplicate should not complete");
+    auto done = ra.process_fragment(ep, 0, fh0, data.data(), MAX_FRAGMENT_PAYLOAD);
+    TEST_ASSERT(done != fragment_result::completed, "duplicate should not complete");
     TEST_ASSERT(ra.pending_count() == 1, "still 1 pending");
 
     // Frag 1 completes
     fragment_header fh1{1, 1, 2};
     done = ra.process_fragment(ep, 0, fh1, data.data() + MAX_FRAGMENT_PAYLOAD, MAX_FRAGMENT_PAYLOAD);
-    TEST_ASSERT(done, "should complete");
+    TEST_ASSERT(done == fragment_result::completed, "should complete");
     TEST_ASSERT(complete, "on_complete should fire");
 
     return true;
@@ -1969,8 +1969,8 @@ static bool test_fragment_app_rejects()
     uint8_t data[100] = {};
 
     fragment_header fh{1, 0, 2};
-    bool done = ra.process_fragment(ep, 0, fh, data, 100);
-    TEST_ASSERT(!done, "should not complete if rejected");
+    auto done = ra.process_fragment(ep, 0, fh, data, 100);
+    TEST_ASSERT(done == fragment_result::rejected, "should be rejected if app returns nullptr");
     TEST_ASSERT(ra.pending_count() == 0, "no entry should be created");
     TEST_ASSERT(!complete, "on_complete should not fire");
 
@@ -2401,8 +2401,8 @@ static bool test_message_id_wrap_protection()
 
     // Complete the new message
     fragment_header fh_new1{1, 1, 2};
-    bool done = ra.process_fragment(ep, 0, fh_new1, buf2.data() + 100, 100);
-    TEST_ASSERT(done, "new message should complete");
+    auto done = ra.process_fragment(ep, 0, fh_new1, buf2.data() + 100, 100);
+    TEST_ASSERT(done == fragment_result::completed, "new message should complete");
     TEST_ASSERT(complete, "on_complete should fire for new message");
 
     return true;
@@ -2566,6 +2566,640 @@ static bool test_set_on_message_expired_e2e()
     return true;
 }
 
+// ============================================================================
+// TEST 53: fragment_result — all return values
+// ============================================================================
+// Verify every fragment_result variant in isolation.
+
+static bool test_fragment_result_values()
+{
+    fragment_reassembler ra;
+
+    // --- invalid: fragment_count = 0
+    {
+        endpoint_key ep{};
+        fragment_header fh{1, 0, 0};
+        uint8_t data[10] = {};
+        auto r = ra.process_fragment(ep, 0, fh, data, 10);
+        TEST_ASSERT(r == fragment_result::invalid, "count=0 should return invalid");
+    }
+
+    // --- invalid: index >= count
+    {
+        endpoint_key ep{};
+        fragment_header fh{1, 3, 2};
+        uint8_t data[10] = {};
+        auto r = ra.process_fragment(ep, 0, fh, data, 10);
+        TEST_ASSERT(r == fragment_result::invalid, "index >= count should return invalid");
+    }
+
+    // --- invalid: data_size = 0
+    {
+        endpoint_key ep{};
+        fragment_header fh{1, 0, 2};
+        uint8_t data[10] = {};
+        auto r = ra.process_fragment(ep, 0, fh, data, 0);
+        TEST_ASSERT(r == fragment_result::invalid, "data_size=0 should return invalid");
+    }
+
+    // --- rejected: on_allocate returns nullptr
+    {
+        fragment_reassembler ra2;
+        ra2.set_on_allocate([](const endpoint_key &, uint32_t, uint8_t, uint8_t, size_t) -> uint8_t *
+                            { return nullptr; });
+        endpoint_key ep{};
+        fragment_header fh{1, 0, 2};
+        uint8_t data[10] = {0xAA};
+        auto r = ra2.process_fragment(ep, 0, fh, data, 10);
+        TEST_ASSERT(r == fragment_result::rejected, "nullptr alloc should return rejected");
+    }
+
+    // --- accepted + duplicate + completed
+    {
+        fragment_reassembler ra3;
+        std::vector<uint8_t> buf(MAX_FRAGMENT_PAYLOAD * 2, 0);
+        ra3.set_on_allocate([&](const endpoint_key &, uint32_t, uint8_t, uint8_t, size_t) -> uint8_t *
+                            { return buf.data(); });
+        bool completed_flag = false;
+        ra3.set_on_complete([&](const endpoint_key &, uint32_t, uint8_t, uint8_t *, size_t) { completed_flag = true; });
+
+        endpoint_key ep{};
+        uint8_t data[100] = {0xBB};
+
+        fragment_header fh0{5, 0, 2};
+        auto r0 = ra3.process_fragment(ep, 0, fh0, data, 100);
+        TEST_ASSERT(r0 == fragment_result::accepted, "first frag should return accepted");
+
+        // duplicate
+        auto rd = ra3.process_fragment(ep, 0, fh0, data, 100);
+        TEST_ASSERT(rd == fragment_result::duplicate, "same frag again should return duplicate");
+
+        // complete
+        fragment_header fh1{5, 1, 2};
+        auto r1 = ra3.process_fragment(ep, 0, fh1, data, 100);
+        TEST_ASSERT(r1 == fragment_result::completed, "last frag should return completed");
+        TEST_ASSERT(completed_flag, "on_complete should have fired");
+    }
+
+    return true;
+}
+
+// ============================================================================
+// TEST 54: capacity() and usage_percent() queries
+// ============================================================================
+
+static bool test_reassembler_capacity_usage()
+{
+    fragment_reassembler ra;
+
+    TEST_ASSERT(ra.capacity() == MAX_INCOMING_FRAGMENTED_MESSAGES, "capacity should be MAX_INCOMING");
+    TEST_ASSERT(ra.pending_count() == 0, "initial pending should be 0");
+    TEST_ASSERT(ra.usage_percent() == 0, "initial usage should be 0%");
+
+    // Fill 32 slots (50%)
+    std::vector<std::vector<uint8_t>> bufs(32, std::vector<uint8_t>(MAX_FRAGMENT_PAYLOAD * 2, 0));
+    int alloc_idx = 0;
+    ra.set_on_allocate([&](const endpoint_key &, uint32_t, uint8_t, uint8_t, size_t) -> uint8_t *
+                       { return bufs[alloc_idx++].data(); });
+
+    endpoint_key ep{};
+    for (uint32_t i = 0; i < 32; ++i)
+    {
+        fragment_header fh{i + 1, 0, 2}; // msg_id = i+1, only send frag 0 of 2
+        uint8_t data[10] = {};
+        ra.process_fragment(ep, 0, fh, data, 10);
+    }
+
+    TEST_ASSERT(ra.pending_count() == 32, "should have 32 pending");
+    TEST_ASSERT(ra.usage_percent() == 50, "32/64 = 50%");
+
+    return true;
+}
+
+// ============================================================================
+// TEST 55: clear() releases all entries via on_expired
+// ============================================================================
+
+static bool test_reassembler_clear()
+{
+    fragment_reassembler ra;
+    int expired_count = 0;
+
+    std::vector<std::vector<uint8_t>> bufs(5, std::vector<uint8_t>(MAX_FRAGMENT_PAYLOAD * 2, 0));
+    int alloc_idx = 0;
+    ra.set_on_allocate([&](const endpoint_key &, uint32_t, uint8_t, uint8_t, size_t) -> uint8_t *
+                       { return bufs[alloc_idx++].data(); });
+    ra.set_on_expired([&](const endpoint_key &, uint32_t, uint8_t, uint8_t *) { expired_count++; });
+
+    endpoint_key ep{};
+    for (uint32_t i = 0; i < 5; ++i)
+    {
+        fragment_header fh{i + 1, 0, 3};
+        uint8_t data[10] = {};
+        ra.process_fragment(ep, 0, fh, data, 10);
+    }
+
+    TEST_ASSERT(ra.pending_count() == 5, "should have 5 pending before clear");
+    ra.clear();
+    TEST_ASSERT(ra.pending_count() == 0, "should have 0 pending after clear");
+    TEST_ASSERT(expired_count == 5, "on_expired should fire for each active entry");
+
+    return true;
+}
+
+// ============================================================================
+// TEST 56: Eviction — slots full triggers evict of least-progress entry
+// ============================================================================
+// Fill all 64 slots with messages at varying progress levels.
+// Insert one more → the entry with least progress gets evicted.
+
+static bool test_reassembler_eviction()
+{
+    fragment_reassembler ra;
+
+    // Allocate buffers for all 64 + 1 messages
+    constexpr size_t N = MAX_INCOMING_FRAGMENTED_MESSAGES;
+    std::vector<std::vector<uint8_t>> bufs(N + 1, std::vector<uint8_t>(MAX_FRAGMENT_PAYLOAD * 4, 0));
+    size_t alloc_idx = 0;
+    ra.set_on_allocate([&](const endpoint_key &, uint32_t, uint8_t, uint8_t, size_t) -> uint8_t *
+                       { return bufs[alloc_idx++].data(); });
+
+    bool evicted_called = false;
+    uint32_t evicted_msg_id = 0;
+    uint8_t evicted_received = 0;
+    uint8_t evicted_total = 0;
+    ra.set_on_evicted(
+        [&](const endpoint_key &, uint32_t msg_id, uint8_t, uint8_t *, uint8_t recv, uint8_t total)
+        {
+            evicted_called = true;
+            evicted_msg_id = msg_id;
+            evicted_received = recv;
+            evicted_total = total;
+        });
+
+    endpoint_key ep{};
+
+    // Fill all 64 slots — msg_id 1..64, each with 4 fragments, send 2 frags each
+    for (uint32_t i = 0; i < static_cast<uint32_t>(N); ++i)
+    {
+        uint8_t data[100] = {};
+        fragment_header fh0{i + 1, 0, 4};
+        ra.process_fragment(ep, 0, fh0, data, 100);
+        fragment_header fh1{i + 1, 1, 4};
+        ra.process_fragment(ep, 0, fh1, data, 100);
+    }
+    // All 64 have 2/4 progress
+
+    // Now make msg_id=1 have only 2/4 fragments (same as others)
+    // But give msg_id=64 extra progress: 3/4
+    {
+        uint8_t data[100] = {};
+        fragment_header fh2{64, 2, 4};
+        ra.process_fragment(ep, 0, fh2, data, 100);
+    }
+    // Now msg_id=64 has 3/4, all others have 2/4
+    // The victim should be msg_id=1 (first with worst progress 2/4, found first in scan)
+
+    TEST_ASSERT(ra.pending_count() == N, "should have all slots full");
+    TEST_ASSERT(!evicted_called, "no eviction yet");
+
+    // Insert message 65 — triggers eviction
+    {
+        uint8_t data[100] = {};
+        fragment_header fh{100, 0, 2}; // msg_id=100
+        auto r = ra.process_fragment(ep, 0, fh, data, 100);
+        // Should succeed (eviction made room)
+        TEST_ASSERT(r == fragment_result::accepted, "new message should be accepted after eviction");
+    }
+
+    TEST_ASSERT(evicted_called, "on_evicted should have fired");
+    TEST_ASSERT(evicted_msg_id == 1, "msg_id=1 should have been evicted (first with min progress 2/4)");
+    TEST_ASSERT(evicted_received == 2, "evicted had 2 fragments received");
+    TEST_ASSERT(evicted_total == 4, "evicted had 4 total fragments");
+    TEST_ASSERT(ra.pending_count() == N, "should still have all slots full (new one replaced evicted)");
+
+    return true;
+}
+
+// ============================================================================
+// TEST 57: Eviction prefers least-progress, not arbitrary
+// ============================================================================
+// Fill 64 slots with varying progress. Verify the one with 0 progress
+// (only allocation, no fragments stored yet) is NOT possible since
+// on_allocate is only called when first fragment arrives.
+// Instead: fill with 1/3 and one with 2/3 — the 1/3 victim gets evicted.
+
+static bool test_reassembler_eviction_picks_least()
+{
+    fragment_reassembler ra;
+
+    constexpr size_t N = MAX_INCOMING_FRAGMENTED_MESSAGES;
+    std::vector<std::vector<uint8_t>> bufs(N + 1, std::vector<uint8_t>(MAX_FRAGMENT_PAYLOAD * 3, 0));
+    size_t alloc_idx = 0;
+    ra.set_on_allocate([&](const endpoint_key &, uint32_t, uint8_t, uint8_t, size_t) -> uint8_t *
+                       { return bufs[alloc_idx++].data(); });
+
+    uint32_t evicted_msg_id = 0;
+    ra.set_on_evicted([&](const endpoint_key &, uint32_t msg_id, uint8_t, uint8_t *, uint8_t, uint8_t)
+                      { evicted_msg_id = msg_id; });
+
+    endpoint_key ep{};
+
+    // Fill slot 0: msg_id=1, 1/3 progress (this should be victim)
+    {
+        uint8_t data[50] = {};
+        fragment_header fh{1, 0, 3};
+        ra.process_fragment(ep, 0, fh, data, 50);
+    }
+
+    // Fill slots 1..63: msg_id=2..64, each 2/3 progress
+    for (uint32_t i = 1; i < static_cast<uint32_t>(N); ++i)
+    {
+        uint8_t data[50] = {};
+        fragment_header fh0{i + 1, 0, 3};
+        ra.process_fragment(ep, 0, fh0, data, 50);
+        fragment_header fh1{i + 1, 1, 3};
+        ra.process_fragment(ep, 0, fh1, data, 50);
+    }
+
+    TEST_ASSERT(ra.pending_count() == N, "all slots full");
+
+    // Insert msg 200 — should evict msg_id=1 (1/3 < 2/3)
+    {
+        uint8_t data[50] = {};
+        fragment_header fh{200, 0, 2};
+        auto r = ra.process_fragment(ep, 0, fh, data, 50);
+        TEST_ASSERT(r == fragment_result::accepted, "should succeed after eviction");
+    }
+
+    TEST_ASSERT(evicted_msg_id == 1, "msg_id=1 with 1/3 progress should be evicted, not 2/3 entries");
+
+    return true;
+}
+
+// ============================================================================
+// TEST 58: on_message_evicted callback — falls back to on_expired if not set
+// ============================================================================
+
+static bool test_eviction_falls_back_to_expired()
+{
+    fragment_reassembler ra;
+
+    constexpr size_t N = MAX_INCOMING_FRAGMENTED_MESSAGES;
+    std::vector<std::vector<uint8_t>> bufs(N + 1, std::vector<uint8_t>(MAX_FRAGMENT_PAYLOAD * 2, 0));
+    size_t alloc_idx = 0;
+    ra.set_on_allocate([&](const endpoint_key &, uint32_t, uint8_t, uint8_t, size_t) -> uint8_t *
+                       { return bufs[alloc_idx++].data(); });
+
+    // NO on_evicted set — on_expired should fire as fallback
+    bool expired_fallback = false;
+    uint32_t expired_msg_id = 0;
+    ra.set_on_expired(
+        [&](const endpoint_key &, uint32_t msg_id, uint8_t, uint8_t *)
+        {
+            expired_fallback = true;
+            expired_msg_id = msg_id;
+        });
+
+    endpoint_key ep{};
+    for (uint32_t i = 0; i < static_cast<uint32_t>(N); ++i)
+    {
+        uint8_t data[50] = {};
+        fragment_header fh{i + 1, 0, 2};
+        ra.process_fragment(ep, 0, fh, data, 50);
+    }
+
+    // Trigger eviction
+    {
+        uint8_t data[50] = {};
+        fragment_header fh{999, 0, 2};
+        ra.process_fragment(ep, 0, fh, data, 50);
+    }
+
+    TEST_ASSERT(expired_fallback, "on_expired should fire as fallback when on_evicted is not set");
+    TEST_ASSERT(expired_msg_id == 1, "oldest entry should be evicted");
+
+    return true;
+}
+
+// ============================================================================
+// TEST 59: Per-connection reassembler — server isolates clients
+// ============================================================================
+// Two clients send fragments. Each client's reassembler is independent.
+// Verify that one client filling their slots doesn't affect the other.
+
+static bool test_per_connection_reassembler_isolation()
+{
+    server srv(9931);
+    srv.channels().register_defaults();
+    std::atomic<bool> stop_flag{false};
+
+    // Track completions per message_id
+    std::atomic<int> complete_count{0};
+    std::vector<uint8_t> buf1(MAX_FRAGMENT_PAYLOAD * 3, 0);
+    std::vector<uint8_t> buf2(MAX_FRAGMENT_PAYLOAD * 3, 0);
+    int alloc_calls = 0;
+
+    srv.set_on_allocate_message(
+        [&](const endpoint_key &, uint32_t, uint8_t, uint8_t, size_t) -> uint8_t *
+        {
+            alloc_calls++;
+            return (alloc_calls % 2 == 1) ? buf1.data() : buf2.data();
+        });
+    srv.set_on_message_complete([&](const endpoint_key &, uint32_t, uint8_t, uint8_t *, size_t) { complete_count++; });
+
+    TEST_ASSERT(srv.start(), "server should start");
+    std::thread server_thread(
+        [&]()
+        {
+            while (!stop_flag.load())
+            {
+                srv.poll();
+                srv.update();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+
+    // Two clients each send a fragmented message
+    client c1("127.0.0.1", 9931);
+    client c2("127.0.0.1", 9931);
+    c1.set_verbose(false);
+    c2.set_verbose(false);
+    c1.channels().register_defaults();
+    c2.channels().register_defaults();
+
+    TEST_ASSERT(c1.connect(), "c1 should connect");
+    TEST_ASSERT(c2.connect(), "c2 should connect");
+
+    const size_t msg_size = MAX_FRAGMENT_PAYLOAD * 2 + 100; // 3 fragments
+    std::vector<uint8_t> data1(msg_size, 0x11);
+    std::vector<uint8_t> data2(msg_size, 0x22);
+
+    c1.send_payload(data1.data(), msg_size, 0, channels::RELIABLE.id);
+    c2.send_payload(data2.data(), msg_size, 0, channels::RELIABLE.id);
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (complete_count.load() < 2 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+    TEST_ASSERT(complete_count.load() == 2, "both fragmented messages should complete independently");
+
+    c1.disconnect();
+    c2.disconnect();
+    stop_flag = true;
+    server_thread.join();
+    srv.stop();
+
+    return true;
+}
+
+// ============================================================================
+// TEST 60: set_on_message_evicted E2E — server eviction callback
+// ============================================================================
+// Fill a connection's reassembler to capacity, then send one more message.
+// Verify on_message_evicted fires via the server API.
+
+static bool test_set_on_message_evicted_e2e()
+{
+    server srv(9932);
+    srv.channels().register_defaults();
+    srv.set_reassembly_timeout(30'000'000); // 30s — no timeout eviction during test
+    std::atomic<bool> stop_flag{false};
+
+    constexpr size_t N = MAX_INCOMING_FRAGMENTED_MESSAGES;
+    // We need N+1 buffers (N fill + 1 new)
+    std::vector<std::vector<uint8_t>> bufs(N + 1, std::vector<uint8_t>(MAX_FRAGMENT_PAYLOAD * 3, 0));
+    std::atomic<size_t> alloc_idx{0};
+
+    srv.set_on_allocate_message(
+        [&](const endpoint_key &, uint32_t, uint8_t, uint8_t, size_t) -> uint8_t *
+        {
+            size_t i = alloc_idx.fetch_add(1);
+            return (i < bufs.size()) ? bufs[i].data() : nullptr;
+        });
+
+    std::atomic<bool> evicted_fired{false};
+    std::atomic<uint32_t> evicted_msg_id{0};
+    srv.set_on_message_evicted(
+        [&](const endpoint_key &, uint32_t msg_id, uint8_t, uint8_t *, uint8_t recv, uint8_t total)
+        {
+            evicted_fired.store(true);
+            evicted_msg_id.store(msg_id);
+        });
+
+    TEST_ASSERT(srv.start(), "server should start");
+    std::thread server_thread(
+        [&]()
+        {
+            while (!stop_flag.load())
+            {
+                srv.poll();
+                srv.update();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+
+    client c("127.0.0.1", 9932);
+    c.set_verbose(false);
+    c.channels().register_defaults();
+    TEST_ASSERT(c.connect(), "client should connect");
+
+    // Send N incomplete messages (1/3 each) to fill the per-connection reassembler
+    for (uint32_t i = 0; i < static_cast<uint32_t>(N); ++i)
+    {
+        // Send frag 0 of 3 with a distinct message_id
+        // Use raw send so we control the message_id manually
+        fragment_header fhdr{i + 1, 0, 3};
+        uint8_t frag_payload[FRAGMENT_HEADER_SIZE + 100];
+        std::memcpy(frag_payload, &fhdr, FRAGMENT_HEADER_SIZE);
+        std::memset(frag_payload + FRAGMENT_HEADER_SIZE, static_cast<uint8_t>(i), 100);
+
+        packet_header hdr{};
+        hdr.flags = FLAG_FRAGMENT;
+        hdr.channel_id = channels::RELIABLE.id;
+        hdr.payload_size = static_cast<uint16_t>(FRAGMENT_HEADER_SIZE + 100);
+        c.send(hdr, frag_payload);
+    }
+
+    // Wait for server to process all fragments
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (alloc_idx.load() < N && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+    TEST_ASSERT(alloc_idx.load() >= N, "server should have allocated N entries");
+    TEST_ASSERT(!evicted_fired.load(), "no eviction yet");
+
+    // Send one more incomplete message → triggers eviction
+    {
+        fragment_header fhdr{999, 0, 3};
+        uint8_t frag_payload[FRAGMENT_HEADER_SIZE + 100];
+        std::memcpy(frag_payload, &fhdr, FRAGMENT_HEADER_SIZE);
+        std::memset(frag_payload + FRAGMENT_HEADER_SIZE, 0xFF, 100);
+
+        packet_header hdr{};
+        hdr.flags = FLAG_FRAGMENT;
+        hdr.channel_id = channels::RELIABLE.id;
+        hdr.payload_size = static_cast<uint16_t>(FRAGMENT_HEADER_SIZE + 100);
+        c.send(hdr, frag_payload);
+    }
+
+    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!evicted_fired.load() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+    TEST_ASSERT(evicted_fired.load(), "on_message_evicted should have fired via server per-connection reassembler");
+    TEST_ASSERT(evicted_msg_id.load() == 1, "msg_id=1 should be evicted (first, min progress)");
+
+    c.disconnect();
+    stop_flag = true;
+    server_thread.join();
+    srv.stop();
+
+    return true;
+}
+
+// ============================================================================
+// TEST 61: Backpressure — client.is_fragment_throttled() and send_payload -2
+// ============================================================================
+// Manually set backpressure on the client's connection and verify
+// send_payload returns -2 for fragmented sends.
+
+static bool test_client_backpressure_throttle()
+{
+    // Start a simple server
+    test_server_ctx ctx(9933);
+    TEST_ASSERT(ctx.start(), "server should start");
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    client c("127.0.0.1", 9933);
+    c.set_verbose(false);
+    c.channels().register_defaults();
+    TEST_ASSERT(c.connect(), "client should connect");
+
+    // Not throttled initially
+    TEST_ASSERT(!c.is_fragment_throttled(), "should NOT be throttled initially");
+
+    // Non-fragmented sends should still work under backpressure
+    c.connection().set_fragment_backpressured(true);
+    TEST_ASSERT(c.is_fragment_throttled(), "should be throttled after set");
+
+    // Small payload (single packet) should NOT be affected
+    int r1 = c.send_payload("hello", 5, 0, channels::RELIABLE.id);
+    TEST_ASSERT(r1 > 0, "single-packet send should work even under backpressure");
+
+    // Fragmented payload should return -2
+    std::vector<uint8_t> big(MAX_FRAGMENT_PAYLOAD * 3, 0xAA);
+    int r2 = c.send_payload(big.data(), big.size(), 0, channels::RELIABLE.id);
+    TEST_ASSERT(r2 == -2, "fragmented send should return -2 when backpressured");
+
+    // Release backpressure
+    c.connection().set_fragment_backpressured(false);
+    TEST_ASSERT(!c.is_fragment_throttled(), "should not be throttled after release");
+
+    c.disconnect();
+    return true;
+}
+
+// ============================================================================
+// TEST 62: Backpressure — server.is_fragment_throttled() and send_payload_to -2
+// ============================================================================
+
+static bool test_server_backpressure_throttle()
+{
+    server srv(9934);
+    srv.channels().register_defaults();
+    std::atomic<bool> stop_flag{false};
+    std::string client_addr;
+    uint16_t client_port = 0;
+    std::atomic<bool> client_known{false};
+
+    srv.set_on_client_connected(
+        [&](const endpoint_key &, const std::string &addr, uint16_t port)
+        {
+            client_addr = addr;
+            client_port = port;
+            client_known = true;
+        });
+
+    TEST_ASSERT(srv.start(), "server should start");
+    std::thread server_thread(
+        [&]()
+        {
+            while (!stop_flag.load())
+            {
+                srv.poll();
+                srv.update();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+
+    client c("127.0.0.1", 9934);
+    c.set_verbose(false);
+    c.channels().register_defaults();
+    TEST_ASSERT(c.connect(), "client should connect");
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!client_known.load() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    TEST_ASSERT(client_known.load(), "server should know client");
+
+    // Not throttled initially
+    TEST_ASSERT(!srv.is_fragment_throttled(client_addr, client_port), "should NOT be throttled initially");
+
+    // Fragmented send should work
+    std::vector<uint8_t> big(MAX_FRAGMENT_PAYLOAD * 3, 0xBB);
+    int r1 = srv.send_payload_to(big.data(), big.size(), channels::RELIABLE.id, client_addr, client_port);
+    TEST_ASSERT(r1 > 0, "fragmented send should work when not throttled");
+
+    // Unknown address — not throttled
+    TEST_ASSERT(!srv.is_fragment_throttled("192.168.1.1", 9999), "unknown addr should not be throttled");
+
+    c.disconnect();
+    stop_flag = true;
+    server_thread.join();
+    srv.stop();
+
+    return true;
+}
+
+// ============================================================================
+// TEST 63: Per-connection reassembler — connection reset clears reassembler
+// ============================================================================
+// Verify udp_connection::reset() calls reassembler.clear() and fires
+// on_expired for active entries.
+
+static bool test_connection_reset_clears_reassembler()
+{
+    udp_connection conn;
+    conn.reset();
+    conn.set_active(true);
+    conn.set_state(connection_state::CONNECTED);
+
+    int expired_count = 0;
+    auto &ra = conn.reassembler();
+    std::vector<uint8_t> buf(MAX_FRAGMENT_PAYLOAD * 2, 0);
+    ra.set_on_allocate([&](const endpoint_key &, uint32_t, uint8_t, uint8_t, size_t) -> uint8_t *
+                       { return buf.data(); });
+    ra.set_on_expired([&](const endpoint_key &, uint32_t, uint8_t, uint8_t *) { expired_count++; });
+
+    // Add 3 incomplete messages
+    endpoint_key ep{};
+    for (uint32_t i = 0; i < 3; ++i)
+    {
+        fragment_header fh{i + 1, 0, 2};
+        uint8_t data[10] = {};
+        ra.process_fragment(ep, 0, fh, data, 10);
+    }
+    TEST_ASSERT(ra.pending_count() == 3, "should have 3 pending");
+
+    // reset() should clear the reassembler
+    conn.reset();
+    TEST_ASSERT(ra.pending_count() == 0, "reassembler should be clear after connection reset");
+    TEST_ASSERT(expired_count == 3, "on_expired should fire for each entry during reset");
+
+    return true;
+}
+
 int main()
 {
     platform_init();
@@ -2631,6 +3265,19 @@ int main()
     register_test("message_id wrap protection", test_message_id_wrap_protection);
     register_test("Scatter-gather E2E", test_scatter_gather_e2e);
     register_test("set_on_message_expired E2E", test_set_on_message_expired_e2e);
+
+    // -- Reassembler defense layers --
+    register_test("fragment_result all values", test_fragment_result_values);
+    register_test("Reassembler capacity/usage", test_reassembler_capacity_usage);
+    register_test("Reassembler clear()", test_reassembler_clear);
+    register_test("Reassembler eviction", test_reassembler_eviction);
+    register_test("Eviction picks least progress", test_reassembler_eviction_picks_least);
+    register_test("Eviction falls back on_expired", test_eviction_falls_back_to_expired);
+    register_test("Per-connection reassembler isolation", test_per_connection_reassembler_isolation);
+    register_test("set_on_message_evicted E2E", test_set_on_message_evicted_e2e);
+    register_test("Client backpressure throttle", test_client_backpressure_throttle);
+    register_test("Server backpressure throttle", test_server_backpressure_throttle);
+    register_test("Connection reset clears reassembler", test_connection_reset_clears_reassembler);
 
     std::cout << "========================================" << std::endl;
     std::cout << " Entanglement Test Battery" << std::endl;

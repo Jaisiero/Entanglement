@@ -38,6 +38,13 @@ namespace entanglement
         m_next_message_id = 1;
         for (auto &pm : m_pending_messages)
             pm.reset();
+
+        // Clear receiver-side reassembler (calls on_expired for each active entry so app frees buffers)
+        m_reassembler.clear();
+
+        // Reset backpressure flags
+        m_fragment_backpressured = false;
+        m_backpressure_sent = false;
     }
 
     // --- Sending side ---
@@ -276,6 +283,7 @@ namespace entanglement
             out[count].payload_size = entry.payload_size;
             out[count].message_id = entry.message_id;
             out[count].fragment_index = entry.fragment_index;
+            out[count].fragment_count = entry.fragment_count;
             ++count;
 
             // Deactivate — we give up on this packet.

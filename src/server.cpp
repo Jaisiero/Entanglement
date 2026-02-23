@@ -108,13 +108,27 @@ namespace entanglement
                 continue;
             }
 
-            // Handle fragmented data packets — route to reassembler
+            // Handle fragmented data packets — route to per-connection reassembler
             if ((header.flags & FLAG_FRAGMENT) && header.payload_size > FRAGMENT_HEADER_SIZE)
             {
                 fragment_header fhdr;
                 std::memcpy(&fhdr, payload, FRAGMENT_HEADER_SIZE);
-                m_reassembler.process_fragment(key, header.channel_id, fhdr, payload + FRAGMENT_HEADER_SIZE,
-                                               header.payload_size - FRAGMENT_HEADER_SIZE);
+                auto result =
+                    conn->reassembler().process_fragment(key, header.channel_id, fhdr, payload + FRAGMENT_HEADER_SIZE,
+                                                         header.payload_size - FRAGMENT_HEADER_SIZE);
+
+                // If reassembler is full/under pressure, send backpressure to this client
+                if (result == fragment_result::slots_full ||
+                    conn->reassembler().usage_percent() >= BACKPRESSURE_HIGH_WATERMARK)
+                {
+                    if (!conn->backpressure_sent())
+                    {
+                        uint8_t bp[2] = {CONTROL_BACKPRESSURE, 0};
+                        send_control_payload_to(conn, bp, 2, sender_addr, sender_port);
+                        conn->set_backpressure_sent(true);
+                    }
+                }
+
                 ++count;
                 continue;
             }
@@ -130,6 +144,11 @@ namespace entanglement
     }
 
     int server::update()
+    {
+        return update(nullptr);
+    }
+
+    int server::update(on_server_packet_lost loss_callback)
     {
         if (!m_running)
             return 0;
@@ -159,6 +178,41 @@ namespace entanglement
                 inet_ntop(AF_INET, &key.address, addr_buf, sizeof(addr_buf));
                 send_control_to(&conn, CONTROL_HEARTBEAT, addr_buf, key.port);
             }
+
+            // Collect losses for this connection
+            if (loss_callback)
+            {
+                lost_packet_info lost[MAX_LOSSES_PER_UPDATE];
+                int loss_count = conn.collect_losses(now, lost, MAX_LOSSES_PER_UPDATE);
+                if (loss_count > 0)
+                {
+                    inet_ntop(AF_INET, &key.address, addr_buf, sizeof(addr_buf));
+                    for (int l = 0; l < loss_count; ++l)
+                    {
+                        loss_callback(lost[l], addr_buf, key.port);
+                    }
+                }
+            }
+            else
+            {
+                // Even without a callback, collect losses to expire unreliable packets
+                lost_packet_info lost[MAX_LOSSES_PER_UPDATE];
+                conn.collect_losses(now, lost, MAX_LOSSES_PER_UPDATE);
+            }
+
+            // Per-connection reassembler cleanup
+            auto &ra = conn.reassembler();
+            ra.cleanup_stale(now, ra.reassembly_timeout());
+
+            // Send backpressure relief if usage dropped below low watermark
+            if (conn.backpressure_sent() && ra.usage_percent() < BACKPRESSURE_LOW_WATERMARK)
+            {
+                inet_ntop(AF_INET, &key.address, addr_buf, sizeof(addr_buf));
+                uint8_t available = static_cast<uint8_t>(ra.capacity() - ra.pending_count());
+                uint8_t bp[2] = {CONTROL_BACKPRESSURE, available};
+                send_control_payload_to(&conn, bp, 2, addr_buf, key.port);
+                conn.set_backpressure_sent(false);
+            }
         }
 
         for (int i = 0; i < timeout_count; ++i)
@@ -175,9 +229,6 @@ namespace entanglement
             }
             disconnect_client(timed_out[i]);
         }
-
-        // Expire stale reassembly entries
-        m_reassembler.cleanup_stale(now, m_reassembly_timeout_us);
 
         return timeout_count;
     }
@@ -223,11 +274,13 @@ namespace entanglement
     }
 
     int server::send_payload_to(const void *data, size_t size, uint8_t channel_id, const std::string &address,
-                                uint16_t port, uint8_t flags)
+                                uint16_t port, uint8_t flags, uint32_t *out_message_id)
     {
         // Single-packet path
         if (size <= MAX_PAYLOAD_SIZE)
         {
+            if (out_message_id)
+                *out_message_id = 0;
             packet_header header{};
             header.flags = flags;
             header.channel_id = channel_id;
@@ -245,6 +298,12 @@ namespace entanglement
             return -1;
 
         // --- Fragmented send ---
+        // Check backpressure from client
+        if (conn->is_fragment_backpressured())
+        {
+            return -2; // BACKPRESSURED: client's reassembler is full
+        }
+
         const uint8_t *src = static_cast<const uint8_t *>(data);
         uint8_t fragment_count = static_cast<uint8_t>((size + MAX_FRAGMENT_PAYLOAD - 1) / MAX_FRAGMENT_PAYLOAD);
         if (fragment_count == 0)
@@ -258,20 +317,38 @@ namespace entanglement
             size_t offset = static_cast<size_t>(i) * MAX_FRAGMENT_PAYLOAD;
             size_t chunk = (std::min)(MAX_FRAGMENT_PAYLOAD, size - offset);
 
-            int result = send_fragment_to(conn, message_id, i, fragment_count, src + offset, chunk, flags, channel_id,
-                                          address, port);
+            int result = send_fragment_to_impl(conn, message_id, i, fragment_count, src + offset, chunk, flags,
+                                               channel_id, address, port);
             if (result <= 0)
                 return result;
             total_sent += static_cast<int>(chunk);
         }
 
         conn->register_pending_message(message_id, fragment_count);
+
+        if (out_message_id)
+            *out_message_id = message_id;
+
         return total_sent;
     }
 
-    int server::send_fragment_to(udp_connection *conn, uint32_t message_id, uint8_t index, uint8_t count,
-                                 const void *data, size_t size, uint8_t flags, uint8_t channel_id,
-                                 const std::string &address, uint16_t port)
+    int server::send_fragment_to(uint32_t message_id, uint8_t index, uint8_t count, const void *data, size_t size,
+                                 uint8_t flags, uint8_t channel_id, const std::string &address, uint16_t port)
+    {
+        endpoint_key key{};
+        inet_pton(AF_INET, address.c_str(), &key.address);
+        key.port = port;
+
+        udp_connection *conn = find(key);
+        if (!conn || conn->state() != connection_state::CONNECTED)
+            return -1;
+
+        return send_fragment_to_impl(conn, message_id, index, count, data, size, flags, channel_id, address, port);
+    }
+
+    int server::send_fragment_to_impl(udp_connection *conn, uint32_t message_id, uint8_t index, uint8_t count,
+                                      const void *data, size_t size, uint8_t flags, uint8_t channel_id,
+                                      const std::string &address, uint16_t port)
     {
         // Build fragment header on stack (4 bytes)
         fragment_header fhdr{message_id, index, count};
@@ -289,6 +366,7 @@ namespace entanglement
         auto &entry = conn->send_buffer_entry(idx);
         entry.message_id = message_id;
         entry.fragment_index = index;
+        entry.fragment_count = count;
 
         // Scatter-gather: [packet_header] + [fragment_header] + [user data] — zero intermediate copy
         const void *segments[2] = {&fhdr, data};
@@ -333,6 +411,20 @@ namespace entanglement
         conn.reset();
         conn.set_active(true);
         conn.set_endpoint(key);
+
+        // Set up per-connection reassembler with stored callback templates
+        auto &ra = conn.reassembler();
+        if (m_frag_alloc_cb)
+            ra.set_on_allocate(m_frag_alloc_cb);
+        if (m_frag_complete_cb)
+            ra.set_on_complete(m_frag_complete_cb);
+        if (m_frag_expired_cb)
+            ra.set_on_expired(m_frag_expired_cb);
+        if (m_frag_evicted_cb)
+            ra.set_on_evicted(m_frag_evicted_cb);
+        if (m_reassembly_timeout_us != REASSEMBLY_TIMEOUT_US)
+            ra.set_reassembly_timeout(m_reassembly_timeout_us);
+
         m_index[key] = static_cast<uint16_t>(slot);
         return &conn;
     }
@@ -439,6 +531,19 @@ namespace entanglement
                 break;
             }
 
+            case CONTROL_BACKPRESSURE:
+            {
+                // Payload: [type(1)][available_slots(1)]
+                // available=0 means throttle, >0 means resume
+                if (conn && payload_size >= 2)
+                {
+                    conn->process_incoming(header);
+                    uint8_t available = payload[1];
+                    conn->set_fragment_backpressured(available == 0);
+                }
+                break;
+            }
+
             case CONTROL_CHANNEL_OPEN:
             {
                 if (!conn || conn->state() != connection_state::CONNECTED)
@@ -540,17 +645,49 @@ namespace entanglement
 
     void server::set_on_allocate_message(on_allocate_message cb)
     {
-        m_reassembler.set_on_allocate(std::move(cb));
+        m_frag_alloc_cb = cb;
+        for (auto &[key, idx] : m_index)
+            (*m_pool)[idx].reassembler().set_on_allocate(cb);
     }
 
     void server::set_on_message_complete(on_message_complete cb)
     {
-        m_reassembler.set_on_complete(std::move(cb));
+        m_frag_complete_cb = cb;
+        for (auto &[key, idx] : m_index)
+            (*m_pool)[idx].reassembler().set_on_complete(cb);
     }
 
     void server::set_on_message_expired(on_message_expired cb)
     {
-        m_reassembler.set_on_expired(std::move(cb));
+        m_frag_expired_cb = cb;
+        for (auto &[key, idx] : m_index)
+            (*m_pool)[idx].reassembler().set_on_expired(cb);
+    }
+
+    void server::set_on_message_evicted(on_message_evicted cb)
+    {
+        m_frag_evicted_cb = cb;
+        for (auto &[key, idx] : m_index)
+            (*m_pool)[idx].reassembler().set_on_evicted(cb);
+    }
+
+    void server::set_reassembly_timeout(int64_t timeout_us)
+    {
+        m_reassembly_timeout_us = timeout_us;
+        for (auto &[key, idx] : m_index)
+            (*m_pool)[idx].reassembler().set_reassembly_timeout(timeout_us);
+    }
+
+    bool server::is_fragment_throttled(const std::string &address, uint16_t port) const
+    {
+        endpoint_key key{};
+        inet_pton(AF_INET, address.c_str(), &key.address);
+        key.port = port;
+
+        auto it = m_index.find(key);
+        if (it == m_index.end())
+            return false;
+        return (*m_pool)[it->second].is_fragment_backpressured();
     }
 
 } // namespace entanglement

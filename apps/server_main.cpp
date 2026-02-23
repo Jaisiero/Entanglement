@@ -1,10 +1,15 @@
 // ============================================================================
-// Entanglement — Soak Test Server v2.0
+// Entanglement — Soak Test Server v3.1
 // ============================================================================
 // Receives both simple and fragmented messages from soak-test clients,
 // tracks per-channel statistics for each type, verifies ordering for
 // RELIABLE_ORDERED channels, detects gaps/duplicates, echoes every
 // message back, and prints a comprehensive summary.
+//
+// Echo retransmission: when a reliable echo packet is detected as lost
+// (via collect_losses), the server retransmits it. Simple echoes are
+// stored by sequence; fragmented echoes are stored by message_id.
+// This ensures 100% end-to-end delivery under simulated packet loss.
 //
 // Simple messages   → set_on_packet_received   → echo via send_to
 // Fragmented messages → set_on_message_complete → echo via send_payload_to
@@ -139,7 +144,36 @@ static int g_total_simple_packets = 0;
 static int g_total_frag_messages = 0;
 static int g_total_simple_echoes = 0;
 static int g_total_frag_echoes = 0;
+static int g_total_echo_retransmissions = 0;
 static bool g_had_clients = false;
+
+// --- Echo retransmission state ---
+// Composite key: encode client port into high bits to avoid collisions
+// between connections that share the same per-connection sequence/message_id space.
+static uint64_t make_echo_key(uint16_t port, uint64_t id)
+{
+    return (static_cast<uint64_t>(port) << 48) ^ id;
+}
+
+// Simple echoes: (port⊕sequence → {payload, channel_id})
+struct simple_echo_entry
+{
+    std::vector<uint8_t> payload;
+    uint8_t channel_id = 0;
+};
+static std::unordered_map<uint64_t, simple_echo_entry> g_simple_echo_payloads;
+
+// Fragmented echoes: (port⊕message_id → {full payload, channel_id})
+struct frag_echo_entry
+{
+    std::vector<uint8_t> payload;
+    uint8_t channel_id = 0;
+};
+static std::unordered_map<uint64_t, frag_echo_entry> g_frag_echo_payloads;
+
+// Per-fragment retry counter: key = make_echo_key(port, (message_id << 8) | fragment_index)
+static std::unordered_map<uint64_t, int> g_frag_echo_retries;
+constexpr int MAX_ECHO_FRAG_RETRIES = 10;
 
 static std::string make_client_key(const std::string &addr, uint16_t p)
 {
@@ -291,6 +325,7 @@ static void print_aggregate_stats()
     std::cout << "Fragmented messages received: " << g_total_frag_messages << std::endl;
     std::cout << "Simple echoes sent:          " << g_total_simple_echoes << std::endl;
     std::cout << "Fragmented echoes sent:      " << g_total_frag_echoes << std::endl;
+    std::cout << "Echo retransmissions:        " << g_total_echo_retransmissions << std::endl;
 
     bool all_simple_reliable_ok = true;
     bool all_simple_ordered_ok = true;
@@ -379,7 +414,7 @@ int main(int argc, char *argv[])
     std::signal(SIGINT, signal_handler);
 
     std::cout << "=============================================" << std::endl;
-    std::cout << " Entanglement Soak Test Server v2.0" << std::endl;
+    std::cout << " Entanglement Soak Test Server v3.1" << std::endl;
     std::cout << " Port: " << port << std::endl;
     std::cout << " Header size: " << sizeof(packet_header) << " bytes" << std::endl;
     std::cout << " Soak payload (simple): " << SOAK_MSG_SIZE << " bytes" << std::endl;
@@ -468,6 +503,16 @@ int main(int argc, char *argv[])
             reply.channel_id = hdr.channel_id;
             reply.payload_size = static_cast<uint16_t>(size);
             srv.send_to(reply, payload, addr, p);
+
+            // Store payload for echo retransmission (reliable channels only)
+            if (srv.channels().is_reliable(hdr.channel_id))
+            {
+                simple_echo_entry entry;
+                entry.payload.assign(payload, payload + size);
+                entry.channel_id = hdr.channel_id;
+                g_simple_echo_payloads[make_echo_key(p, reply.sequence)] = std::move(entry);
+            }
+
             ++cs.total_simple_echoes;
             ++g_total_simple_echoes;
         });
@@ -520,7 +565,18 @@ int main(int argc, char *argv[])
             }
 
             // Echo entire reassembled payload back (auto-fragments)
-            srv.send_payload_to(data, total_size, ch_id, addr, p);
+            uint32_t echo_msg_id = 0;
+            srv.send_payload_to(data, total_size, ch_id, addr, p, 0, &echo_msg_id);
+
+            // Store payload for echo retransmission (reliable channels only)
+            if (srv.channels().is_reliable(ch_id) && echo_msg_id != 0)
+            {
+                frag_echo_entry entry;
+                entry.payload.assign(data, data + total_size);
+                entry.channel_id = ch_id;
+                g_frag_echo_payloads[make_echo_key(p, echo_msg_id)] = std::move(entry);
+            }
+
             ++cs.total_frag_echoes;
             ++g_total_frag_echoes;
 
@@ -542,6 +598,60 @@ int main(int argc, char *argv[])
         });
 
     // =========================================================================
+    // LOSS callback — retransmit lost echo packets
+    // =========================================================================
+    auto on_echo_loss = [&](const lost_packet_info &info, const std::string &addr, uint16_t p)
+    {
+        if (info.message_id != 0)
+        {
+            // Fragment echo loss — retransmit the specific fragment
+            uint64_t ekey = make_echo_key(p, info.message_id);
+            auto it = g_frag_echo_payloads.find(ekey);
+            if (it == g_frag_echo_payloads.end())
+                return;
+
+            // Check retry limit
+            uint64_t frag_key = make_echo_key(p, (static_cast<uint64_t>(info.message_id) << 8) | info.fragment_index);
+            int &retries = g_frag_echo_retries[frag_key];
+            if (retries >= MAX_ECHO_FRAG_RETRIES)
+                return;
+            ++retries;
+
+            const auto &entry = it->second;
+            size_t offset = static_cast<size_t>(info.fragment_index) * MAX_FRAGMENT_PAYLOAD;
+            if (offset >= entry.payload.size())
+                return;
+            size_t chunk = (std::min)(MAX_FRAGMENT_PAYLOAD, entry.payload.size() - offset);
+
+            srv.send_fragment_to(info.message_id, info.fragment_index, info.fragment_count,
+                                 entry.payload.data() + offset, chunk, 0, info.channel_id, addr, p);
+            ++g_total_echo_retransmissions;
+            return;
+        }
+
+        // Simple echo loss — retransmit
+        uint64_t ekey = make_echo_key(p, info.sequence);
+        auto it = g_simple_echo_payloads.find(ekey);
+        if (it == g_simple_echo_payloads.end())
+            return;
+
+        const auto &entry = it->second;
+
+        packet_header reply{};
+        reply.channel_id = entry.channel_id;
+        reply.payload_size = static_cast<uint16_t>(entry.payload.size());
+        srv.send_to(reply, entry.payload.data(), addr, p);
+
+        // Update tracking: remove old sequence, store new one under new sequence
+        simple_echo_entry new_entry;
+        new_entry.payload = entry.payload;
+        new_entry.channel_id = entry.channel_id;
+        g_simple_echo_payloads.erase(it);
+        g_simple_echo_payloads[make_echo_key(p, reply.sequence)] = std::move(new_entry);
+        ++g_total_echo_retransmissions;
+    };
+
+    // =========================================================================
 
     if (!srv.start())
     {
@@ -557,7 +667,7 @@ int main(int argc, char *argv[])
     while (g_running.load())
     {
         srv.poll();
-        srv.update();
+        srv.update(on_echo_loss);
 
         auto now = std::chrono::steady_clock::now();
 

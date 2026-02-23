@@ -31,6 +31,11 @@ namespace entanglement
     using on_channel_requested =
         std::function<bool(const endpoint_key &key, uint8_t channel_id, channel_mode mode, uint8_t priority)>;
 
+    // Callback: a reliable packet sent to a client was detected as lost.
+    // The server reports the client address/port alongside the loss info so the app can retransmit.
+    using on_server_packet_lost =
+        std::function<void(const lost_packet_info &info, const std::string &address, uint16_t port)>;
+
     class server
     {
     public:
@@ -52,6 +57,10 @@ namespace entanglement
         // Returns the number of connections that timed out.
         int update();
 
+        // Same as update(), but also collects reliable packet losses from all connections
+        // and invokes loss_callback for each one. Returns number of timed-out connections.
+        int update(on_server_packet_lost loss_callback);
+
         // Callbacks
         void set_on_packet_received(on_packet_received callback);
         void set_on_client_connected(on_client_connected callback);
@@ -62,9 +71,16 @@ namespace entanglement
         int send_to(packet_header &header, const void *payload, const std::string &address, uint16_t port);
 
         // Send payload to a connected client, auto-fragmenting if needed.
+        // If out_message_id is non-null, the library message_id is written there
+        // (only meaningful for fragmented sends; 0 for single-packet sends).
         // Returns bytes of user data sent, or -1 on error.
         int send_payload_to(const void *data, size_t size, uint8_t channel_id, const std::string &address,
-                            uint16_t port, uint8_t flags = 0);
+                            uint16_t port, uint8_t flags = 0, uint32_t *out_message_id = nullptr);
+
+        // Send a single fragment to a connected client (for retransmission or custom fragmented sends).
+        // Returns bytes sent, or -1 on error.
+        int send_fragment_to(uint32_t message_id, uint8_t index, uint8_t count, const void *data, size_t size,
+                             uint8_t flags, uint8_t channel_id, const std::string &address, uint16_t port);
 
         // Disconnect a specific client
         void disconnect_client(const endpoint_key &key);
@@ -87,9 +103,13 @@ namespace entanglement
         void set_on_allocate_message(on_allocate_message cb);
         void set_on_message_complete(on_message_complete cb);
         void set_on_message_expired(on_message_expired cb);
+        void set_on_message_evicted(on_message_evicted cb);
 
         // Override the reassembly timeout (default: REASSEMBLY_TIMEOUT_US).
-        void set_reassembly_timeout(int64_t timeout_us) { m_reassembly_timeout_us = timeout_us; }
+        void set_reassembly_timeout(int64_t timeout_us);
+
+        // Fragment flow control: check if a specific client asked us to stop sending fragments
+        bool is_fragment_throttled(const std::string &address, uint16_t port) const;
 
         // Channel configuration
         channel_manager &channels() { return m_channels; }
@@ -102,8 +122,14 @@ namespace entanglement
         std::atomic<bool> m_running{false};
         bool m_verbose = true;
         channel_manager m_channels;
-        fragment_reassembler m_reassembler;
         int64_t m_reassembly_timeout_us = REASSEMBLY_TIMEOUT_US;
+
+        // Stored callback templates (applied to each new connection's reassembler)
+        on_allocate_message m_frag_alloc_cb;
+        on_message_complete m_frag_complete_cb;
+        on_message_expired m_frag_expired_cb;
+        on_message_evicted m_frag_evicted_cb;
+
         on_packet_received m_on_packet_received;
         on_client_connected m_on_client_connected;
         on_client_disconnected m_on_client_disconnected;
@@ -131,9 +157,10 @@ namespace entanglement
         // Send a control packet without a connection (e.g. CONNECTION_DENIED)
         void send_raw_control(uint8_t control_type, const std::string &address, uint16_t port);
 
-        // Send a single fragment to a client (called from send_payload_to)
-        int send_fragment_to(udp_connection *conn, uint32_t message_id, uint8_t index, uint8_t count, const void *data,
-                             size_t size, uint8_t flags, uint8_t channel_id, const std::string &address, uint16_t port);
+        // Send a single fragment to a client (internal — takes connection pointer)
+        int send_fragment_to_impl(udp_connection *conn, uint32_t message_id, uint8_t index, uint8_t count,
+                                  const void *data, size_t size, uint8_t flags, uint8_t channel_id,
+                                  const std::string &address, uint16_t port);
     };
 
 } // namespace entanglement

@@ -119,11 +119,13 @@ namespace entanglement
         return m_socket.send_packet(header, payload, m_server_address, m_server_port);
     }
 
-    int client::send_payload(const void *data, size_t size, uint8_t flags, uint8_t channel_id)
+    int client::send_payload(const void *data, size_t size, uint8_t flags, uint8_t channel_id, uint32_t *out_message_id)
     {
         // Single-packet path (no fragmentation overhead)
         if (size <= MAX_PAYLOAD_SIZE)
         {
+            if (out_message_id)
+                *out_message_id = 0;
             packet_header header{};
             header.flags = flags;
             header.shard_id = 0;
@@ -131,6 +133,12 @@ namespace entanglement
             header.reserved = 0;
             header.payload_size = static_cast<uint16_t>(size);
             return send(header, data);
+        }
+
+        // Fragmented send — check backpressure from server
+        if (m_connection.is_fragment_backpressured())
+        {
+            return -2; // BACKPRESSURED: server's reassembler is full
         }
 
         // --- Fragmented send (zero-copy from user buffer) ---
@@ -158,6 +166,9 @@ namespace entanglement
         // Register for ACK tracking (sender side)
         m_connection.register_pending_message(message_id, fragment_count);
 
+        if (out_message_id)
+            *out_message_id = message_id;
+
         return total_sent;
     }
 
@@ -182,6 +193,7 @@ namespace entanglement
         auto &entry = m_connection.send_buffer_entry(idx);
         entry.message_id = message_id;
         entry.fragment_index = index;
+        entry.fragment_count = count;
 
         // Scatter-gather: [packet_header] + [fragment_header] + [user data] — zero intermediate copy
         const void *segments[2] = {&fhdr, data};
@@ -218,14 +230,36 @@ namespace entanglement
                 continue;
             }
 
-            // Handle fragmented data packets — route to reassembler
+            // Handle fragmented data packets — route to per-connection reassembler
             if ((header.flags & FLAG_FRAGMENT) && header.payload_size > FRAGMENT_HEADER_SIZE)
             {
                 fragment_header fhdr;
                 std::memcpy(&fhdr, payload, FRAGMENT_HEADER_SIZE);
                 endpoint_key server_ep{}; // zeroed — single server
-                m_reassembler.process_fragment(server_ep, header.channel_id, fhdr, payload + FRAGMENT_HEADER_SIZE,
-                                               header.payload_size - FRAGMENT_HEADER_SIZE);
+                auto result = m_connection.reassembler().process_fragment(server_ep, header.channel_id, fhdr,
+                                                                          payload + FRAGMENT_HEADER_SIZE,
+                                                                          header.payload_size - FRAGMENT_HEADER_SIZE);
+
+                // If reassembler is full/under pressure, send backpressure to server
+                if (result == fragment_result::slots_full)
+                {
+                    if (!m_connection.backpressure_sent())
+                    {
+                        uint8_t bp[2] = {CONTROL_BACKPRESSURE, 0};
+                        send_control_payload(bp, 2);
+                        m_connection.set_backpressure_sent(true);
+                    }
+                }
+                else if (m_connection.reassembler().usage_percent() >= BACKPRESSURE_HIGH_WATERMARK)
+                {
+                    if (!m_connection.backpressure_sent())
+                    {
+                        uint8_t bp[2] = {CONTROL_BACKPRESSURE, 0};
+                        send_control_payload(bp, 2);
+                        m_connection.set_backpressure_sent(true);
+                    }
+                }
+
                 ++count;
                 continue;
             }
@@ -283,7 +317,17 @@ namespace entanglement
         }
 
         // Expire stale reassembly entries
-        m_reassembler.cleanup_stale(now, m_reassembly_timeout_us);
+        auto &ra = m_connection.reassembler();
+        ra.cleanup_stale(now, ra.reassembly_timeout());
+
+        // Send backpressure relief if usage dropped below low watermark
+        if (m_connection.backpressure_sent() && ra.usage_percent() < BACKPRESSURE_LOW_WATERMARK)
+        {
+            uint8_t available = static_cast<uint8_t>(ra.capacity() - ra.pending_count());
+            uint8_t bp[2] = {CONTROL_BACKPRESSURE, available};
+            send_control_payload(bp, 2);
+            m_connection.set_backpressure_sent(false);
+        }
 
         return count;
     }
@@ -300,17 +344,22 @@ namespace entanglement
 
     void client::set_on_allocate_message(on_allocate_message cb)
     {
-        m_reassembler.set_on_allocate(std::move(cb));
+        m_connection.reassembler().set_on_allocate(std::move(cb));
     }
 
     void client::set_on_message_complete(on_message_complete cb)
     {
-        m_reassembler.set_on_complete(std::move(cb));
+        m_connection.reassembler().set_on_complete(std::move(cb));
     }
 
     void client::set_on_message_expired(on_message_expired cb)
     {
-        m_reassembler.set_on_expired(std::move(cb));
+        m_connection.reassembler().set_on_expired(std::move(cb));
+    }
+
+    void client::set_on_message_evicted(on_message_evicted cb)
+    {
+        m_connection.reassembler().set_on_evicted(std::move(cb));
     }
 
     void client::set_on_message_acked(on_message_acked cb)
@@ -385,6 +434,18 @@ namespace entanglement
                         m_channel_ack_status = status;
                         m_pending_channel_id = -1; // ACK received — unblock open_channel
                     }
+                }
+                break;
+            }
+
+            case CONTROL_BACKPRESSURE:
+            {
+                // Payload: [type(1)][available_slots(1)]
+                // available=0 means throttle, >0 means resume
+                if (payload_size >= 2)
+                {
+                    uint8_t available = payload[1];
+                    m_connection.set_fragment_backpressured(available == 0);
                 }
                 break;
             }

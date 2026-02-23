@@ -83,6 +83,25 @@ namespace entanglement
     using on_message_expired =
         std::function<void(const endpoint_key &sender, uint32_t message_id, uint8_t channel_id, uint8_t *app_buffer)>;
 
+    // Called when an incomplete message is evicted to make room for a new one.
+    // Includes progress info so the app knows how much was lost.
+    using on_message_evicted = std::function<void(const endpoint_key &sender, uint32_t message_id, uint8_t channel_id,
+                                                  uint8_t *app_buffer, uint8_t received_count, uint8_t fragment_count)>;
+
+    // -----------------------------------------------------------------------
+    // fragment_result — rich return from process_fragment.
+    // -----------------------------------------------------------------------
+
+    enum class fragment_result : uint8_t
+    {
+        accepted,   // Fragment stored, message not yet complete
+        completed,  // This fragment completed the message
+        duplicate,  // Fragment already received (no-op)
+        slots_full, // No free reassembly slot (after eviction attempts)
+        rejected,   // App rejected buffer allocation (on_allocate → nullptr)
+        invalid,    // Bad fragment header or data
+    };
+
     // -----------------------------------------------------------------------
     // RECEIVER SIDE — reassembly_entry tracks one incoming fragmented message.
     //   Fixed array, zero allocation.  The data lives in app-provided buffer.
@@ -141,15 +160,19 @@ namespace entanglement
         void set_on_allocate(on_allocate_message cb) { m_on_allocate = std::move(cb); }
         void set_on_complete(on_message_complete cb) { m_on_complete = std::move(cb); }
         void set_on_expired(on_message_expired cb) { m_on_expired = std::move(cb); }
+        void set_on_evicted(on_message_evicted cb) { m_on_evicted = std::move(cb); }
 
         // Process one incoming fragment.  Calls on_allocate / on_complete as needed.
-        // Returns true if a message was completed by this fragment.
-        bool process_fragment(const endpoint_key &sender, uint8_t channel_id, const fragment_header &fhdr,
-                              const uint8_t *frag_data, size_t frag_data_size);
+        // Returns a fragment_result indicating what happened.
+        fragment_result process_fragment(const endpoint_key &sender, uint8_t channel_id, const fragment_header &fhdr,
+                                         const uint8_t *frag_data, size_t frag_data_size);
 
         // Expire incomplete messages older than timeout_us microseconds.
         // Calls on_message_expired for each evicted entry.  Returns count evicted.
         int cleanup_stale(std::chrono::steady_clock::time_point now, int64_t timeout_us = REASSEMBLY_TIMEOUT_US);
+
+        // Clear all active entries, calling on_expired for each (so app frees buffers).
+        void clear();
 
         // Number of messages currently being reassembled
         size_t pending_count() const
@@ -161,14 +184,25 @@ namespace entanglement
             return n;
         }
 
+        // Capacity queries (for backpressure logic)
+        static constexpr size_t capacity() { return MAX_INCOMING_FRAGMENTED_MESSAGES; }
+        int usage_percent() const;
+
+        // Reassembly timeout (used internally by eviction fallback)
+        void set_reassembly_timeout(int64_t timeout_us) { m_reassembly_timeout_us = timeout_us; }
+        int64_t reassembly_timeout() const { return m_reassembly_timeout_us; }
+
     private:
         reassembly_entry m_entries[MAX_INCOMING_FRAGMENTED_MESSAGES]{};
         on_allocate_message m_on_allocate;
         on_message_complete m_on_complete;
         on_message_expired m_on_expired;
+        on_message_evicted m_on_evicted;
+        int64_t m_reassembly_timeout_us = REASSEMBLY_TIMEOUT_US;
 
         reassembly_entry *find_entry(const endpoint_key &sender, uint32_t message_id);
         reassembly_entry *allocate_entry();
+        reassembly_entry *try_evict_least_progress();
     };
 
 } // namespace entanglement

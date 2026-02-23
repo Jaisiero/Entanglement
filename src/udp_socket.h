@@ -4,7 +4,6 @@
 #include "platform.h"
 #include <functional>
 #include <string>
-#include <vector>
 
 #ifdef ENTANGLEMENT_SIMULATE_LOSS
 #include <random>
