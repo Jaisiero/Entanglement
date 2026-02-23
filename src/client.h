@@ -92,6 +92,12 @@ namespace entanglement
         void set_verbose(bool verbose) { m_verbose = verbose; }
         bool verbose() const { return m_verbose; }
 
+#ifdef ENTANGLEMENT_SIMULATE_LOSS
+        void set_simulated_drop_rate(double rate) { m_socket.set_drop_rate(rate); }
+        double simulated_drop_rate() const { return m_socket.drop_rate(); }
+        uint64_t simulated_drop_count() const { return m_socket.drop_count(); }
+#endif
+
         uint16_t local_port() const;
 
     private:

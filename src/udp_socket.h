@@ -6,6 +6,10 @@
 #include <string>
 #include <vector>
 
+#ifdef ENTANGLEMENT_SIMULATE_LOSS
+#include <random>
+#endif
+
 namespace entanglement
 {
 
@@ -61,8 +65,23 @@ namespace entanglement
         bool is_valid() const { return m_socket != INVALID_SOCK; }
         void close();
 
+#ifdef ENTANGLEMENT_SIMULATE_LOSS
+        // Set the probability [0.0, 1.0] that an inbound packet is silently dropped.
+        void set_drop_rate(double rate);
+        double drop_rate() const { return m_drop_rate; }
+        uint64_t drop_count() const { return m_drop_count; }
+#endif
+
     private:
         socket_t m_socket = INVALID_SOCK;
+
+#ifdef ENTANGLEMENT_SIMULATE_LOSS
+        double m_drop_rate = 0.0;
+        uint64_t m_drop_count = 0;
+        std::mt19937 m_rng{std::random_device{}()};
+        std::uniform_real_distribution<double> m_dist{0.0, 1.0};
+        bool should_drop();
+#endif
     };
 
 } // namespace entanglement

@@ -78,6 +78,11 @@ namespace entanglement
         void set_verbose(bool verbose) { m_verbose = verbose; }
         bool verbose() const { return m_verbose; }
 
+#ifdef ENTANGLEMENT_SIMULATE_LOSS
+        void set_simulated_drop_rate(double rate) { m_socket.set_drop_rate(rate); }
+        double simulated_drop_rate() const { return m_socket.drop_rate(); }
+#endif
+
         // Fragmentation: receiver callbacks
         void set_on_allocate_message(on_allocate_message cb);
         void set_on_message_complete(on_message_complete cb);

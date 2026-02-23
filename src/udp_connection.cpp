@@ -86,9 +86,12 @@ namespace entanglement
         //    The remote is telling us which of OUR packets it received
         if (header.ack > 0)
         {
-            ack_packet(header.ack);
+            // Primary ACK: most recent packet remote received — valid RTT sample
+            ack_packet(header.ack, /*take_rtt_sample=*/true);
 
             // Process bitmap: bit N = ack - (N+1)
+            // Bitmap entries are older packets whose initial ACK may have been
+            // dropped; measuring RTT from them would inflate the estimate.
             for (int i = 0; i < ACK_BITMAP_WIDTH; ++i)
             {
                 if (header.ack_bitmap & (1u << i))
@@ -96,7 +99,7 @@ namespace entanglement
                     uint64_t acked_seq = header.ack - static_cast<uint64_t>(i + 1);
                     if (acked_seq > 0)
                     {
-                        ack_packet(acked_seq);
+                        ack_packet(acked_seq, /*take_rtt_sample=*/false);
                     }
                 }
             }
@@ -152,7 +155,7 @@ namespace entanglement
 
     // --- Helpers ---
 
-    void udp_connection::ack_packet(uint64_t sequence)
+    void udp_connection::ack_packet(uint64_t sequence, bool take_rtt_sample)
     {
         size_t index = sequence % SEQUENCE_BUFFER_SIZE;
         auto &entry = m_send_buffer[index];
@@ -182,13 +185,18 @@ namespace entanglement
                 }
             }
 
-            // Every ACKed packet is a first transmission (losses are deactivated,
-            // not retried), so all RTT samples are valid — no Karn's filtering needed.
-            auto now = std::chrono::steady_clock::now();
-            auto sample = std::chrono::duration_cast<std::chrono::microseconds>(now - entry.send_time).count();
-            if (sample > 0)
+            // Take RTT sample only from primary ACK (header.ack), not bitmap entries.
+            // Bitmap ACKs represent older packets whose initial response may have been
+            // dropped by simulated or real loss; their apparent delay is inflated and
+            // would poison the smoothed RTT estimator.
+            if (take_rtt_sample)
             {
-                update_rtt(sample);
+                auto now = std::chrono::steady_clock::now();
+                auto sample = std::chrono::duration_cast<std::chrono::microseconds>(now - entry.send_time).count();
+                if (sample > 0)
+                {
+                    update_rtt(sample);
+                }
             }
 
             // Notify congestion controller and update pacing
@@ -232,18 +240,32 @@ namespace entanglement
         // Scan the active window of the send buffer
         uint64_t oldest = (m_local_sequence > SEQUENCE_BUFFER_SIZE) ? m_local_sequence - SEQUENCE_BUFFER_SIZE : 1;
 
-        for (uint64_t seq = oldest; seq < m_local_sequence && count < max_count; ++seq)
+        for (uint64_t seq = oldest; seq < m_local_sequence; ++seq)
         {
             size_t idx = seq % SEQUENCE_BUFFER_SIZE;
             auto &entry = m_send_buffer[idx];
 
             if (!entry.active || entry.acked || entry.sequence != seq)
                 continue;
-            if (!entry.reliable)
-                continue;
 
             auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - entry.send_time);
             if (elapsed.count() < m_rto)
+                continue;
+
+            if (!entry.reliable)
+            {
+                // Unreliable packet timed out — reclaim its in_flight slot silently.
+                // Without this, dropped unreliable packets leak in_flight, eventually
+                // starving can_send() and collapsing throughput.
+                entry.active = false;
+                m_cc.on_packet_expired();
+                continue;
+            }
+
+            // Reliable packet loss — report to application (up to max_count).
+            // We keep scanning beyond max_count so unreliable expirations above
+            // are still processed; reliable losses beyond the limit are deferred.
+            if (count >= max_count)
                 continue;
 
             // Report loss metadata to application

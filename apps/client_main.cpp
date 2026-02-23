@@ -166,7 +166,7 @@ static void build_frag_payload(std::vector<uint8_t> &buf, uint32_t msg_id, uint3
 // ============================================================================
 // Single client soak test run
 // ============================================================================
-static client_result run_client(int id, const char *server_ip, uint16_t port, int duration_seconds)
+static client_result run_client(int id, const char *server_ip, uint16_t port, int duration_seconds, double drop_rate)
 {
     client_result result;
     result.id = id;
@@ -209,6 +209,13 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
     client cli(server_ip, port);
     cli.set_verbose(false);
     cli.channels().register_defaults();
+
+#ifdef ENTANGLEMENT_SIMULATE_LOSS
+    if (drop_rate > 0.0)
+        cli.set_simulated_drop_rate(drop_rate);
+#else
+    (void)drop_rate;
+#endif
 
     // =========================================================================
     // SIMPLE ECHO callback (non-fragmented responses from server)
@@ -337,6 +344,10 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
     constexpr auto PROGRESS_INTERVAL = std::chrono::seconds(10);
     int cycle = 0;
 
+    // Stream rotation: cycle through 6 streams one message at a time.
+    // 0=simple-rel, 1=frag-rel, 2=simple-ord, 3=frag-ord, 4=simple-unr, 5=frag-unr
+    // This avoids bursting 9 packets (3 frag messages) which overwhelms the cwnd.
+
     while (std::chrono::steady_clock::now() < deadline)
     {
         cli.poll();
@@ -357,58 +368,55 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
             continue;
         }
 
-        // Alternate: even cycles → simple, odd cycles → fragmented
-        bool send_simple = (cycle % 2 == 0);
+        int stream = cycle % 6;
+        int ch_index = stream / 2;            // 0, 0, 1, 1, 2, 2
+        bool send_simple = (stream % 2 == 0); // even=simple, odd=frag
         ++cycle;
+
+        uint8_t ch_id = ch_ids[ch_index];
 
         if (send_simple)
         {
-            // ── Send 3 simple messages ──
-            for (int c = 0; c < 3; ++c)
-            {
-                uint8_t ch_id = ch_ids[c];
-                uint32_t msg_id = static_cast<uint32_t>(simple_sent[c]);
+            // ── Send 1 simple message ──
+            uint32_t msg_id = static_cast<uint32_t>(simple_sent[ch_index]);
 
-                soak_msg payload;
-                payload.msg_id = msg_id;
-                payload.total_expected = 0;
-                payload.channel_id = ch_id;
+            soak_msg payload;
+            payload.msg_id = msg_id;
+            payload.total_expected = 0;
+            payload.channel_id = ch_id;
 
-                packet_header hdr{};
-                hdr.channel_id = ch_id;
-                hdr.payload_size = static_cast<uint16_t>(SOAK_MSG_SIZE);
-                cli.send(hdr, &payload);
+            packet_header hdr{};
+            hdr.channel_id = ch_id;
+            hdr.payload_size = static_cast<uint16_t>(SOAK_MSG_SIZE);
+            cli.send(hdr, &payload);
 
-                seq_to_msg[hdr.sequence] = {ch_id, msg_id};
-                auto sit = simple_idx.find(ch_id);
-                if (sit != simple_idx.end())
-                    ++result.streams[sit->second].total_packets;
+            seq_to_msg[hdr.sequence] = {ch_id, msg_id};
+            auto sit = simple_idx.find(ch_id);
+            if (sit != simple_idx.end())
+                ++result.streams[sit->second].total_packets;
 
-                ++simple_sent[c];
-                ++result.total_data_packets_sent;
-            }
+            ++simple_sent[ch_index];
+            ++result.total_data_packets_sent;
+
             result.streams[S_REL].messages_sent = simple_sent[0];
             result.streams[S_ORD].messages_sent = simple_sent[1];
             result.streams[S_UNR].messages_sent = simple_sent[2];
         }
         else
         {
-            // ── Send 3 fragmented messages ──
-            for (int c = 0; c < 3; ++c)
+            // ── Send 1 fragmented message ──
+            uint32_t msg_id = static_cast<uint32_t>(frag_sent[ch_index]);
+
+            build_frag_payload(frag_buf, msg_id, 0, ch_id);
+            int sent_bytes = cli.send_payload(frag_buf.data(), frag_buf.size(), 0, ch_id);
+
+            if (sent_bytes > 0)
             {
-                uint8_t ch_id = ch_ids[c];
-                uint32_t msg_id = static_cast<uint32_t>(frag_sent[c]);
-
-                build_frag_payload(frag_buf, msg_id, 0, ch_id);
-                int sent_bytes = cli.send_payload(frag_buf.data(), frag_buf.size(), 0, ch_id);
-
-                if (sent_bytes > 0)
-                {
-                    ++frag_sent[c];
-                    // Each fragmented message generates ceil(2500/1160)=3 packets
-                    result.total_data_packets_sent += 3;
-                }
+                ++frag_sent[ch_index];
+                // Each fragmented message generates ceil(2500/1160)=3 packets
+                result.total_data_packets_sent += 3;
             }
+
             result.streams[F_REL].messages_sent = frag_sent[0];
             result.streams[F_ORD].messages_sent = frag_sent[1];
             result.streams[F_UNR].messages_sent = frag_sent[2];
@@ -498,7 +506,11 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
         std::lock_guard<std::mutex> lk(g_cout_mutex);
         std::cout << "[client " << id << "] Finished: s_echo=" << result.total_simple_echoes
                   << " f_echo=" << result.total_frag_echoes << " loss=" << result.total_losses_detected
-                  << " retx=" << result.total_retransmissions << " drain=" << result.drain_iterations << std::endl;
+                  << " retx=" << result.total_retransmissions << " drain=" << result.drain_iterations;
+#ifdef ENTANGLEMENT_SIMULATE_LOSS
+        std::cout << " sim_drops=" << cli.simulated_drop_count();
+#endif
+        std::cout << std::endl;
     }
 
     return result;
@@ -582,32 +594,56 @@ int main(int argc, char *argv[])
     uint16_t server_port = DEFAULT_PORT;
     int duration_minutes = 1;
     int num_clients = 1;
+    double drop_rate = 0.0;
 
     // --- Parse args ---
-    bool got_ip = false, got_port = false;
     for (int i = 1; i < argc; ++i)
     {
-        if ((std::strcmp(argv[i], "-t") == 0 || std::strcmp(argv[i], "--t") == 0) && i + 1 < argc)
+        if ((std::strcmp(argv[i], "-s") == 0 || std::strcmp(argv[i], "--server") == 0) && i + 1 < argc)
+        {
+            server_ip = argv[++i];
+        }
+        else if ((std::strcmp(argv[i], "-p") == 0 || std::strcmp(argv[i], "--port") == 0) && i + 1 < argc)
+        {
+            server_port = static_cast<uint16_t>(std::atoi(argv[++i]));
+        }
+        else if ((std::strcmp(argv[i], "-t") == 0 || std::strcmp(argv[i], "--time") == 0) && i + 1 < argc)
         {
             duration_minutes = std::atoi(argv[++i]);
             if (duration_minutes < 1)
                 duration_minutes = 1;
         }
-        else if ((std::strcmp(argv[i], "-c") == 0 || std::strcmp(argv[i], "--c") == 0) && i + 1 < argc)
+        else if ((std::strcmp(argv[i], "-c") == 0 || std::strcmp(argv[i], "--clients") == 0) && i + 1 < argc)
         {
             num_clients = std::atoi(argv[++i]);
             if (num_clients < 1)
                 num_clients = 1;
         }
-        else if (!got_ip)
+        else if ((std::strcmp(argv[i], "-d") == 0 || std::strcmp(argv[i], "--drop") == 0) && i + 1 < argc)
         {
-            server_ip = argv[i];
-            got_ip = true;
+            drop_rate = std::atof(argv[++i]) / 100.0; // percent → [0,1]
+            if (drop_rate < 0.0)
+                drop_rate = 0.0;
+            if (drop_rate > 1.0)
+                drop_rate = 1.0;
         }
-        else if (!got_port)
+        else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0)
         {
-            server_port = static_cast<uint16_t>(std::atoi(argv[i]));
-            got_port = true;
+            std::cout << "Usage: EntanglementClient [-s ip] [-p port] [-t minutes] [-c clients] [-d drop%]"
+                      << std::endl;
+            std::cout << "  -s, --server   Server IP (default: 127.0.0.1)" << std::endl;
+            std::cout << "  -p, --port     Server port (default: " << DEFAULT_PORT << ")" << std::endl;
+            std::cout << "  -t, --time     Duration in minutes (default: 1)" << std::endl;
+            std::cout << "  -c, --clients  Number of clients (default: 1)" << std::endl;
+            std::cout << "  -d, --drop     Simulated drop rate in percent (default: 0)" << std::endl;
+            return 0;
+        }
+        else
+        {
+            std::cerr << "Unknown argument: " << argv[i] << std::endl;
+            std::cerr << "Usage: EntanglementClient [-s ip] [-p port] [-t minutes] [-c clients] [-d drop%]"
+                      << std::endl;
+            return 1;
         }
     }
 
@@ -622,6 +658,9 @@ int main(int argc, char *argv[])
     std::cout << " Simple payload:  " << SOAK_MSG_SIZE << " bytes" << std::endl;
     std::cout << " Frag payload:    " << FRAG_PAYLOAD_SIZE << " bytes (~"
               << ((FRAG_PAYLOAD_SIZE + MAX_FRAGMENT_PAYLOAD - 1) / MAX_FRAGMENT_PAYLOAD) << " fragments)" << std::endl;
+#ifdef ENTANGLEMENT_SIMULATE_LOSS
+    std::cout << " Drop rate: " << (drop_rate * 100.0) << "%" << std::endl;
+#endif
     std::cout << "=============================================" << std::endl;
 
     // --- Launch client threads ---
@@ -632,8 +671,8 @@ int main(int argc, char *argv[])
 
     for (int i = 0; i < num_clients; ++i)
     {
-        threads.emplace_back([&results, i, server_ip, server_port, duration_seconds]()
-                             { results[i] = run_client(i, server_ip, server_port, duration_seconds); });
+        threads.emplace_back([&results, i, server_ip, server_port, duration_seconds, drop_rate]()
+                             { results[i] = run_client(i, server_ip, server_port, duration_seconds, drop_rate); });
     }
 
     for (auto &t : threads)

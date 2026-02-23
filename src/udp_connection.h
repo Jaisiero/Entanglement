@@ -171,8 +171,10 @@ namespace entanglement
         // Congestion control algorithm instance
         congestion_control m_cc;
 
-        // Helper: mark a sent packet as acked (+ RTT sample)
-        void ack_packet(uint64_t sequence);
+        // Helper: mark a sent packet as acked.
+        // take_rtt_sample: true for primary ACK (header.ack), false for bitmap entries
+        // (bitmap ACKs can have inflated delays due to dropped responses).
+        void ack_packet(uint64_t sequence, bool take_rtt_sample);
 
         // Helper: update RTT estimates from a sample
         void update_rtt(int64_t sample_us);

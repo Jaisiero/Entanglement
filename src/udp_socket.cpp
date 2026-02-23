@@ -16,9 +16,20 @@ namespace entanglement
         close();
     }
 
-    udp_socket::udp_socket(udp_socket &&other) noexcept : m_socket(other.m_socket)
+    udp_socket::udp_socket(udp_socket &&other) noexcept
+        : m_socket(other.m_socket)
+#ifdef ENTANGLEMENT_SIMULATE_LOSS
+          ,
+          m_drop_rate(other.m_drop_rate),
+          m_drop_count(other.m_drop_count),
+          m_rng(std::move(other.m_rng))
+#endif
     {
         other.m_socket = INVALID_SOCK;
+#ifdef ENTANGLEMENT_SIMULATE_LOSS
+        other.m_drop_rate = 0.0;
+        other.m_drop_count = 0;
+#endif
     }
 
     udp_socket &udp_socket::operator=(udp_socket &&other) noexcept
@@ -28,6 +39,13 @@ namespace entanglement
             close();
             m_socket = other.m_socket;
             other.m_socket = INVALID_SOCK;
+#ifdef ENTANGLEMENT_SIMULATE_LOSS
+            m_drop_rate = other.m_drop_rate;
+            m_drop_count = other.m_drop_count;
+            m_rng = std::move(other.m_rng);
+            other.m_drop_rate = 0.0;
+            other.m_drop_count = 0;
+#endif
         }
         return *this;
     }
@@ -86,6 +104,10 @@ namespace entanglement
 
         if (received > 0)
         {
+#ifdef ENTANGLEMENT_SIMULATE_LOSS
+            if (should_drop())
+                return -1; // simulate network loss
+#endif
             char addr_str[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, &from.sin_addr, addr_str, sizeof(addr_str));
             sender_address = addr_str;
@@ -242,5 +264,26 @@ namespace entanglement
             m_socket = INVALID_SOCK;
         }
     }
+
+#ifdef ENTANGLEMENT_SIMULATE_LOSS
+    void udp_socket::set_drop_rate(double rate)
+    {
+        if (rate < 0.0)
+            rate = 0.0;
+        if (rate > 1.0)
+            rate = 1.0;
+        m_drop_rate = rate;
+    }
+
+    bool udp_socket::should_drop()
+    {
+        if (m_drop_rate <= 0.0)
+            return false;
+        bool drop = m_dist(m_rng) < m_drop_rate;
+        if (drop)
+            ++m_drop_count;
+        return drop;
+    }
+#endif
 
 } // namespace entanglement

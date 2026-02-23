@@ -20,6 +20,7 @@
 #include <chrono>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
@@ -344,8 +345,36 @@ int main(int argc, char *argv[])
     }
 
     uint16_t port = DEFAULT_PORT;
-    if (argc >= 2)
-        port = static_cast<uint16_t>(std::atoi(argv[1]));
+    double drop_rate = 0.0;
+
+    for (int i = 1; i < argc; ++i)
+    {
+        if ((std::strcmp(argv[i], "-p") == 0 || std::strcmp(argv[i], "--port") == 0) && i + 1 < argc)
+        {
+            port = static_cast<uint16_t>(std::atoi(argv[++i]));
+        }
+        else if ((std::strcmp(argv[i], "-d") == 0 || std::strcmp(argv[i], "--drop") == 0) && i + 1 < argc)
+        {
+            drop_rate = std::atof(argv[++i]) / 100.0;
+            if (drop_rate < 0.0)
+                drop_rate = 0.0;
+            if (drop_rate > 1.0)
+                drop_rate = 1.0;
+        }
+        else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0)
+        {
+            std::cout << "Usage: EntanglementServer [-p port] [-d drop%]" << std::endl;
+            std::cout << "  -p, --port  Listen port (default: " << DEFAULT_PORT << ")" << std::endl;
+            std::cout << "  -d, --drop  Simulated drop rate in percent (default: 0)" << std::endl;
+            return 0;
+        }
+        else
+        {
+            std::cerr << "Unknown argument: " << argv[i] << std::endl;
+            std::cerr << "Usage: EntanglementServer [-p port] [-d drop%]" << std::endl;
+            return 1;
+        }
+    }
 
     std::signal(SIGINT, signal_handler);
 
@@ -355,10 +384,20 @@ int main(int argc, char *argv[])
     std::cout << " Header size: " << sizeof(packet_header) << " bytes" << std::endl;
     std::cout << " Soak payload (simple): " << SOAK_MSG_SIZE << " bytes" << std::endl;
     std::cout << " Max fragment payload:  " << MAX_FRAGMENT_PAYLOAD << " bytes" << std::endl;
+#ifdef ENTANGLEMENT_SIMULATE_LOSS
+    std::cout << " Drop rate: " << (drop_rate * 100.0) << "%" << std::endl;
+#endif
     std::cout << "=============================================" << std::endl;
 
     server srv(port);
     srv.channels().register_defaults();
+
+#ifdef ENTANGLEMENT_SIMULATE_LOSS
+    if (drop_rate > 0.0)
+        srv.set_simulated_drop_rate(drop_rate);
+#else
+    (void)drop_rate;
+#endif
 
     // --- Client connected ---
     srv.set_on_client_connected(

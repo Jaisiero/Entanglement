@@ -9,11 +9,18 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Simulated packet loss (testing only, OFF by default)
+option(ENTANGLEMENT_SIMULATE_LOSS "Enable simulated packet loss for testing" OFF)
+
 # Collect sources in src/ (protocol library)
 file(GLOB_RECURSE LIB_SOURCES CONFIGURE_DEPENDS "src/*.cpp")
 
 add_library(entanglement_core STATIC ${LIB_SOURCES})
 target_include_directories(entanglement_core PUBLIC src)
+
+if(ENTANGLEMENT_SIMULATE_LOSS)
+    target_compile_definitions(entanglement_core PUBLIC ENTANGLEMENT_SIMULATE_LOSS)
+endif()
 
 # Platform-specific libraries
 if(WIN32)

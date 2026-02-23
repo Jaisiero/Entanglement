@@ -2,6 +2,7 @@
 
 #include "constants.h"
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 
 namespace entanglement
@@ -49,6 +50,10 @@ namespace entanglement
         // A reliable packet was detected as lost (RTO expired)
         void on_packet_lost();
 
+        // An unreliable packet expired without ACK — reclaim in_flight only,
+        // no congestion response (unreliable loss is expected and non-actionable).
+        void on_packet_expired();
+
         // --- Queries (read by application via client/connection) ---
 
         // True when the window still has room for more packets
@@ -77,6 +82,11 @@ namespace entanglement
         // Fractional cwnd accumulator for congestion avoidance
         // (we add 1/cwnd per ACK, this stores the fraction)
         double m_cwnd_accumulator = 0.0;
+
+        // Loss event coalescing: only apply multiplicative decrease once per RTT.
+        // Multiple losses within the same RTT window are a single congestion event.
+        double m_srtt_us = 0.0;
+        std::chrono::steady_clock::time_point m_last_cwnd_reduction{};
     };
 
 } // namespace entanglement

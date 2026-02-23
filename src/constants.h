@@ -37,7 +37,7 @@ namespace entanglement
 
     // --- Congestion control ---
     constexpr uint32_t INITIAL_CWND = 4;      // conservative initial window (packets)
-    constexpr uint32_t MIN_CWND = 2;          // floor — never starve the connection
+    constexpr uint32_t MIN_CWND = 4;          // floor — never starve the connection
     constexpr uint32_t INITIAL_SSTHRESH = 64; // switch slow-start → congestion avoidance
     constexpr uint32_t MAX_CWND = 256;        // cap for gaming (low-latency priority)
 

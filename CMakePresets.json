@@ -64,6 +64,38 @@
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Release"
             }
+        },
+        {
+            "name": "debug-simloss",
+            "displayName": "Debug + Simulated Loss (Windows)",
+            "inherits": "debug",
+            "cacheVariables": {
+                "ENTANGLEMENT_SIMULATE_LOSS": "ON"
+            }
+        },
+        {
+            "name": "release-simloss",
+            "displayName": "Release + Simulated Loss (Windows)",
+            "inherits": "release",
+            "cacheVariables": {
+                "ENTANGLEMENT_SIMULATE_LOSS": "ON"
+            }
+        },
+        {
+            "name": "linux-debug-simloss",
+            "displayName": "Debug + Simulated Loss (Linux)",
+            "inherits": "linux-debug",
+            "cacheVariables": {
+                "ENTANGLEMENT_SIMULATE_LOSS": "ON"
+            }
+        },
+        {
+            "name": "linux-release-simloss",
+            "displayName": "Release + Simulated Loss (Linux)",
+            "inherits": "linux-release",
+            "cacheVariables": {
+                "ENTANGLEMENT_SIMULATE_LOSS": "ON"
+            }
         }
     ],
     "buildPresets": [
@@ -88,6 +120,28 @@
             "name": "linux-release",
             "displayName": "Release (Linux)",
             "configurePreset": "linux-release"
+        },
+        {
+            "name": "debug-simloss",
+            "displayName": "Debug + Simulated Loss (Windows)",
+            "configurePreset": "debug-simloss",
+            "configuration": "Debug"
+        },
+        {
+            "name": "release-simloss",
+            "displayName": "Release + Simulated Loss (Windows)",
+            "configurePreset": "release-simloss",
+            "configuration": "Release"
+        },
+        {
+            "name": "linux-debug-simloss",
+            "displayName": "Debug + Simulated Loss (Linux)",
+            "configurePreset": "linux-debug-simloss"
+        },
+        {
+            "name": "linux-release-simloss",
+            "displayName": "Release + Simulated Loss (Linux)",
+            "configurePreset": "linux-release-simloss"
         }
     ]
 }
