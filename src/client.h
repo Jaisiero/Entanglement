@@ -2,6 +2,7 @@
 
 #include "channel_manager.h"
 #include "congestion_control.h"
+#include "fragmentation.h"
 #include "udp_connection.h"
 #include "udp_socket.h"
 #include <atomic>
@@ -43,7 +44,10 @@ namespace entanglement
         // Send a data packet (header gets seq/ack filled automatically)
         int send(packet_header &header, const void *payload = nullptr);
 
-        // Send raw payload with auto-filled header fields
+        // Send raw payload with auto-filled header fields.
+        // Messages <= MAX_PAYLOAD_SIZE are sent as a single packet.
+        // Larger messages are automatically fragmented.
+        // Returns bytes of user data sent, or -1 on error.
         int send_payload(const void *data, size_t size, uint8_t flags = 0, uint8_t channel_id = 0);
 
         // Receive and dispatch incoming packets
@@ -70,6 +74,17 @@ namespace entanglement
         // Must be called while connected.
         int open_channel(channel_mode mode, uint8_t priority = 128, const char *name = "", uint8_t hint = 4);
 
+        // Fragmentation: receiver callbacks (app-provided buffer management)
+        void set_on_allocate_message(on_allocate_message cb);
+        void set_on_message_complete(on_message_complete cb);
+        void set_on_message_expired(on_message_expired cb);
+
+        // Fragmentation: sender callback (all fragments ACKed)
+        void set_on_message_acked(on_message_acked cb);
+
+        // Override the reassembly timeout (default: REASSEMBLY_TIMEOUT_US).
+        void set_reassembly_timeout(int64_t timeout_us) { m_reassembly_timeout_us = timeout_us; }
+
         // Congestion control: application queries these to pace sends
         bool can_send() const { return m_connection.can_send(); }
         congestion_info congestion() const { return m_connection.congestion(); }
@@ -94,6 +109,10 @@ namespace entanglement
         int m_pending_channel_id = -1;    // channel id awaiting ACK, or -1
         uint8_t m_channel_ack_status = 0; // last received ACK status
 
+        // Fragment reassembly (receiver side)
+        fragment_reassembler m_reassembler;
+        int64_t m_reassembly_timeout_us = REASSEMBLY_TIMEOUT_US;
+
         // Send a control packet (FLAG_CONTROL + type byte)
         void send_control(uint8_t control_type);
 
@@ -102,6 +121,10 @@ namespace entanglement
 
         // Dispatch incoming control packet
         void handle_control(const uint8_t *payload, size_t payload_size);
+
+        // Send a single fragment (called from send_payload for fragmented paths)
+        int send_fragment(uint16_t message_id, uint8_t index, uint8_t count, const void *data, size_t size,
+                          uint8_t flags, uint8_t channel_id);
     };
 
 } // namespace entanglement

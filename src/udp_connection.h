@@ -2,6 +2,8 @@
 
 #include "congestion_control.h"
 #include "constants.h"
+#include "endpoint_key.h"
+#include "fragmentation.h"
 #include "packet_header.h"
 #include <array>
 #include <chrono>
@@ -9,24 +11,6 @@
 
 namespace entanglement
 {
-
-    // --- Endpoint identifier ---
-
-    struct endpoint_key
-    {
-        uint32_t address = 0; // IPv4 in network byte order
-        uint16_t port = 0;
-
-        bool operator==(const endpoint_key &other) const { return address == other.address && port == other.port; }
-    };
-
-    struct endpoint_key_hash
-    {
-        size_t operator()(const endpoint_key &k) const
-        {
-            return std::hash<uint64_t>{}((static_cast<uint64_t>(k.address) << 16) | k.port);
-        }
-    };
 
     // --- Sent packet entry (metadata only, no payload copy) ---
 
@@ -40,6 +24,8 @@ namespace entanglement
         uint8_t channel_id = 0;
         uint16_t shard_id = 0;
         uint16_t payload_size = 0;
+        uint16_t message_id = 0;    // Non-zero if this packet is a fragment
+        uint8_t fragment_index = 0; // Which fragment within the message
         std::chrono::steady_clock::time_point send_time{};
     };
 
@@ -52,6 +38,8 @@ namespace entanglement
         uint8_t channel_id = 0;
         uint16_t shard_id = 0;
         uint16_t payload_size = 0;
+        uint16_t message_id = 0;    // Non-zero if this was a fragment
+        uint8_t fragment_index = 0; // Which fragment within the message
     };
 
     // --- Connection state ---
@@ -104,6 +92,10 @@ namespace entanglement
         uint64_t local_sequence() const { return m_local_sequence; }
         uint64_t remote_sequence() const { return m_remote_sequence; }
 
+        // Direct access to a send buffer entry (for tagging fragment metadata after prepare_header)
+        sent_packet_entry &send_buffer_entry(size_t index) { return m_send_buffer[index]; }
+        const sent_packet_entry &send_buffer_entry(size_t index) const { return m_send_buffer[index]; }
+
         // --- Reliability ---
 
         // Scan send buffer for timed-out reliable packets.
@@ -121,6 +113,22 @@ namespace entanglement
         double rttvar_ms() const { return m_rttvar / 1000.0; }
         double rto_ms() const { return static_cast<double>(m_rto) / 1000.0; }
         uint32_t rtt_sample_count() const { return m_rtt_sample_count; }
+
+        // --- Fragmentation (sender side) ---
+
+        // Get a new monotonic message_id for a fragmented send
+        uint16_t next_message_id() { return m_next_message_id++; }
+
+        // Register a fragmented send for ACK tracking.
+        // Call after all fragments have been sent via prepare_header.
+        // Returns false if the pending table is full.
+        bool register_pending_message(uint16_t message_id, uint8_t fragment_count);
+
+        // Query whether a fragmented message has been fully ACKed
+        bool is_message_acked(uint16_t message_id) const;
+
+        // Set callback for when all fragments of a message are ACKed
+        void set_on_message_acked(on_message_acked cb) { m_on_message_acked = std::move(cb); }
 
         // --- Congestion control ---
 
@@ -151,6 +159,11 @@ namespace entanglement
         double m_rttvar = 0.0;          // RTT variance
         int64_t m_rto = INITIAL_RTO_US; // retransmission timeout
         uint32_t m_rtt_sample_count = 0;
+
+        // Fragmentation (sender side)
+        uint16_t m_next_message_id = 1; // 0 = not a fragment
+        pending_message m_pending_messages[MAX_PENDING_FRAGMENTED_MESSAGES]{};
+        on_message_acked m_on_message_acked;
 
         // Congestion control algorithm instance
         congestion_control m_cc;

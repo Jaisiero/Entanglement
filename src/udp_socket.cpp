@@ -98,22 +98,79 @@ namespace entanglement
     int udp_socket::send_packet(const packet_header &header, const void *payload, const std::string &address,
                                 uint16_t port)
     {
-        uint8_t buffer[MAX_PACKET_SIZE];
-        size_t total = sizeof(packet_header) + header.payload_size;
+        // Delegate to scatter-gather with a single payload segment
+        if (payload && header.payload_size > 0)
+        {
+            const void *seg = payload;
+            size_t seg_size = header.payload_size;
+            return send_packet_gather(header, &seg, &seg_size, 1, address, port);
+        }
+        return send_packet_gather(header, nullptr, nullptr, 0, address, port);
+    }
 
+    int udp_socket::send_packet_gather(const packet_header &header, const void *const *segments, const size_t *sizes,
+                                       size_t count, const std::string &address, uint16_t port)
+    {
+        // Validate total size
+        size_t payload_total = 0;
+        for (size_t i = 0; i < count; ++i)
+            payload_total += sizes[i];
+
+        if (count > MAX_GATHER_SEGMENTS)
+        {
+            std::cerr << "[udp_socket] Too many gather segments: " << count << " (max " << MAX_GATHER_SEGMENTS << ")"
+                      << std::endl;
+            return -1;
+        }
+
+        size_t total = sizeof(packet_header) + payload_total;
         if (total > MAX_PACKET_SIZE)
         {
             std::cerr << "[udp_socket] Packet too large: " << total << " bytes" << std::endl;
             return -1;
         }
 
-        std::memcpy(buffer, &header, sizeof(packet_header));
-        if (payload && header.payload_size > 0)
+        sockaddr_in dest{};
+        dest.sin_family = AF_INET;
+        dest.sin_port = htons(port);
+        inet_pton(AF_INET, address.c_str(), &dest.sin_addr);
+
+#ifdef ENTANGLEMENT_PLATFORM_WINDOWS
+        // WSASend scatter-gather — no intermediate buffer copy
+        WSABUF bufs[MAX_GATHER_SEGMENTS + 1]; // slot 0 = header, rest = payload segments
+        bufs[0].buf = reinterpret_cast<char *>(const_cast<packet_header *>(&header));
+        bufs[0].len = static_cast<ULONG>(sizeof(packet_header));
+
+        for (size_t i = 0; i < count; ++i)
         {
-            std::memcpy(buffer + sizeof(packet_header), payload, header.payload_size);
+            bufs[i + 1].buf = static_cast<char *>(const_cast<void *>(segments[i]));
+            bufs[i + 1].len = static_cast<ULONG>(sizes[i]);
         }
 
-        return send_to(buffer, total, address, port);
+        DWORD bytes_sent = 0;
+        int result = WSASendTo(m_socket, bufs, static_cast<DWORD>(count + 1), &bytes_sent, 0,
+                               reinterpret_cast<sockaddr *>(&dest), sizeof(dest), nullptr, nullptr);
+        return (result == 0) ? static_cast<int>(bytes_sent) : -1;
+#else
+        // sendmsg scatter-gather — no intermediate buffer copy
+        struct iovec iov[MAX_GATHER_SEGMENTS + 1]; // slot 0 = header, rest = payload segments
+        iov[0].iov_base = const_cast<packet_header *>(&header);
+        iov[0].iov_len = sizeof(packet_header);
+
+        for (size_t i = 0; i < count; ++i)
+        {
+            iov[i + 1].iov_base = const_cast<void *>(segments[i]);
+            iov[i + 1].iov_len = sizes[i];
+        }
+
+        struct msghdr msg{};
+        msg.msg_name = &dest;
+        msg.msg_namelen = sizeof(dest);
+        msg.msg_iov = iov;
+        msg.msg_iovlen = static_cast<int>(count + 1);
+
+        return static_cast<int>(sendmsg(m_socket, &msg, 0));
+#endif
     }
 
     int udp_socket::recv_packet(packet_header &header, void *payload, size_t payload_capacity,

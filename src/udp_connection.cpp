@@ -30,6 +30,11 @@ namespace entanglement
 
         // Reset congestion control
         m_cc.reset();
+
+        // Reset fragmentation state (preserve callback — it's app config, not session state)
+        m_next_message_id = 1;
+        for (auto &pm : m_pending_messages)
+            pm.reset();
     }
 
     // --- Sending side ---
@@ -60,6 +65,8 @@ namespace entanglement
         entry.channel_id = header.channel_id;
         entry.shard_id = header.shard_id;
         entry.payload_size = header.payload_size;
+        entry.message_id = 0;
+        entry.fragment_index = 0;
         entry.send_time = std::chrono::steady_clock::now();
         m_last_send_time = entry.send_time;
 
@@ -150,6 +157,27 @@ namespace entanglement
         {
             entry.acked = true;
 
+            // Track fragment ACK for pending messages
+            if (entry.message_id != 0)
+            {
+                for (auto &pm : m_pending_messages)
+                {
+                    if (pm.active && pm.message_id == entry.message_id)
+                    {
+                        pm.acked_count++;
+                        if (pm.is_complete())
+                        {
+                            pm.active = false;
+                            if (m_on_message_acked)
+                            {
+                                m_on_message_acked(pm.message_id);
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+
             // Every ACKed packet is a first transmission (losses are deactivated,
             // not retried), so all RTT samples are valid — no Karn's filtering needed.
             auto now = std::chrono::steady_clock::now();
@@ -220,6 +248,8 @@ namespace entanglement
             out[count].channel_id = entry.channel_id;
             out[count].shard_id = entry.shard_id;
             out[count].payload_size = entry.payload_size;
+            out[count].message_id = entry.message_id;
+            out[count].fragment_index = entry.fragment_index;
             ++count;
 
             // Deactivate — we give up on this packet.
@@ -250,6 +280,35 @@ namespace entanglement
             return false;
         auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - m_last_send_time).count();
         return elapsed > HEARTBEAT_INTERVAL_US;
+    }
+
+    // --- Fragmentation (sender side) ---
+
+    bool udp_connection::register_pending_message(uint16_t message_id, uint8_t fragment_count)
+    {
+        for (auto &pm : m_pending_messages)
+        {
+            if (!pm.active)
+            {
+                pm.active = true;
+                pm.message_id = message_id;
+                pm.fragment_count = fragment_count;
+                pm.acked_count = 0;
+                return true;
+            }
+        }
+        return false; // all slots full
+    }
+
+    bool udp_connection::is_message_acked(uint16_t message_id) const
+    {
+        for (const auto &pm : m_pending_messages)
+        {
+            if (pm.active && pm.message_id == message_id)
+                return false; // still pending
+        }
+        // Not found means either already completed and cleaned up, or never registered
+        return true;
     }
 
     // --- RTT estimation (RFC 6298 / Jacobson-Karels) ---

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "channel_manager.h"
+#include "fragmentation.h"
 #include "udp_connection.h"
 #include "udp_socket.h"
 #include <array>
@@ -60,6 +61,11 @@ namespace entanglement
         // Send a data packet to a connected client
         int send_to(packet_header &header, const void *payload, const std::string &address, uint16_t port);
 
+        // Send payload to a connected client, auto-fragmenting if needed.
+        // Returns bytes of user data sent, or -1 on error.
+        int send_payload_to(const void *data, size_t size, uint8_t channel_id, const std::string &address,
+                            uint16_t port, uint8_t flags = 0);
+
         // Disconnect a specific client
         void disconnect_client(const endpoint_key &key);
 
@@ -72,6 +78,14 @@ namespace entanglement
         void set_verbose(bool verbose) { m_verbose = verbose; }
         bool verbose() const { return m_verbose; }
 
+        // Fragmentation: receiver callbacks
+        void set_on_allocate_message(on_allocate_message cb);
+        void set_on_message_complete(on_message_complete cb);
+        void set_on_message_expired(on_message_expired cb);
+
+        // Override the reassembly timeout (default: REASSEMBLY_TIMEOUT_US).
+        void set_reassembly_timeout(int64_t timeout_us) { m_reassembly_timeout_us = timeout_us; }
+
         // Channel configuration
         channel_manager &channels() { return m_channels; }
         const channel_manager &channels() const { return m_channels; }
@@ -83,6 +97,8 @@ namespace entanglement
         std::atomic<bool> m_running{false};
         bool m_verbose = true;
         channel_manager m_channels;
+        fragment_reassembler m_reassembler;
+        int64_t m_reassembly_timeout_us = REASSEMBLY_TIMEOUT_US;
         on_packet_received m_on_packet_received;
         on_client_connected m_on_client_connected;
         on_client_disconnected m_on_client_disconnected;
@@ -109,6 +125,10 @@ namespace entanglement
 
         // Send a control packet without a connection (e.g. CONNECTION_DENIED)
         void send_raw_control(uint8_t control_type, const std::string &address, uint16_t port);
+
+        // Send a single fragment to a client (called from send_payload_to)
+        int send_fragment_to(udp_connection *conn, uint16_t message_id, uint8_t index, uint8_t count, const void *data,
+                             size_t size, uint8_t flags, uint8_t channel_id, const std::string &address, uint16_t port);
     };
 
 } // namespace entanglement

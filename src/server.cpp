@@ -1,4 +1,6 @@
 #include "server.h"
+#include <algorithm>
+#include <cstring>
 #include <iostream>
 
 #ifdef ENTANGLEMENT_PLATFORM_WINDOWS
@@ -100,6 +102,23 @@ namespace entanglement
             }
 
             bool is_new = conn->process_incoming(header);
+            if (!is_new)
+            {
+                ++count;
+                continue;
+            }
+
+            // Handle fragmented data packets — route to reassembler
+            if ((header.flags & FLAG_FRAGMENT) && header.payload_size > FRAGMENT_HEADER_SIZE)
+            {
+                fragment_header fhdr;
+                std::memcpy(&fhdr, payload, FRAGMENT_HEADER_SIZE);
+                m_reassembler.process_fragment(key, header.channel_id, fhdr, payload + FRAGMENT_HEADER_SIZE,
+                                               header.payload_size - FRAGMENT_HEADER_SIZE);
+                ++count;
+                continue;
+            }
+
             if (is_new && m_on_packet_received)
             {
                 m_on_packet_received(header, payload, header.payload_size, sender_addr, sender_port);
@@ -157,6 +176,9 @@ namespace entanglement
             disconnect_client(timed_out[i]);
         }
 
+        // Expire stale reassembly entries
+        m_reassembler.cleanup_stale(now, m_reassembly_timeout_us);
+
         return timeout_count;
     }
 
@@ -198,6 +220,80 @@ namespace entanglement
         }
 
         return m_socket.send_packet(header, payload, address, port);
+    }
+
+    int server::send_payload_to(const void *data, size_t size, uint8_t channel_id, const std::string &address,
+                                uint16_t port, uint8_t flags)
+    {
+        // Single-packet path
+        if (size <= MAX_PAYLOAD_SIZE)
+        {
+            packet_header header{};
+            header.flags = flags;
+            header.channel_id = channel_id;
+            header.payload_size = static_cast<uint16_t>(size);
+            return send_to(header, data, address, port);
+        }
+
+        // Look up connection
+        endpoint_key key{};
+        inet_pton(AF_INET, address.c_str(), &key.address);
+        key.port = port;
+
+        udp_connection *conn = find(key);
+        if (!conn || conn->state() != connection_state::CONNECTED)
+            return -1;
+
+        // --- Fragmented send ---
+        const uint8_t *src = static_cast<const uint8_t *>(data);
+        uint8_t fragment_count = static_cast<uint8_t>((size + MAX_FRAGMENT_PAYLOAD - 1) / MAX_FRAGMENT_PAYLOAD);
+        if (fragment_count == 0)
+            return -1;
+
+        uint16_t message_id = conn->next_message_id();
+        int total_sent = 0;
+
+        for (uint8_t i = 0; i < fragment_count; ++i)
+        {
+            size_t offset = static_cast<size_t>(i) * MAX_FRAGMENT_PAYLOAD;
+            size_t chunk = (std::min)(MAX_FRAGMENT_PAYLOAD, size - offset);
+
+            int result = send_fragment_to(conn, message_id, i, fragment_count, src + offset, chunk, flags, channel_id,
+                                          address, port);
+            if (result <= 0)
+                return result;
+            total_sent += static_cast<int>(chunk);
+        }
+
+        conn->register_pending_message(message_id, fragment_count);
+        return total_sent;
+    }
+
+    int server::send_fragment_to(udp_connection *conn, uint16_t message_id, uint8_t index, uint8_t count,
+                                 const void *data, size_t size, uint8_t flags, uint8_t channel_id,
+                                 const std::string &address, uint16_t port)
+    {
+        // Build fragment header on stack (4 bytes)
+        fragment_header fhdr{message_id, index, count};
+
+        packet_header header{};
+        header.flags = flags | FLAG_FRAGMENT;
+        header.channel_id = channel_id;
+        header.payload_size = static_cast<uint16_t>(FRAGMENT_HEADER_SIZE + size);
+
+        bool reliable = m_channels.is_reliable(channel_id);
+        conn->prepare_header(header, reliable);
+
+        // Tag fragment metadata for loss tracking
+        size_t idx = header.sequence % SEQUENCE_BUFFER_SIZE;
+        auto &entry = conn->send_buffer_entry(idx);
+        entry.message_id = message_id;
+        entry.fragment_index = index;
+
+        // Scatter-gather: [packet_header] + [fragment_header] + [user data] — zero intermediate copy
+        const void *segments[2] = {&fhdr, data};
+        size_t seg_sizes[2] = {FRAGMENT_HEADER_SIZE, size};
+        return m_socket.send_packet_gather(header, segments, seg_sizes, 2, address, port);
     }
 
     // --- Connection management ---
@@ -440,6 +536,21 @@ namespace entanglement
         header.ack_bitmap = 0;
         header.payload_size = 1;
         m_socket.send_packet(header, &control_type, address, port);
+    }
+
+    void server::set_on_allocate_message(on_allocate_message cb)
+    {
+        m_reassembler.set_on_allocate(std::move(cb));
+    }
+
+    void server::set_on_message_complete(on_message_complete cb)
+    {
+        m_reassembler.set_on_complete(std::move(cb));
+    }
+
+    void server::set_on_message_expired(on_message_expired cb)
+    {
+        m_reassembler.set_on_expired(std::move(cb));
     }
 
 } // namespace entanglement

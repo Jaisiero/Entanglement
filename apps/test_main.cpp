@@ -8,6 +8,7 @@
 #include "channel_manager.h"
 #include "client.h"
 #include "congestion_control.h"
+#include "fragmentation.h"
 #include "server.h"
 #include "udp_connection.h"
 #include <atomic>
@@ -1800,6 +1801,746 @@ static bool test_channel_name_sync()
     return true;
 }
 
+// ============================================================================
+// TEST 40: Fragment reassembler — basic in-order, app-provided buffer
+// ============================================================================
+
+static bool test_fragment_reassembler_basic()
+{
+    fragment_reassembler ra;
+
+    // Build a message of 3 fragments
+    const size_t msg_size = MAX_FRAGMENT_PAYLOAD * 2 + 100;
+    std::vector<uint8_t> original(msg_size);
+    for (size_t i = 0; i < msg_size; ++i)
+        original[i] = static_cast<uint8_t>(i & 0xFF);
+
+    // App-provided buffer (simulating app allocation)
+    std::vector<uint8_t> app_buffer(MAX_FRAGMENT_PAYLOAD * 3, 0);
+    bool alloc_called = false;
+    bool complete_called = false;
+    size_t complete_size = 0;
+
+    ra.set_on_allocate(
+        [&](uint16_t, uint8_t, uint8_t, size_t) -> uint8_t *
+        {
+            alloc_called = true;
+            return app_buffer.data();
+        });
+
+    ra.set_on_complete(
+        [&](uint16_t msg_id, uint8_t ch_id, uint8_t *data, size_t total)
+        {
+            complete_called = true;
+            complete_size = total;
+            TEST_ASSERT(msg_id == 42, "message_id should be 42");
+            TEST_ASSERT(ch_id == 5, "channel_id should be 5");
+            TEST_ASSERT(data == app_buffer.data(), "data pointer should be app buffer");
+        });
+
+    endpoint_key ep{0x7F000001, 1234};
+    uint8_t fcount = 3;
+
+    // Fragment 0
+    fragment_header fh0{42, 0, fcount};
+    bool done = ra.process_fragment(ep, 5, fh0, original.data(), MAX_FRAGMENT_PAYLOAD);
+    TEST_ASSERT(!done, "not complete after frag 0");
+    TEST_ASSERT(alloc_called, "on_allocate should have been called");
+
+    // Fragment 1
+    fragment_header fh1{42, 1, fcount};
+    done = ra.process_fragment(ep, 5, fh1, original.data() + MAX_FRAGMENT_PAYLOAD, MAX_FRAGMENT_PAYLOAD);
+    TEST_ASSERT(!done, "not complete after frag 1");
+
+    // Fragment 2 (last, smaller)
+    fragment_header fh2{42, 2, fcount};
+    done = ra.process_fragment(ep, 5, fh2, original.data() + 2 * MAX_FRAGMENT_PAYLOAD, 100);
+    TEST_ASSERT(done, "complete after frag 2");
+    TEST_ASSERT(complete_called, "on_complete should have been called");
+    TEST_ASSERT(complete_size == msg_size, "total size should match");
+    TEST_ASSERT(std::memcmp(app_buffer.data(), original.data(), msg_size) == 0, "reassembled data should match");
+    TEST_ASSERT(ra.pending_count() == 0, "no pending after completion");
+
+    return true;
+}
+
+// ============================================================================
+// TEST 41: Fragment reassembler — out-of-order delivery
+// ============================================================================
+
+static bool test_fragment_reassembler_out_of_order()
+{
+    fragment_reassembler ra;
+
+    const size_t msg_size = MAX_FRAGMENT_PAYLOAD * 3;
+    std::vector<uint8_t> original(msg_size);
+    for (size_t i = 0; i < msg_size; ++i)
+        original[i] = static_cast<uint8_t>((i * 7 + 13) & 0xFF);
+
+    std::vector<uint8_t> app_buffer(msg_size, 0);
+    bool complete = false;
+
+    ra.set_on_allocate([&](uint16_t, uint8_t, uint8_t, size_t) -> uint8_t * { return app_buffer.data(); });
+    ra.set_on_complete([&](uint16_t, uint8_t, uint8_t *, size_t) { complete = true; });
+
+    endpoint_key ep{};
+    uint8_t fcount = 3;
+
+    // Deliver: 2, 0, 1
+    fragment_header fh2{99, 2, fcount};
+    ra.process_fragment(ep, 1, fh2, original.data() + 2 * MAX_FRAGMENT_PAYLOAD, MAX_FRAGMENT_PAYLOAD);
+    TEST_ASSERT(!complete, "not complete after 2");
+
+    fragment_header fh0{99, 0, fcount};
+    ra.process_fragment(ep, 1, fh0, original.data(), MAX_FRAGMENT_PAYLOAD);
+    TEST_ASSERT(!complete, "not complete after 0");
+
+    fragment_header fh1{99, 1, fcount};
+    ra.process_fragment(ep, 1, fh1, original.data() + MAX_FRAGMENT_PAYLOAD, MAX_FRAGMENT_PAYLOAD);
+    TEST_ASSERT(complete, "complete after 1");
+    TEST_ASSERT(std::memcmp(app_buffer.data(), original.data(), msg_size) == 0, "data should match");
+
+    return true;
+}
+
+// ============================================================================
+// TEST 42: Fragment reassembler — duplicate fragment ignored
+// ============================================================================
+
+static bool test_fragment_duplicate_ignored()
+{
+    fragment_reassembler ra;
+
+    std::vector<uint8_t> app_buffer(MAX_FRAGMENT_PAYLOAD * 2, 0);
+    bool complete = false;
+
+    ra.set_on_allocate([&](uint16_t, uint8_t, uint8_t, size_t) -> uint8_t * { return app_buffer.data(); });
+    ra.set_on_complete([&](uint16_t, uint8_t, uint8_t *, size_t) { complete = true; });
+
+    endpoint_key ep{};
+    std::vector<uint8_t> data(MAX_FRAGMENT_PAYLOAD * 2, 0xAB);
+
+    fragment_header fh0{1, 0, 2};
+    ra.process_fragment(ep, 0, fh0, data.data(), MAX_FRAGMENT_PAYLOAD);
+
+    // Duplicate frag 0
+    bool done = ra.process_fragment(ep, 0, fh0, data.data(), MAX_FRAGMENT_PAYLOAD);
+    TEST_ASSERT(!done, "duplicate should not complete");
+    TEST_ASSERT(ra.pending_count() == 1, "still 1 pending");
+
+    // Frag 1 completes
+    fragment_header fh1{1, 1, 2};
+    done = ra.process_fragment(ep, 0, fh1, data.data() + MAX_FRAGMENT_PAYLOAD, MAX_FRAGMENT_PAYLOAD);
+    TEST_ASSERT(done, "should complete");
+    TEST_ASSERT(complete, "on_complete should fire");
+
+    return true;
+}
+
+// ============================================================================
+// TEST 43: App rejects allocation — all fragments dropped
+// ============================================================================
+
+static bool test_fragment_app_rejects()
+{
+    fragment_reassembler ra;
+
+    // Return nullptr to reject
+    ra.set_on_allocate([](uint16_t, uint8_t, uint8_t, size_t) -> uint8_t * { return nullptr; });
+
+    bool complete = false;
+    ra.set_on_complete([&](uint16_t, uint8_t, uint8_t *, size_t) { complete = true; });
+
+    endpoint_key ep{};
+    uint8_t data[100] = {};
+
+    fragment_header fh{1, 0, 2};
+    bool done = ra.process_fragment(ep, 0, fh, data, 100);
+    TEST_ASSERT(!done, "should not complete if rejected");
+    TEST_ASSERT(ra.pending_count() == 0, "no entry should be created");
+    TEST_ASSERT(!complete, "on_complete should not fire");
+
+    return true;
+}
+
+// ============================================================================
+// TEST 44: lost_packet_info includes fragment metadata
+// ============================================================================
+
+static bool test_loss_includes_fragment_info()
+{
+    udp_connection conn;
+    conn.reset();
+    conn.set_active(true);
+    conn.set_state(connection_state::CONNECTED);
+
+    // Simulate sending a fragment: prepare_header then tag with fragment info
+    packet_header hdr{};
+    hdr.flags = FLAG_FRAGMENT;
+    hdr.channel_id = 5;
+    hdr.payload_size = 100;
+    conn.prepare_header(hdr, true); // reliable
+
+    // Tag fragment metadata
+    size_t idx = hdr.sequence % SEQUENCE_BUFFER_SIZE;
+    auto &entry = conn.send_buffer_entry(idx);
+    entry.message_id = 42;
+    entry.fragment_index = 3;
+
+    // Jump beyond RTO
+    lost_packet_info lost[16];
+    auto future = std::chrono::steady_clock::now() + std::chrono::microseconds(INITIAL_RTO_US + 100'000);
+    int count = conn.collect_losses(future, lost, 16);
+
+    TEST_ASSERT(count == 1, "should detect 1 loss");
+    TEST_ASSERT(lost[0].message_id == 42, "lost info should include message_id");
+    TEST_ASSERT(lost[0].fragment_index == 3, "lost info should include fragment_index");
+
+    return true;
+}
+
+// ============================================================================
+// TEST 45: Pending message ACK tracking
+// ============================================================================
+
+static bool test_pending_message_ack_tracking()
+{
+    udp_connection conn;
+    conn.reset();
+    conn.set_active(true);
+    conn.set_state(connection_state::CONNECTED);
+
+    uint16_t msg_id = conn.next_message_id();
+    uint8_t frag_count = 3;
+
+    // Send 3 fragments
+    for (uint8_t i = 0; i < frag_count; ++i)
+    {
+        packet_header hdr{};
+        hdr.flags = FLAG_FRAGMENT;
+        hdr.channel_id = 2;
+        hdr.payload_size = 100;
+        conn.prepare_header(hdr, true);
+
+        size_t idx = hdr.sequence % SEQUENCE_BUFFER_SIZE;
+        auto &entry = conn.send_buffer_entry(idx);
+        entry.message_id = msg_id;
+        entry.fragment_index = i;
+    }
+
+    conn.register_pending_message(msg_id, frag_count);
+    TEST_ASSERT(!conn.is_message_acked(msg_id), "message should not be acked yet");
+
+    // Track callback
+    bool acked_callback = false;
+    conn.set_on_message_acked(
+        [&](uint16_t id)
+        {
+            acked_callback = true;
+            TEST_ASSERT(id == msg_id, "acked message_id should match");
+        });
+
+    // Simulate remote ACKing all 3 sequences (seq 1, 2, 3)
+    // ACK seq 3 with bitmap covering 1 and 2
+    packet_header ack_hdr{};
+    ack_hdr.magic = PROTOCOL_MAGIC;
+    ack_hdr.version = PROTOCOL_VERSION;
+    ack_hdr.sequence = 1;
+    ack_hdr.ack = 3;
+    ack_hdr.ack_bitmap = 0b11; // bits 0,1 → acks seq 2 and seq 1
+    ack_hdr.payload_size = 0;
+    conn.process_incoming(ack_hdr);
+
+    TEST_ASSERT(conn.is_message_acked(msg_id), "message should be acked after all fragments ACKed");
+    TEST_ASSERT(acked_callback, "on_message_acked should have fired");
+
+    return true;
+}
+
+// ============================================================================
+// TEST 46: Small message does NOT fragment
+// ============================================================================
+
+static bool test_small_message_no_fragment()
+{
+    server srv(9926);
+    srv.channels().register_defaults();
+    std::atomic<bool> stop_flag{false};
+    std::atomic<uint8_t> last_flags{0xFF};
+
+    srv.set_on_packet_received([&](const packet_header &header, const uint8_t *, size_t, const std::string &, uint16_t)
+                               { last_flags = header.flags; });
+
+    TEST_ASSERT(srv.start(), "server should start");
+
+    std::thread server_thread(
+        [&]()
+        {
+            while (!stop_flag.load())
+            {
+                srv.poll();
+                srv.update();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+
+    client c("127.0.0.1", 9926);
+    c.set_verbose(false);
+    c.channels().register_defaults();
+    TEST_ASSERT(c.connect(), "client should connect");
+
+    const char *msg = "SMALL";
+    c.send_payload(msg, 5, 0, channels::RELIABLE.id);
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (last_flags.load() == 0xFF && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+    TEST_ASSERT(last_flags.load() != 0xFF, "server should have received packet");
+    TEST_ASSERT((last_flags.load() & FLAG_FRAGMENT) == 0, "small message should NOT have FLAG_FRAGMENT");
+
+    c.disconnect();
+    stop_flag = true;
+    server_thread.join();
+    srv.stop();
+
+    return true;
+}
+
+// ============================================================================
+// TEST 47: Fragmented message E2E — client sends large, server reassembles
+// ============================================================================
+
+static bool test_fragmented_e2e()
+{
+    server srv(9927);
+    srv.channels().register_defaults();
+    std::atomic<bool> stop_flag{false};
+
+    // Server: app provides buffer for reassembly
+    std::vector<uint8_t> srv_buffer;
+    bool srv_alloc_called = false;
+    bool srv_complete = false;
+    size_t srv_complete_size = 0;
+
+    srv.set_on_allocate_message(
+        [&](uint16_t, uint8_t, uint8_t frag_count, size_t max_size) -> uint8_t *
+        {
+            srv_alloc_called = true;
+            srv_buffer.resize(max_size, 0);
+            return srv_buffer.data();
+        });
+
+    srv.set_on_message_complete(
+        [&](uint16_t, uint8_t, uint8_t *, size_t total)
+        {
+            srv_complete = true;
+            srv_complete_size = total;
+        });
+
+    TEST_ASSERT(srv.start(), "server should start");
+
+    std::thread server_thread(
+        [&]()
+        {
+            while (!stop_flag.load())
+            {
+                srv.poll();
+                srv.update();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+
+    client c("127.0.0.1", 9927);
+    c.set_verbose(false);
+    c.channels().register_defaults();
+    TEST_ASSERT(c.connect(), "client should connect");
+
+    // Build a 4000-byte message (4 fragments)
+    const size_t msg_size = 4000;
+    std::vector<uint8_t> original(msg_size);
+    for (size_t i = 0; i < msg_size; ++i)
+        original[i] = static_cast<uint8_t>((i * 37 + 13) & 0xFF);
+
+    int sent = c.send_payload(original.data(), msg_size, 0, channels::RELIABLE.id);
+    TEST_ASSERT(sent == static_cast<int>(msg_size), "send_payload should return message size");
+
+    // Wait for server to reassemble
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!srv_complete && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+    TEST_ASSERT(srv_alloc_called, "server on_allocate should have been called");
+    TEST_ASSERT(srv_complete, "server on_complete should have been called");
+    TEST_ASSERT(srv_complete_size == msg_size, "reassembled size should match");
+    TEST_ASSERT(std::memcmp(srv_buffer.data(), original.data(), msg_size) == 0,
+                "reassembled data should match original");
+
+    c.disconnect();
+    stop_flag = true;
+    server_thread.join();
+    srv.stop();
+
+    return true;
+}
+
+// ============================================================================
+// TEST 48: Fragmented echo E2E — full round trip with send_payload_to
+// ============================================================================
+
+static bool test_fragmented_echo_e2e()
+{
+    server srv(9928);
+    srv.channels().register_defaults();
+    std::atomic<bool> stop_flag{false};
+
+    // Server: reassemble then echo back via send_payload_to
+    std::vector<uint8_t> srv_buffer;
+    uint8_t srv_echo_channel = 0;
+    std::string srv_echo_addr;
+    uint16_t srv_echo_port = 0;
+
+    srv.set_on_allocate_message(
+        [&](uint16_t, uint8_t, uint8_t, size_t max_size) -> uint8_t *
+        {
+            srv_buffer.resize(max_size, 0);
+            return srv_buffer.data();
+        });
+
+    srv.set_on_message_complete(
+        [&](uint16_t, uint8_t channel_id, uint8_t *data, size_t total)
+        {
+            // Echo the complete message back
+            srv.send_payload_to(data, total, channel_id, srv_echo_addr, srv_echo_port);
+        });
+
+    // Capture the sender address on connect (on_packet_received skips fragments)
+    srv.set_on_client_connected(
+        [&](const endpoint_key &, const std::string &addr, uint16_t port)
+        {
+            srv_echo_addr = addr;
+            srv_echo_port = port;
+        });
+
+    TEST_ASSERT(srv.start(), "server should start");
+
+    std::thread server_thread(
+        [&]()
+        {
+            while (!stop_flag.load())
+            {
+                srv.poll();
+                srv.update();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+
+    client c("127.0.0.1", 9928);
+    c.set_verbose(false);
+    c.channels().register_defaults();
+
+    // Client: reassemble the echo response
+    std::vector<uint8_t> client_buffer;
+    std::atomic<bool> client_complete{false};
+    size_t client_complete_size = 0;
+
+    c.set_on_allocate_message(
+        [&](uint16_t, uint8_t, uint8_t, size_t max_size) -> uint8_t *
+        {
+            client_buffer.resize(max_size, 0);
+            return client_buffer.data();
+        });
+
+    c.set_on_message_complete(
+        [&](uint16_t, uint8_t, uint8_t *, size_t total)
+        {
+            client_complete_size = total;
+            client_complete = true;
+        });
+
+    TEST_ASSERT(c.connect(), "client should connect");
+
+    // Sender ACK tracking: verify the app knows when it can release the send buffer
+    // NOTE: registered after connect() because connect() calls reset() internally.
+    std::atomic<bool> send_acked{false};
+    c.set_on_message_acked([&](uint16_t) { send_acked = true; });
+
+    // Send 4000-byte message
+    const size_t msg_size = 4000;
+    std::vector<uint8_t> original(msg_size);
+    for (size_t i = 0; i < msg_size; ++i)
+        original[i] = static_cast<uint8_t>((i * 37 + 13) & 0xFF);
+
+    c.send_payload(original.data(), msg_size, 0, channels::RELIABLE.id);
+
+    // Wait for echo AND sender ACK
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while ((!client_complete.load() || !send_acked.load()) && std::chrono::steady_clock::now() < deadline)
+    {
+        c.poll();
+        c.update(nullptr);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    TEST_ASSERT(client_complete.load(), "client should receive fragmented echo");
+    TEST_ASSERT(client_complete_size == msg_size, "echo size should match");
+    TEST_ASSERT(std::memcmp(client_buffer.data(), original.data(), msg_size) == 0, "echo data should match original");
+    TEST_ASSERT(send_acked.load(), "on_message_acked should fire — app can now release send buffer");
+
+    c.disconnect();
+    stop_flag = true;
+    server_thread.join();
+    srv.stop();
+
+    return true;
+}
+
+// ============================================================================
+// TEST 49: Reassembly timeout — incomplete message expires
+// ============================================================================
+
+static bool test_reassembly_timeout()
+{
+    fragment_reassembler ra;
+
+    std::vector<uint8_t> app_buffer(MAX_FRAGMENT_PAYLOAD * 3, 0);
+    bool expired_callback = false;
+    uint16_t expired_msg_id = 0;
+
+    ra.set_on_allocate([&](uint16_t, uint8_t, uint8_t, size_t) -> uint8_t * { return app_buffer.data(); });
+    ra.set_on_complete([&](uint16_t, uint8_t, uint8_t *, size_t)
+                       { TEST_ASSERT(false, "on_complete should NOT fire for expired message"); });
+    ra.set_on_expired(
+        [&](uint16_t msg_id, uint8_t, uint8_t *buf)
+        {
+            expired_callback = true;
+            expired_msg_id = msg_id;
+            TEST_ASSERT(buf == app_buffer.data(), "expired callback should provide app buffer");
+        });
+
+    endpoint_key ep{};
+
+    // Send 2 of 3 fragments — intentionally leave incomplete
+    fragment_header fh0{10, 0, 3};
+    ra.process_fragment(ep, 1, fh0, app_buffer.data(), 100);
+    fragment_header fh1{10, 1, 3};
+    ra.process_fragment(ep, 1, fh1, app_buffer.data() + 100, 100);
+
+    TEST_ASSERT(ra.pending_count() == 1, "should have 1 pending");
+
+    // Expire with a time far in the future
+    auto future = std::chrono::steady_clock::now() + std::chrono::microseconds(REASSEMBLY_TIMEOUT_US + 1'000'000);
+    int evicted = ra.cleanup_stale(future);
+    TEST_ASSERT(evicted == 1, "should evict 1 entry");
+    TEST_ASSERT(ra.pending_count() == 0, "no pending after cleanup");
+    TEST_ASSERT(expired_callback, "on_expired should have fired");
+    TEST_ASSERT(expired_msg_id == 10, "expired message_id should match");
+
+    return true;
+}
+
+// ============================================================================
+// TEST 50: message_id wrap protection — stale entry evicted on mismatch
+// ============================================================================
+
+static bool test_message_id_wrap_protection()
+{
+    fragment_reassembler ra;
+
+    std::vector<uint8_t> buf1(MAX_FRAGMENT_PAYLOAD * 4, 0xAA);
+    std::vector<uint8_t> buf2(MAX_FRAGMENT_PAYLOAD * 2, 0xBB);
+    int alloc_count = 0;
+
+    bool expired_called = false;
+
+    ra.set_on_allocate(
+        [&](uint16_t, uint8_t, uint8_t frag_count, size_t) -> uint8_t *
+        {
+            alloc_count++;
+            return (alloc_count == 1) ? buf1.data() : buf2.data();
+        });
+
+    bool complete = false;
+    ra.set_on_complete([&](uint16_t, uint8_t, uint8_t *, size_t) { complete = true; });
+    ra.set_on_expired([&](uint16_t, uint8_t, uint8_t *) { expired_called = true; });
+
+    endpoint_key ep{};
+
+    // First: message_id=1, count=4, send only 1 fragment (incomplete)
+    fragment_header fh_old{1, 0, 4};
+    ra.process_fragment(ep, 0, fh_old, buf1.data(), 100);
+    TEST_ASSERT(ra.pending_count() == 1, "should have 1 pending");
+
+    // Wrap: same message_id=1 but count=2 (recycled ID)
+    fragment_header fh_new0{1, 0, 2};
+    ra.process_fragment(ep, 0, fh_new0, buf2.data(), 100);
+    TEST_ASSERT(expired_called, "stale entry should be expired on wrap");
+    TEST_ASSERT(ra.pending_count() == 1, "should still have 1 pending (new entry)");
+    TEST_ASSERT(alloc_count == 2, "should have allocated twice (old rejected, new created)");
+
+    // Complete the new message
+    fragment_header fh_new1{1, 1, 2};
+    bool done = ra.process_fragment(ep, 0, fh_new1, buf2.data() + 100, 100);
+    TEST_ASSERT(done, "new message should complete");
+    TEST_ASSERT(complete, "on_complete should fire for new message");
+
+    return true;
+}
+
+// ============================================================================
+// TEST 51: scatter-gather send — fragmented E2E still works
+// ============================================================================
+// This test verifies the scatter-gather refactor didn't break anything
+// by sending a large message and verifying data integrity.
+
+static bool test_scatter_gather_e2e()
+{
+    server srv(9929);
+    srv.channels().register_defaults();
+    std::atomic<bool> stop_flag{false};
+
+    std::vector<uint8_t> srv_buffer;
+    bool srv_complete = false;
+    size_t srv_complete_size = 0;
+
+    srv.set_on_allocate_message(
+        [&](uint16_t, uint8_t, uint8_t, size_t max_size) -> uint8_t *
+        {
+            srv_buffer.resize(max_size, 0);
+            return srv_buffer.data();
+        });
+    srv.set_on_message_complete(
+        [&](uint16_t, uint8_t, uint8_t *, size_t total)
+        {
+            srv_complete = true;
+            srv_complete_size = total;
+        });
+
+    TEST_ASSERT(srv.start(), "server should start");
+    std::thread server_thread(
+        [&]()
+        {
+            while (!stop_flag.load())
+            {
+                srv.poll();
+                srv.update();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+
+    client c("127.0.0.1", 9929);
+    c.set_verbose(false);
+    c.channels().register_defaults();
+    TEST_ASSERT(c.connect(), "client should connect");
+
+    // 8KB message = 7 fragments
+    const size_t msg_size = 8000;
+    std::vector<uint8_t> original(msg_size);
+    for (size_t i = 0; i < msg_size; ++i)
+        original[i] = static_cast<uint8_t>((i * 41 + 7) & 0xFF);
+
+    c.send_payload(original.data(), msg_size, 0, channels::RELIABLE.id);
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!srv_complete && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+    TEST_ASSERT(srv_complete, "server should reassemble");
+    TEST_ASSERT(srv_complete_size == msg_size, "size should match");
+    TEST_ASSERT(std::memcmp(srv_buffer.data(), original.data(), msg_size) == 0, "data integrity after scatter-gather");
+
+    c.disconnect();
+    stop_flag = true;
+    server_thread.join();
+    srv.stop();
+
+    return true;
+}
+
+// ============================================================================
+// TEST 52: set_on_message_expired E2E — server expires incomplete message
+// ============================================================================
+// Verifies the full integration path:
+//   server.set_on_message_expired(cb) → reassembler.set_on_expired(cb)
+//   server.update() → reassembler.cleanup_stale(now, m_reassembly_timeout_us)
+
+static bool test_set_on_message_expired_e2e()
+{
+    server srv(9930);
+    srv.channels().register_defaults();
+    srv.set_reassembly_timeout(100'000); // 100 ms — short for testing
+    std::atomic<bool> stop_flag{false};
+
+    std::vector<uint8_t> srv_buffer(MAX_FRAGMENT_PAYLOAD * 3, 0);
+    std::atomic<bool> expired_fired{false};
+    uint16_t expired_msg_id = 0;
+    uint8_t expired_ch_id = 255;
+
+    srv.set_on_allocate_message([&](uint16_t, uint8_t, uint8_t, size_t) -> uint8_t * { return srv_buffer.data(); });
+    srv.set_on_message_complete([&](uint16_t, uint8_t, uint8_t *, size_t)
+                                { TEST_ASSERT(false, "on_complete should NOT fire for expired message"); });
+    srv.set_on_message_expired(
+        [&](uint16_t msg_id, uint8_t ch_id, uint8_t *buf)
+        {
+            expired_msg_id = msg_id;
+            expired_ch_id = ch_id;
+            expired_fired.store(true);
+            TEST_ASSERT(buf == srv_buffer.data(), "expired callback should provide app buffer");
+        });
+
+    TEST_ASSERT(srv.start(), "server should start");
+    std::thread server_thread(
+        [&]()
+        {
+            while (!stop_flag.load())
+            {
+                srv.poll();
+                srv.update();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+
+    client c("127.0.0.1", 9930);
+    c.set_verbose(false);
+    c.channels().register_defaults();
+    TEST_ASSERT(c.connect(), "client should connect");
+
+    // Send a single fragment (index=0 of 3) using the raw send() API.
+    // Fragments 1 and 2 are never sent → message stays incomplete.
+    {
+        fragment_header fhdr{42, 0, 3}; // message_id=42, index=0, count=3
+        uint8_t frag_payload[FRAGMENT_HEADER_SIZE + 100];
+        std::memcpy(frag_payload, &fhdr, FRAGMENT_HEADER_SIZE);
+        std::memset(frag_payload + FRAGMENT_HEADER_SIZE, 0xCC, 100);
+
+        packet_header hdr{};
+        hdr.flags = FLAG_FRAGMENT;
+        hdr.channel_id = channels::RELIABLE.id;
+        hdr.payload_size = static_cast<uint16_t>(FRAGMENT_HEADER_SIZE + 100);
+        c.send(hdr, frag_payload);
+    }
+
+    // Wait for server to receive the fragment
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    TEST_ASSERT(!expired_fired.load(), "should NOT have expired yet (only 50 ms)");
+
+    // Wait beyond 100 ms timeout for cleanup_stale to evict
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!expired_fired.load() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    TEST_ASSERT(expired_fired.load(), "set_on_message_expired should have fired via server.update()");
+    TEST_ASSERT(expired_msg_id == 42, "expired message_id should be 42");
+    TEST_ASSERT(expired_ch_id == channels::RELIABLE.id, "expired channel_id should match");
+
+    c.disconnect();
+    stop_flag = true;
+    server_thread.join();
+    srv.stop();
+
+    return true;
+}
+
 int main()
 {
     platform_init();
@@ -1850,6 +2591,21 @@ int main()
     register_test("Channel negotiation rejected", test_channel_negotiation_rejected);
     register_test("Channel negotiation selective", test_channel_negotiation_selective);
     register_test("Channel name sync", test_channel_name_sync);
+
+    // -- Fragmentation --
+    register_test("Fragment reassembler basic", test_fragment_reassembler_basic);
+    register_test("Fragment reassembler out-of-order", test_fragment_reassembler_out_of_order);
+    register_test("Fragment duplicate ignored", test_fragment_duplicate_ignored);
+    register_test("Fragment app rejects allocation", test_fragment_app_rejects);
+    register_test("Loss includes fragment info", test_loss_includes_fragment_info);
+    register_test("Pending message ACK tracking", test_pending_message_ack_tracking);
+    register_test("Small message no fragment", test_small_message_no_fragment);
+    register_test("Fragmented E2E", test_fragmented_e2e);
+    register_test("Fragmented echo E2E", test_fragmented_echo_e2e);
+    register_test("Reassembly timeout", test_reassembly_timeout);
+    register_test("message_id wrap protection", test_message_id_wrap_protection);
+    register_test("Scatter-gather E2E", test_scatter_gather_e2e);
+    register_test("set_on_message_expired E2E", test_set_on_message_expired_e2e);
 
     std::cout << "========================================" << std::endl;
     std::cout << " Entanglement Test Battery" << std::endl;

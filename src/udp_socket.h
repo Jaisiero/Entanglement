@@ -10,6 +10,8 @@ namespace entanglement
 {
 
     constexpr size_t MAX_PAYLOAD_SIZE = MAX_PACKET_SIZE - sizeof(packet_header);
+    static_assert(MAX_PAYLOAD_SIZE == MAX_PACKET_SIZE - PACKET_HEADER_SIZE,
+                  "PACKET_HEADER_SIZE constant must match sizeof(packet_header)");
 
     class udp_socket
     {
@@ -36,6 +38,12 @@ namespace entanglement
 
         // Send a packet with header + payload
         int send_packet(const packet_header &header, const void *payload, const std::string &address, uint16_t port);
+
+        // Send a packet with header + multiple payload segments (scatter-gather, zero-copy).
+        // Segments are sent contiguously after the header without intermediate buffer copies.
+        // segments/sizes arrays must have 'count' elements (max MAX_GATHER_SEGMENTS).
+        int send_packet_gather(const packet_header &header, const void *const *segments, const size_t *sizes,
+                               size_t count, const std::string &address, uint16_t port);
 
         // Receive a packet, splits header and payload
         int recv_packet(packet_header &header, void *payload, size_t payload_capacity, std::string &sender_address,
