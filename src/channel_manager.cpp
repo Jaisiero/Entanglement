@@ -3,15 +3,15 @@
 namespace entanglement
 {
 
-    bool channel_manager::register_channel(const channel_config &config)
+    error_code channel_manager::register_channel(const channel_config &config)
     {
         if (m_registered[config.id])
-            return false;
+            return error_code::channel_in_use;
 
         m_channels[config.id] = config;
         m_registered[config.id] = true;
         ++m_count;
-        return true;
+        return error_code::ok;
     }
 
     int channel_manager::open_channel(channel_mode mode, uint8_t priority, const char *name, uint8_t hint)
@@ -35,18 +35,18 @@ namespace entanglement
                 return static_cast<int>(id);
             }
         }
-        return -1; // All 256 slots occupied
+        return static_cast<int>(error_code::channel_slots_full); // All 256 slots occupied
     }
 
-    bool channel_manager::unregister_channel(uint8_t id)
+    error_code channel_manager::unregister_channel(uint8_t id)
     {
         if (!m_registered[id])
-            return false;
+            return error_code::channel_not_found;
 
         m_channels[id] = {};
         m_registered[id] = false;
         --m_count;
-        return true;
+        return error_code::ok;
     }
 
     const channel_config *channel_manager::get_channel(uint8_t id) const

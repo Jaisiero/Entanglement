@@ -17,19 +17,19 @@ namespace entanglement
         disconnect();
     }
 
-    bool client::connect()
+    error_code client::connect()
     {
-        if (!m_socket.bind(0))
-            return false;
+        if (auto ec = m_socket.bind(0); failed(ec))
+            return ec;
 
-        if (!m_socket.set_non_blocking(true))
+        if (auto ec = m_socket.set_non_blocking(true); failed(ec))
         {
             if (m_verbose)
             {
                 std::cerr << "[client] Failed to set non-blocking mode" << std::endl;
             }
             m_socket.close();
-            return false;
+            return ec;
         }
 
         m_connection.reset();
@@ -59,7 +59,7 @@ namespace entanglement
                 {
                     m_on_connected();
                 }
-                return true;
+                return error_code::ok;
             }
 
             if (m_connection.state() == connection_state::DISCONNECTED)
@@ -67,7 +67,7 @@ namespace entanglement
                 // Got CONNECTION_DENIED
                 m_socket.close();
                 m_connection.reset();
-                return false;
+                return error_code::connection_denied;
             }
 
             auto now = std::chrono::steady_clock::now();
@@ -92,7 +92,7 @@ namespace entanglement
         }
         m_connection.reset();
         m_socket.close();
-        return false;
+        return error_code::connection_timeout;
     }
 
     void client::disconnect()
@@ -142,7 +142,7 @@ namespace entanglement
         // Fragmented send — check backpressure from server
         if (m_connection.is_fragment_backpressured())
         {
-            return -2; // BACKPRESSURED: server's reassembler is full
+            return static_cast<int>(error_code::backpressured);
         }
 
         // --- Fragmented send (zero-copy from user buffer) ---
@@ -151,7 +151,7 @@ namespace entanglement
 
         // Validate: uint8_t count means max 255 fragments
         if (fragment_count == 0)
-            return -1;
+            return static_cast<int>(error_code::invalid_argument);
 
         uint32_t message_id = m_connection.next_message_id();
         int total_sent = 0;
@@ -472,12 +472,12 @@ namespace entanglement
     int client::open_channel(channel_mode mode, uint8_t priority, const char *name, uint8_t hint)
     {
         if (m_connection.state() != connection_state::CONNECTED)
-            return -1;
+            return static_cast<int>(error_code::not_connected);
 
         // Register locally first (picks an available slot)
         int id = m_channels.open_channel(mode, priority, name, hint);
         if (id < 0)
-            return -1;
+            return id; // propagate error_code
 
         // Build CHANNEL_OPEN payload: [type(1)][channel_id(1)][mode(1)][priority(1)][name(up to 32)]
         uint8_t open_payload[4 + MAX_CHANNEL_NAME] = {};
@@ -525,7 +525,7 @@ namespace entanglement
                         std::cerr << "[client] Channel " << id << " rejected by server" << std::endl;
                     }
                     m_channels.unregister_channel(static_cast<uint8_t>(id));
-                    return -1;
+                    return static_cast<int>(error_code::channel_rejected);
                 }
             }
 
@@ -547,7 +547,7 @@ namespace entanglement
         }
         m_pending_channel_id = -1;
         m_channels.unregister_channel(static_cast<uint8_t>(id));
-        return -1;
+        return static_cast<int>(error_code::channel_timeout);
     }
 
 } // namespace entanglement

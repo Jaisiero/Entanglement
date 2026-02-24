@@ -123,8 +123,8 @@ namespace entanglement
 
         // Register a fragmented send for ACK tracking.
         // Call after all fragments have been sent via prepare_header.
-        // Returns false if the pending table is full.
-        bool register_pending_message(uint32_t message_id, uint8_t fragment_count);
+        // Returns error_code::ok or error_code::pool_full.
+        error_code register_pending_message(uint32_t message_id, uint8_t fragment_count);
 
         // Query whether a fragmented message has been fully ACKed
         bool is_message_acked(uint32_t message_id) const;

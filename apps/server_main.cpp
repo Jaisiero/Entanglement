@@ -654,7 +654,7 @@ int main(int argc, char *argv[])
 
     // =========================================================================
 
-    if (!srv.start())
+    if (failed(srv.start()))
     {
         platform_shutdown();
         return 1;

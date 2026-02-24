@@ -367,7 +367,7 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
         std::cout << "[client " << id << "] Connecting to " << server_ip << ":" << port << "..." << std::endl;
     }
 
-    if (!cli.connect())
+    if (failed(cli.connect()))
     {
         std::lock_guard<std::mutex> lk(g_cout_mutex);
         std::cerr << "[client " << id << "] FAILED to connect!" << std::endl;

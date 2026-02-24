@@ -36,8 +36,8 @@ namespace entanglement
         client &operator=(const client &) = delete;
 
         // Perform handshake with the server (blocking, ~5 s timeout with retries).
-        // Returns true if CONNECTION_ACCEPTED was received.
-        bool connect();
+        // Returns error_code::ok on success.
+        error_code connect();
 
         // Send DISCONNECT and close the socket.
         void disconnect();
@@ -52,7 +52,7 @@ namespace entanglement
         // Larger messages are automatically fragmented.
         // If out_message_id is non-null, the library message_id is written there
         // (only meaningful for fragmented sends; 0 for single-packet sends).
-        // Returns bytes of user data sent, or -1 on error.
+        // Returns bytes of user data sent, or a negative error_code on failure.
         int send_payload(const void *data, size_t size, uint8_t flags = 0, uint8_t channel_id = 0,
                          uint32_t *out_message_id = nullptr);
 
@@ -84,7 +84,7 @@ namespace entanglement
 
         // Open a remote channel via negotiation with the server.
         // Registers locally, sends CONTROL_CHANNEL_OPEN and waits for ACK.
-        // Returns the assigned channel_id (>= 0) or -1 on failure/rejection.
+        // Returns the assigned channel_id (>= 0) or a negative error_code on failure.
         // Must be called while connected.
         int open_channel(channel_mode mode, uint8_t priority = 128, const char *name = "", uint8_t hint = 4);
 

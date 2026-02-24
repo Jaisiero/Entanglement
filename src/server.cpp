@@ -24,21 +24,21 @@ namespace entanglement
         stop();
     }
 
-    bool server::start()
+    error_code server::start()
     {
-        if (!m_socket.bind(m_port, m_bind_address))
+        if (auto ec = m_socket.bind(m_port, m_bind_address); failed(ec))
         {
-            return false;
+            return ec;
         }
 
-        if (!m_socket.set_non_blocking(true))
+        if (auto ec = m_socket.set_non_blocking(true); failed(ec))
         {
             if (m_verbose)
             {
                 std::cerr << "[server] Failed to set non-blocking mode" << std::endl;
             }
             m_socket.close();
-            return false;
+            return ec;
         }
 
         m_running = true;
@@ -46,7 +46,7 @@ namespace entanglement
         {
             std::cout << "[server] Listening on " << m_bind_address << ":" << m_port << std::endl;
         }
-        return true;
+        return error_code::ok;
     }
 
     void server::stop()
@@ -301,19 +301,19 @@ namespace entanglement
 
         udp_connection *conn = find(key);
         if (!conn || conn->state() != connection_state::CONNECTED)
-            return -1;
+            return static_cast<int>(error_code::not_connected);
 
         // --- Fragmented send ---
         // Check backpressure from client
         if (conn->is_fragment_backpressured())
         {
-            return -2; // BACKPRESSURED: client's reassembler is full
+            return static_cast<int>(error_code::backpressured);
         }
 
         const uint8_t *src = static_cast<const uint8_t *>(data);
         uint8_t fragment_count = static_cast<uint8_t>((size + MAX_FRAGMENT_PAYLOAD - 1) / MAX_FRAGMENT_PAYLOAD);
         if (fragment_count == 0)
-            return -1;
+            return static_cast<int>(error_code::invalid_argument);
 
         uint32_t message_id = conn->next_message_id();
         int total_sent = 0;
@@ -347,7 +347,7 @@ namespace entanglement
 
         udp_connection *conn = find(key);
         if (!conn || conn->state() != connection_state::CONNECTED)
-            return -1;
+            return static_cast<int>(error_code::not_connected);
 
         return send_fragment_to_impl(conn, message_id, index, count, data, size, flags, channel_id, address, port);
     }
@@ -452,7 +452,7 @@ namespace entanglement
                 return static_cast<int>(i);
             }
         }
-        return -1;
+        return static_cast<int>(error_code::pool_full);
     }
 
     // --- Control packet handling ---

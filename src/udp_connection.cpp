@@ -335,7 +335,7 @@ namespace entanglement
 
     // --- Fragmentation (sender side) ---
 
-    bool udp_connection::register_pending_message(uint32_t message_id, uint8_t fragment_count)
+    error_code udp_connection::register_pending_message(uint32_t message_id, uint8_t fragment_count)
     {
         for (auto &pm : m_pending_messages)
         {
@@ -345,10 +345,10 @@ namespace entanglement
                 pm.message_id = message_id;
                 pm.fragment_count = fragment_count;
                 pm.acked_count = 0;
-                return true;
+                return error_code::ok;
             }
         }
-        return false; // all slots full
+        return error_code::pool_full;
     }
 
     bool udp_connection::is_message_acked(uint32_t message_id) const

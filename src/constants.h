@@ -71,6 +71,48 @@ namespace entanglement
     constexpr int CHANNEL_OPEN_MAX_ATTEMPTS = 5;            // retries before giving up
     constexpr int64_t CHANNEL_OPEN_RETRY_INTERVAL_MS = 200; // ms between retries
 
+    // --- Error codes ---
+    // Negative values so int-returning functions can cast them directly.
+    // succeeded() / failed() helpers below for quick checks.
+    enum class error_code : int
+    {
+        ok = 0,
+
+        // Socket / startup
+        socket_error = -1, // OS-level socket operation failed (bind, ioctl, etc.)
+
+        // Connection
+        not_connected = -2,      // Operation requires an active connection
+        connection_denied = -3,  // Server explicitly rejected the connection
+        connection_timeout = -4, // Handshake or negotiation timed out
+
+        // Send
+        backpressured = -5,     // Remote reassembler full, retry later
+        payload_too_large = -6, // Data exceeds maximum fragment capacity
+        invalid_argument = -7,  // Bad parameter (zero fragment count, null data, etc.)
+
+        // Channel
+        channel_in_use = -8,      // channel_id already registered
+        channel_not_found = -9,   // channel_id not registered
+        channel_slots_full = -10, // No free channel slots
+        channel_rejected = -11,   // Server rejected channel open request
+        channel_timeout = -12,    // Channel negotiation timed out
+
+        // Resources
+        pool_full = -13,        // Connection pool or pending-message table full
+        duplicate_packet = -14, // Packet already received
+        already_started = -15,  // Server already running / client already connected
+    };
+
+    inline bool succeeded(error_code ec)
+    {
+        return ec == error_code::ok;
+    }
+    inline bool failed(error_code ec)
+    {
+        return ec != error_code::ok;
+    }
+
     // --- Fragment flow control (backpressure) ---
     constexpr int BACKPRESSURE_HIGH_WATERMARK = 75; // percent: send throttle signal to sender
     constexpr int BACKPRESSURE_LOW_WATERMARK = 50;  // percent: send relief signal to sender

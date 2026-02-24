@@ -102,7 +102,7 @@ struct test_server_ctx
 
     bool start()
     {
-        if (!srv.start())
+        if (failed(srv.start()))
             return false;
         thread = std::thread(
             [this]()
@@ -157,7 +157,7 @@ static bool test_send_before_connect()
 // ============================================================================
 // TEST 2: Connect to non-existent server (timeout)
 // ============================================================================
-// No server is listening. connect() must return false after exhausting
+// No server is listening. connect() must return a non-ok error_code after exhausting
 // retries (~5 s). We verify it does not hang.
 // ============================================================================
 
@@ -167,10 +167,10 @@ static bool test_connect_no_server()
     c.set_verbose(false);
 
     auto t0 = std::chrono::steady_clock::now();
-    bool connected = c.connect();
+    error_code ec = c.connect();
     auto elapsed = std::chrono::steady_clock::now() - t0;
 
-    TEST_ASSERT(!connected, "connect should fail when no server is running");
+    TEST_ASSERT(failed(ec), "connect should fail when no server is running");
     TEST_ASSERT(!c.is_connected(), "is_connected should be false");
 
     // Should have taken a few seconds (retries)
@@ -197,8 +197,8 @@ static bool test_double_connect()
     client c("127.0.0.1", 9902);
     c.set_verbose(false);
 
-    bool first = c.connect();
-    TEST_ASSERT(first, "first connect should succeed");
+    error_code first = c.connect();
+    TEST_ASSERT(succeeded(first), "first connect should succeed");
     TEST_ASSERT(c.is_connected(), "should be connected");
 
     // Second connect: socket already in use — depends on implementation,
@@ -206,7 +206,7 @@ static bool test_double_connect()
     // Since disconnect closes socket, a second connect after the first
     // should either fail or succeed cleanly.
     // The current impl calls bind(0) again which will likely fail since socket is already bound.
-    bool second = c.connect();
+    error_code second = c.connect();
     // Either succeeds (re-handshake) or fails — we just verify no crash
     // and that the client ends in a consistent state.
     bool consistent = c.is_connected() || !c.is_connected(); // always true, just run the path
@@ -231,7 +231,7 @@ static bool test_double_disconnect()
     client c("127.0.0.1", 9903);
     c.set_verbose(false);
 
-    TEST_ASSERT(c.connect(), "connect should succeed");
+    TEST_ASSERT(succeeded(c.connect()), "connect should succeed");
     c.disconnect();
     TEST_ASSERT(!c.is_connected(), "should be disconnected after first disconnect");
 
@@ -258,7 +258,7 @@ static bool test_send_after_disconnect()
     client c("127.0.0.1", 9904);
     c.set_verbose(false);
 
-    TEST_ASSERT(c.connect(), "connect should succeed");
+    TEST_ASSERT(succeeded(c.connect()), "connect should succeed");
     c.disconnect();
 
     int result = c.send_payload("hello", 5);
@@ -279,7 +279,7 @@ static bool test_connection_denied_pool_full()
 {
     // We use a direct server to fill the pool, then try to connect a real client.
     server srv(9905);
-    TEST_ASSERT(srv.start(), "server should start");
+    TEST_ASSERT(succeeded(srv.start()), "server should start");
 
     // Fill all pool slots with fake connections.
     // We do this by sending CONNECTION_REQUEST from many "fake" endpoints.
@@ -318,7 +318,7 @@ static bool test_connection_denied_pool_full()
     {
         auto c = std::make_unique<client>("127.0.0.1", 9905);
         c->set_verbose(false);
-        TEST_ASSERT(c->connect(), ("client " + std::to_string(i) + " should connect").c_str());
+        TEST_ASSERT(succeeded(c->connect()), ("client " + std::to_string(i) + " should connect").c_str());
         clients.push_back(std::move(c));
     }
 
@@ -356,7 +356,7 @@ static bool test_client_timeout_detection()
     client c("127.0.0.1", 9906);
     c.set_verbose(false);
 
-    TEST_ASSERT(c.connect(), "connect should succeed");
+    TEST_ASSERT(succeeded(c.connect()), "connect should succeed");
     TEST_ASSERT(c.is_connected(), "client should be connected");
 
     // Stop the server (kills heartbeats)
@@ -389,7 +389,7 @@ static bool test_client_timeout_detection()
 static bool test_server_timeout_detection()
 {
     server srv(9907);
-    TEST_ASSERT(srv.start(), "server should start");
+    TEST_ASSERT(succeeded(srv.start()), "server should start");
 
     std::atomic<bool> stop_flag{false};
     std::atomic<bool> client_connected{false};
@@ -421,7 +421,7 @@ static bool test_server_timeout_detection()
     {
         client c("127.0.0.1", 9907);
         c.set_verbose(false);
-        TEST_ASSERT(c.connect(), "client should connect");
+        TEST_ASSERT(succeeded(c.connect()), "client should connect");
 
         // Wait for server to register
         auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
@@ -468,7 +468,7 @@ static bool test_heartbeat_keeps_alive()
 
     client c("127.0.0.1", 9908);
     c.set_verbose(false);
-    TEST_ASSERT(c.connect(), "connect should succeed");
+    TEST_ASSERT(succeeded(c.connect()), "connect should succeed");
 
     // Run client/server loop for 3 seconds — heartbeats should keep it alive
     auto end_time = std::chrono::steady_clock::now() + std::chrono::seconds(3);
@@ -702,7 +702,7 @@ static bool test_full_echo_cycle()
             srv.send_to(resp, payload, addr, port);
         });
 
-    TEST_ASSERT(srv.start(), "server should start");
+    TEST_ASSERT(succeeded(srv.start()), "server should start");
 
     std::thread server_thread(
         [&]()
@@ -727,7 +727,7 @@ static bool test_full_echo_cycle()
             responses++;
         });
 
-    TEST_ASSERT(c.connect(), "client should connect");
+    TEST_ASSERT(succeeded(c.connect()), "client should connect");
 
     // Send a message
     const char *msg = "PING";
@@ -851,7 +851,7 @@ static bool test_server_disconnect_callback()
     srv.set_on_client_disconnected([&](const endpoint_key &, const std::string &, uint16_t)
                                    { disconnect_fired = true; });
 
-    TEST_ASSERT(srv.start(), "server should start");
+    TEST_ASSERT(succeeded(srv.start()), "server should start");
 
     std::thread server_thread(
         [&]()
@@ -866,7 +866,7 @@ static bool test_server_disconnect_callback()
 
     client c("127.0.0.1", 9910);
     c.set_verbose(false);
-    TEST_ASSERT(c.connect(), "client should connect");
+    TEST_ASSERT(succeeded(c.connect()), "client should connect");
 
     // Wait for server to register
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
@@ -961,7 +961,7 @@ static bool test_multiple_clients_independent()
     srv.set_on_client_connected([&](const endpoint_key &, const std::string &, uint16_t) { connect_count++; });
     srv.set_on_client_disconnected([&](const endpoint_key &, const std::string &, uint16_t) { disconnect_count++; });
 
-    TEST_ASSERT(srv.start(), "server should start");
+    TEST_ASSERT(succeeded(srv.start()), "server should start");
 
     std::thread server_thread(
         [&]()
@@ -981,9 +981,9 @@ static bool test_multiple_clients_independent()
     c2.set_verbose(false);
     c3.set_verbose(false);
 
-    TEST_ASSERT(c1.connect(), "c1 should connect");
-    TEST_ASSERT(c2.connect(), "c2 should connect");
-    TEST_ASSERT(c3.connect(), "c3 should connect");
+    TEST_ASSERT(succeeded(c1.connect()), "c1 should connect");
+    TEST_ASSERT(succeeded(c2.connect()), "c2 should connect");
+    TEST_ASSERT(succeeded(c3.connect()), "c3 should connect");
 
     // Wait for server
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
@@ -1222,7 +1222,7 @@ static bool test_channel_registration()
 
     // Register a reliable channel
     channel_config cfg = make_channel_config(10, channel_mode::RELIABLE, 200, "test_reliable");
-    TEST_ASSERT(cm.register_channel(cfg), "should register successfully");
+    TEST_ASSERT(succeeded(cm.register_channel(cfg)), "should register successfully");
     TEST_ASSERT(cm.channel_count() == 1, "should have 1 channel");
     TEST_ASSERT(cm.is_registered(10), "channel 10 should be registered");
     TEST_ASSERT(cm.is_reliable(10), "channel 10 should be reliable");
@@ -1230,7 +1230,7 @@ static bool test_channel_registration()
     TEST_ASSERT(cm.priority(10) == 200, "channel 10 priority should be 200");
 
     // Duplicate registration should fail
-    TEST_ASSERT(!cm.register_channel(cfg), "duplicate registration should fail");
+    TEST_ASSERT(failed(cm.register_channel(cfg)), "duplicate registration should fail");
 
     // Unregistered channel queries
     TEST_ASSERT(!cm.is_registered(99), "channel 99 should not be registered");
@@ -1239,7 +1239,7 @@ static bool test_channel_registration()
     TEST_ASSERT(cm.get_channel(99) == nullptr, "get_channel should return nullptr for unregistered");
 
     // Unregister
-    TEST_ASSERT(cm.unregister_channel(10), "should unregister successfully");
+    TEST_ASSERT(succeeded(cm.unregister_channel(10)), "should unregister successfully");
     TEST_ASSERT(cm.channel_count() == 0, "should have 0 channels after unregister");
     TEST_ASSERT(!cm.is_registered(10), "channel 10 should no longer be registered");
 
@@ -1382,7 +1382,7 @@ static bool test_channel_echo_integration()
             srv.send_to(resp, payload, addr, port);
         });
 
-    TEST_ASSERT(srv.start(), "server should start");
+    TEST_ASSERT(succeeded(srv.start()), "server should start");
 
     std::thread server_thread(
         [&]()
@@ -1408,7 +1408,7 @@ static bool test_channel_echo_integration()
             responses++;
         });
 
-    TEST_ASSERT(c.connect(), "client should connect");
+    TEST_ASSERT(succeeded(c.connect()), "client should connect");
 
     // Send on RELIABLE channel
     const char *msg = "ATTACK";
@@ -1497,7 +1497,7 @@ static bool test_open_channel()
     TEST_ASSERT(cm.is_ordered(100), "channel 100 should be ordered");
 
     // Unregister and reopen — slot reuse
-    TEST_ASSERT(cm.unregister_channel(4), "should unregister channel 4");
+    TEST_ASSERT(succeeded(cm.unregister_channel(4)), "should unregister channel 4");
     int id4 = cm.open_channel(channel_mode::UNRELIABLE, 10, "reuse", 4);
     TEST_ASSERT(id4 == 4, "reopened slot should get id 4 again");
 
@@ -1555,14 +1555,14 @@ static bool test_open_channel_saturation()
         cfg.mode = channel_mode::UNRELIABLE;
         cfg.priority = 1;
         std::strncpy(cfg.name, "fill", MAX_CHANNEL_NAME - 1);
-        TEST_ASSERT(cm.register_channel(cfg), "register should succeed for all slots");
+        TEST_ASSERT(succeeded(cm.register_channel(cfg)), "register should succeed for all slots");
     }
 
     TEST_ASSERT(cm.channel_count() == static_cast<int>(MAX_CHANNELS), "all 256 slots should be full");
 
     // open_channel must fail
     int id = cm.open_channel(channel_mode::RELIABLE, 128, "overflow");
-    TEST_ASSERT(id == -1, "open_channel should return -1 when saturated");
+    TEST_ASSERT(id < 0, "open_channel should return a negative error_code when saturated");
 
     return true;
 }
@@ -1578,7 +1578,7 @@ static bool test_channel_negotiation_accepted()
     std::atomic<bool> stop_flag{false};
 
     // Default: no on_channel_requested callback → server accepts all
-    TEST_ASSERT(srv.start(), "server should start");
+    TEST_ASSERT(succeeded(srv.start()), "server should start");
 
     std::thread server_thread(
         [&]()
@@ -1594,7 +1594,7 @@ static bool test_channel_negotiation_accepted()
     client c("127.0.0.1", 9922);
     c.set_verbose(false);
     c.channels().register_defaults();
-    TEST_ASSERT(c.connect(), "client should connect");
+    TEST_ASSERT(succeeded(c.connect()), "client should connect");
 
     // Negotiate a new reliable channel
     int ch_id = c.open_channel(channel_mode::RELIABLE, 200, "combat");
@@ -1664,7 +1664,7 @@ static bool test_channel_negotiation_rejected()
     // Reject all channel open requests
     srv.set_on_channel_requested([](const endpoint_key &, uint8_t, channel_mode, uint8_t) -> bool { return false; });
 
-    TEST_ASSERT(srv.start(), "server should start");
+    TEST_ASSERT(succeeded(srv.start()), "server should start");
 
     std::thread server_thread(
         [&]()
@@ -1680,11 +1680,11 @@ static bool test_channel_negotiation_rejected()
     client c("127.0.0.1", 9923);
     c.set_verbose(false);
     c.channels().register_defaults();
-    TEST_ASSERT(c.connect(), "client should connect");
+    TEST_ASSERT(succeeded(c.connect()), "client should connect");
 
     // Attempt to open a channel — should be rejected
     int ch_id = c.open_channel(channel_mode::RELIABLE, 128, "rejected_ch");
-    TEST_ASSERT(ch_id == -1, "open_channel should return -1 when rejected");
+    TEST_ASSERT(ch_id < 0, "open_channel should return negative error_code when rejected");
 
     // Verify the channel was NOT registered locally (rolled back)
     // The hint was 4, so if it was registered and rolled back, slot 4 should be free
@@ -1712,7 +1712,7 @@ static bool test_channel_negotiation_selective()
     srv.set_on_channel_requested([](const endpoint_key &, uint8_t, channel_mode mode, uint8_t) -> bool
                                  { return mode != channel_mode::UNRELIABLE; });
 
-    TEST_ASSERT(srv.start(), "server should start");
+    TEST_ASSERT(succeeded(srv.start()), "server should start");
 
     std::thread server_thread(
         [&]()
@@ -1728,7 +1728,7 @@ static bool test_channel_negotiation_selective()
     client c("127.0.0.1", 9924);
     c.set_verbose(false);
     c.channels().register_defaults();
-    TEST_ASSERT(c.connect(), "client should connect");
+    TEST_ASSERT(succeeded(c.connect()), "client should connect");
 
     // This one should be accepted (RELIABLE)
     int ch_reliable = c.open_channel(channel_mode::RELIABLE, 128, "ok_channel");
@@ -1737,7 +1737,7 @@ static bool test_channel_negotiation_selective()
 
     // This one should be rejected (UNRELIABLE)
     int ch_unreliable = c.open_channel(channel_mode::UNRELIABLE, 64, "bad_channel");
-    TEST_ASSERT(ch_unreliable == -1, "UNRELIABLE channel should be rejected");
+    TEST_ASSERT(ch_unreliable < 0, "UNRELIABLE channel should be rejected");
 
     c.disconnect();
     stop_flag = true;
@@ -1757,7 +1757,7 @@ static bool test_channel_name_sync()
     srv.channels().register_defaults();
     std::atomic<bool> stop_flag{false};
 
-    TEST_ASSERT(srv.start(), "server should start");
+    TEST_ASSERT(succeeded(srv.start()), "server should start");
 
     std::thread server_thread(
         [&]()
@@ -1773,7 +1773,7 @@ static bool test_channel_name_sync()
     client c("127.0.0.1", 9925);
     c.set_verbose(false);
     c.channels().register_defaults();
-    TEST_ASSERT(c.connect(), "client should connect");
+    TEST_ASSERT(succeeded(c.connect()), "client should connect");
 
     // Open a channel with a specific name
     int ch_id = c.open_channel(channel_mode::RELIABLE, 180, "combat_spells");
@@ -2088,7 +2088,7 @@ static bool test_small_message_no_fragment()
     srv.set_on_client_data_received([&](const packet_header &header, const uint8_t *, size_t, const std::string &,
                                         uint16_t) { last_flags = header.flags; });
 
-    TEST_ASSERT(srv.start(), "server should start");
+    TEST_ASSERT(succeeded(srv.start()), "server should start");
 
     std::thread server_thread(
         [&]()
@@ -2104,7 +2104,7 @@ static bool test_small_message_no_fragment()
     client c("127.0.0.1", 9926);
     c.set_verbose(false);
     c.channels().register_defaults();
-    TEST_ASSERT(c.connect(), "client should connect");
+    TEST_ASSERT(succeeded(c.connect()), "client should connect");
 
     const char *msg = "SMALL";
     c.send_payload(msg, 5, 0, channels::RELIABLE.id);
@@ -2155,7 +2155,7 @@ static bool test_fragmented_e2e()
             srv_complete_size = total;
         });
 
-    TEST_ASSERT(srv.start(), "server should start");
+    TEST_ASSERT(succeeded(srv.start()), "server should start");
 
     std::thread server_thread(
         [&]()
@@ -2171,7 +2171,7 @@ static bool test_fragmented_e2e()
     client c("127.0.0.1", 9927);
     c.set_verbose(false);
     c.channels().register_defaults();
-    TEST_ASSERT(c.connect(), "client should connect");
+    TEST_ASSERT(succeeded(c.connect()), "client should connect");
 
     // Build a 4000-byte message (4 fragments)
     const size_t msg_size = 4000;
@@ -2239,7 +2239,7 @@ static bool test_fragmented_echo_e2e()
             srv_echo_port = port;
         });
 
-    TEST_ASSERT(srv.start(), "server should start");
+    TEST_ASSERT(succeeded(srv.start()), "server should start");
 
     std::thread server_thread(
         [&]()
@@ -2275,7 +2275,7 @@ static bool test_fragmented_echo_e2e()
             client_complete = true;
         });
 
-    TEST_ASSERT(c.connect(), "client should connect");
+    TEST_ASSERT(succeeded(c.connect()), "client should connect");
 
     // Sender ACK tracking: verify the app knows when it can release the send buffer
     // NOTE: registered after connect() because connect() calls reset() internally.
@@ -2438,7 +2438,7 @@ static bool test_scatter_gather_e2e()
             srv_complete_size = total;
         });
 
-    TEST_ASSERT(srv.start(), "server should start");
+    TEST_ASSERT(succeeded(srv.start()), "server should start");
     std::thread server_thread(
         [&]()
         {
@@ -2453,7 +2453,7 @@ static bool test_scatter_gather_e2e()
     client c("127.0.0.1", 9929);
     c.set_verbose(false);
     c.channels().register_defaults();
-    TEST_ASSERT(c.connect(), "client should connect");
+    TEST_ASSERT(succeeded(c.connect()), "client should connect");
 
     // 8KB message = 7 fragments
     const size_t msg_size = 8000;
@@ -2516,7 +2516,7 @@ static bool test_set_on_message_failed_expired_e2e()
                 expired_check_failed = true;
         });
 
-    TEST_ASSERT(srv.start(), "server should start");
+    TEST_ASSERT(succeeded(srv.start()), "server should start");
     std::thread server_thread(
         [&]()
         {
@@ -2531,7 +2531,7 @@ static bool test_set_on_message_failed_expired_e2e()
     client c("127.0.0.1", 9930);
     c.set_verbose(false);
     c.channels().register_defaults();
-    TEST_ASSERT(c.connect(), "client should connect");
+    TEST_ASSERT(succeeded(c.connect()), "client should connect");
 
     // Send a single fragment (index=0 of 3) using the raw send() API.
     // Fragments 1 and 2 are never sent → message stays incomplete.
@@ -2915,7 +2915,7 @@ static bool test_per_connection_reassembler_isolation()
         });
     srv.set_on_message_complete([&](const endpoint_key &, uint32_t, uint8_t, uint8_t *, size_t) { complete_count++; });
 
-    TEST_ASSERT(srv.start(), "server should start");
+    TEST_ASSERT(succeeded(srv.start()), "server should start");
     std::thread server_thread(
         [&]()
         {
@@ -2935,8 +2935,8 @@ static bool test_per_connection_reassembler_isolation()
     c1.channels().register_defaults();
     c2.channels().register_defaults();
 
-    TEST_ASSERT(c1.connect(), "c1 should connect");
-    TEST_ASSERT(c2.connect(), "c2 should connect");
+    TEST_ASSERT(succeeded(c1.connect()), "c1 should connect");
+    TEST_ASSERT(succeeded(c2.connect()), "c2 should connect");
 
     const size_t msg_size = MAX_FRAGMENT_PAYLOAD * 2 + 100; // 3 fragments
     std::vector<uint8_t> data1(msg_size, 0x11);
@@ -2997,7 +2997,7 @@ static bool test_set_on_message_failed_evicted_e2e()
             evicted_msg_id.store(msg_id);
         });
 
-    TEST_ASSERT(srv.start(), "server should start");
+    TEST_ASSERT(succeeded(srv.start()), "server should start");
     std::thread server_thread(
         [&]()
         {
@@ -3012,7 +3012,7 @@ static bool test_set_on_message_failed_evicted_e2e()
     client c("127.0.0.1", 9932);
     c.set_verbose(false);
     c.channels().register_defaults();
-    TEST_ASSERT(c.connect(), "client should connect");
+    TEST_ASSERT(succeeded(c.connect()), "client should connect");
 
     // Send N incomplete messages (1/3 each) to fill the per-connection reassembler
     for (uint32_t i = 0; i < static_cast<uint32_t>(N); ++i)
@@ -3085,7 +3085,7 @@ static bool test_client_backpressure_throttle()
     client c("127.0.0.1", 9933);
     c.set_verbose(false);
     c.channels().register_defaults();
-    TEST_ASSERT(c.connect(), "client should connect");
+    TEST_ASSERT(succeeded(c.connect()), "client should connect");
 
     // Not throttled initially
     TEST_ASSERT(!c.is_fragment_throttled(), "should NOT be throttled initially");
@@ -3098,10 +3098,10 @@ static bool test_client_backpressure_throttle()
     int r1 = c.send_payload("hello", 5, 0, channels::RELIABLE.id);
     TEST_ASSERT(r1 > 0, "single-packet send should work even under backpressure");
 
-    // Fragmented payload should return -2
+    // Fragmented payload should return a negative error_code
     std::vector<uint8_t> big(MAX_FRAGMENT_PAYLOAD * 3, 0xAA);
     int r2 = c.send_payload(big.data(), big.size(), 0, channels::RELIABLE.id);
-    TEST_ASSERT(r2 == -2, "fragmented send should return -2 when backpressured");
+    TEST_ASSERT(r2 < 0, "fragmented send should return negative error_code when backpressured");
 
     // Release backpressure
     c.connection().set_fragment_backpressured(false);
@@ -3112,7 +3112,7 @@ static bool test_client_backpressure_throttle()
 }
 
 // ============================================================================
-// TEST 62: Backpressure — server.is_fragment_throttled() and send_payload_to -2
+// TEST 62: Backpressure — server.is_fragment_throttled() and send_payload_to error_code
 // ============================================================================
 
 static bool test_server_backpressure_throttle()
@@ -3132,7 +3132,7 @@ static bool test_server_backpressure_throttle()
             client_known = true;
         });
 
-    TEST_ASSERT(srv.start(), "server should start");
+    TEST_ASSERT(succeeded(srv.start()), "server should start");
     std::thread server_thread(
         [&]()
         {
@@ -3147,7 +3147,7 @@ static bool test_server_backpressure_throttle()
     client c("127.0.0.1", 9934);
     c.set_verbose(false);
     c.channels().register_defaults();
-    TEST_ASSERT(c.connect(), "client should connect");
+    TEST_ASSERT(succeeded(c.connect()), "client should connect");
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (!client_known.load() && std::chrono::steady_clock::now() < deadline)
@@ -3238,7 +3238,7 @@ static bool test_ordered_simple_delivery()
             srv.send_to(resp, payload, addr, port);
         });
 
-    TEST_ASSERT(srv.start(), "server should start");
+    TEST_ASSERT(succeeded(srv.start()), "server should start");
 
     std::thread server_thread(
         [&]()
@@ -3271,7 +3271,7 @@ static bool test_ordered_simple_delivery()
             }
         });
 
-    TEST_ASSERT(c.connect(), "client should connect");
+    TEST_ASSERT(succeeded(c.connect()), "client should connect");
 
     constexpr int NUM_MSGS = 20;
 
@@ -3354,7 +3354,7 @@ static bool test_ordered_fragmented_delivery()
     srv.set_on_message_failed([&](const endpoint_key &, uint32_t, uint8_t, uint8_t *buf, message_fail_reason, uint8_t,
                                   uint8_t) { delete[] buf; });
 
-    TEST_ASSERT(srv.start(), "server should start");
+    TEST_ASSERT(succeeded(srv.start()), "server should start");
 
     std::thread server_thread(
         [&]()
@@ -3394,7 +3394,7 @@ static bool test_ordered_fragmented_delivery()
     c.set_on_message_failed([&](const endpoint_key &, uint32_t, uint8_t, uint8_t *buf, message_fail_reason, uint8_t,
                                 uint8_t) { delete[] buf; });
 
-    TEST_ASSERT(c.connect(), "client should connect");
+    TEST_ASSERT(succeeded(c.connect()), "client should connect");
 
     constexpr int NUM_MSGS = 10;
     constexpr size_t FRAG_SIZE = 2500; // > MAX_PAYLOAD_SIZE to trigger fragmentation
@@ -3486,7 +3486,7 @@ static bool test_ordered_mixed_delivery()
     srv.set_on_message_failed([&](const endpoint_key &, uint32_t, uint8_t, uint8_t *buf, message_fail_reason, uint8_t,
                                   uint8_t) { delete[] buf; });
 
-    TEST_ASSERT(srv.start(), "server should start");
+    TEST_ASSERT(succeeded(srv.start()), "server should start");
 
     std::thread server_thread(
         [&]()
@@ -3538,7 +3538,7 @@ static bool test_ordered_mixed_delivery()
     c.set_on_message_failed([&](const endpoint_key &, uint32_t, uint8_t, uint8_t *buf, message_fail_reason, uint8_t,
                                 uint8_t) { delete[] buf; });
 
-    TEST_ASSERT(c.connect(), "client should connect");
+    TEST_ASSERT(succeeded(c.connect()), "client should connect");
 
     // Interleave: simple(0), frag(1), simple(2), frag(3), simple(4), ...
     constexpr int NUM_MSGS = 12;

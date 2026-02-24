@@ -46,7 +46,7 @@ namespace entanglement
         server(const server &) = delete;
         server &operator=(const server &) = delete;
 
-        bool start();
+        error_code start();
         void stop();
         bool is_running() const { return m_running.load(); }
 
@@ -75,12 +75,12 @@ namespace entanglement
         // Send payload to a connected client, auto-fragmenting if needed.
         // If out_message_id is non-null, the library message_id is written there
         // (only meaningful for fragmented sends; 0 for single-packet sends).
-        // Returns bytes of user data sent, or -1 on error.
+        // Returns bytes of user data sent, or a negative error_code on failure.
         int send_payload_to(const void *data, size_t size, uint8_t channel_id, const std::string &address,
                             uint16_t port, uint8_t flags = 0, uint32_t *out_message_id = nullptr);
 
         // Send a single fragment to a connected client (for retransmission or custom fragmented sends).
-        // Returns bytes sent, or -1 on error.
+        // Returns bytes sent, or a negative error_code on failure.
         int send_fragment_to(uint32_t message_id, uint8_t index, uint8_t count, const void *data, size_t size,
                              uint8_t flags, uint8_t channel_id, const std::string &address, uint16_t port);
 

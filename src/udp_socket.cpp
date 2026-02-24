@@ -50,13 +50,13 @@ namespace entanglement
         return *this;
     }
 
-    bool udp_socket::bind(uint16_t port, const std::string &address)
+    error_code udp_socket::bind(uint16_t port, const std::string &address)
     {
         m_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (m_socket == INVALID_SOCK)
         {
             std::cerr << "[udp_socket] Failed to create socket: " << last_socket_error() << std::endl;
-            return false;
+            return error_code::socket_error;
         }
 
         // Allow address reuse
@@ -76,10 +76,10 @@ namespace entanglement
         {
             std::cerr << "[udp_socket] Failed to bind on port " << port << ": " << last_socket_error() << std::endl;
             close();
-            return false;
+            return error_code::socket_error;
         }
 
-        return true;
+        return error_code::ok;
     }
 
     int udp_socket::send_to(const void *data, size_t size, const std::string &address, uint16_t port)
@@ -225,17 +225,17 @@ namespace entanglement
         return received;
     }
 
-    bool udp_socket::set_non_blocking(bool enabled)
+    error_code udp_socket::set_non_blocking(bool enabled)
     {
 #ifdef ENTANGLEMENT_PLATFORM_WINDOWS
         u_long mode = enabled ? 1 : 0;
-        return ioctlsocket(m_socket, FIONBIO, &mode) == 0;
+        return ioctlsocket(m_socket, FIONBIO, &mode) == 0 ? error_code::ok : error_code::socket_error;
 #else
         int flags = fcntl(m_socket, F_GETFL, 0);
         if (flags == -1)
-            return false;
+            return error_code::socket_error;
         flags = enabled ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK);
-        return fcntl(m_socket, F_SETFL, flags) == 0;
+        return fcntl(m_socket, F_SETFL, flags) == 0 ? error_code::ok : error_code::socket_error;
 #endif
     }
 
@@ -250,10 +250,12 @@ namespace entanglement
         return 0;
     }
 
-    bool udp_socket::set_recv_buffer_size(int size_bytes)
+    error_code udp_socket::set_recv_buffer_size(int size_bytes)
     {
         return setsockopt(m_socket, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char *>(&size_bytes),
-                          sizeof(size_bytes)) == 0;
+                          sizeof(size_bytes)) == 0
+                   ? error_code::ok
+                   : error_code::socket_error;
     }
 
     void udp_socket::close()

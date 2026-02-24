@@ -61,16 +61,16 @@ namespace entanglement
     public:
         channel_manager() = default;
 
-        // Register a channel. Returns false if the ID is already in use.
-        bool register_channel(const channel_config &config);
+        // Register a channel. Returns error_code::ok or error_code::channel_in_use.
+        error_code register_channel(const channel_config &config);
 
         // Open a new channel with the given mode and priority.
         // Picks the next available ID (starting from 'hint', default = 4).
         // Returns the assigned channel_id, or -1 if no slots are available.
         int open_channel(channel_mode mode, uint8_t priority = 128, const char *name = "", uint8_t hint = 4);
 
-        // Remove a channel registration. Returns false if not registered.
-        bool unregister_channel(uint8_t id);
+        // Remove a channel registration. Returns error_code::ok or error_code::channel_not_found.
+        error_code unregister_channel(uint8_t id);
 
         // Get channel configuration. Returns nullptr if not registered.
         const channel_config *get_channel(uint8_t id) const;

@@ -31,7 +31,7 @@ namespace entanglement
         udp_socket &operator=(udp_socket &&other) noexcept;
 
         // Create and bind to a local port (0 = any available port)
-        bool bind(uint16_t port, const std::string &address = "0.0.0.0");
+        error_code bind(uint16_t port, const std::string &address = "0.0.0.0");
 
         // Send raw data to a remote address
         int send_to(const void *data, size_t size, const std::string &address, uint16_t port);
@@ -53,10 +53,10 @@ namespace entanglement
                         uint16_t &sender_port);
 
         // Set non-blocking mode
-        bool set_non_blocking(bool enabled);
+        error_code set_non_blocking(bool enabled);
 
         // Set socket receive buffer size (SO_RCVBUF)
-        bool set_recv_buffer_size(int size_bytes);
+        error_code set_recv_buffer_size(int size_bytes);
 
         // Get the local port the socket is bound to
         uint16_t local_port() const;
