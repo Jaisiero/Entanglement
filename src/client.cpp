@@ -55,6 +55,10 @@ namespace entanglement
                     std::cout << "[client] Connected to " << m_server_address << ":" << m_server_port << " (port "
                               << m_socket.local_port() << ")" << std::endl;
                 }
+                if (m_on_connected)
+                {
+                    m_on_connected();
+                }
                 return true;
             }
 
@@ -265,9 +269,9 @@ namespace entanglement
             }
 
             // Data packets — only when connected
-            if (m_connection.state() == connection_state::CONNECTED && m_on_response)
+            if (m_connection.state() == connection_state::CONNECTED && m_on_data_received)
             {
-                m_on_response(header, payload, header.payload_size);
+                m_on_data_received(header, payload, header.payload_size);
             }
             ++count;
         }
@@ -308,11 +312,12 @@ namespace entanglement
         lost_packet_info lost[MAX_LOSSES_PER_UPDATE];
         int count = m_connection.collect_losses(now, lost, MAX_LOSSES_PER_UPDATE);
 
-        if (loss_callback)
+        auto &cb = loss_callback ? loss_callback : m_on_packet_lost;
+        if (cb)
         {
             for (int i = 0; i < count; ++i)
             {
-                loss_callback(lost[i]);
+                cb(lost[i]);
             }
         }
 
@@ -332,14 +337,24 @@ namespace entanglement
         return count;
     }
 
-    void client::set_on_response(on_response_received callback)
+    void client::set_on_data_received(on_data_received callback)
     {
-        m_on_response = std::move(callback);
+        m_on_data_received = std::move(callback);
+    }
+
+    void client::set_on_connected(on_connected callback)
+    {
+        m_on_connected = std::move(callback);
     }
 
     void client::set_on_disconnected(on_disconnected callback)
     {
         m_on_disconnected = std::move(callback);
+    }
+
+    void client::set_on_packet_lost(on_packet_lost callback)
+    {
+        m_on_packet_lost = std::move(callback);
     }
 
     void client::set_on_allocate_message(on_allocate_message cb)
@@ -352,14 +367,9 @@ namespace entanglement
         m_connection.reassembler().set_on_complete(std::move(cb));
     }
 
-    void client::set_on_message_expired(on_message_expired cb)
+    void client::set_on_message_failed(on_message_failed cb)
     {
-        m_connection.reassembler().set_on_expired(std::move(cb));
-    }
-
-    void client::set_on_message_evicted(on_message_evicted cb)
-    {
-        m_connection.reassembler().set_on_evicted(std::move(cb));
+        m_connection.reassembler().set_on_failed(std::move(cb));
     }
 
     void client::set_on_message_acked(on_message_acked cb)

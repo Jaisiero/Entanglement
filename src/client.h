@@ -12,12 +12,15 @@
 namespace entanglement
 {
 
-    // Callback: data packet received from server
-    using on_response_received =
+    // Callback: data packet received from server (non-fragmented)
+    using on_data_received =
         std::function<void(const packet_header &header, const uint8_t *payload, size_t payload_size)>;
 
     // Callback: reliable packet detected as lost
     using on_packet_lost = std::function<void(const lost_packet_info &info)>;
+
+    // Callback: connection established successfully
+    using on_connected = std::function<void()>;
 
     // Callback: connection was lost (timeout or server kicked us)
     using on_disconnected = std::function<void()>;
@@ -64,11 +67,14 @@ namespace entanglement
         // Check heartbeat/timeout and collect losses.
         // Sends heartbeat if idle, triggers on_disconnected if timed out.
         // Returns the number of losses detected.
+        // If a loss_callback is provided it overrides the stored one for this call.
         int update(on_packet_lost loss_callback = nullptr);
 
         // Callbacks
-        void set_on_response(on_response_received callback);
+        void set_on_data_received(on_data_received callback);
+        void set_on_connected(on_connected callback);
         void set_on_disconnected(on_disconnected callback);
+        void set_on_packet_lost(on_packet_lost callback);
 
         udp_connection &connection() { return m_connection; }
 
@@ -85,8 +91,7 @@ namespace entanglement
         // Fragmentation: receiver callbacks (app-provided buffer management)
         void set_on_allocate_message(on_allocate_message cb);
         void set_on_message_complete(on_message_complete cb);
-        void set_on_message_expired(on_message_expired cb);
-        void set_on_message_evicted(on_message_evicted cb);
+        void set_on_message_failed(on_message_failed cb);
 
         // Fragmentation: sender callback (all fragments ACKed)
         void set_on_message_acked(on_message_acked cb);
@@ -123,8 +128,10 @@ namespace entanglement
         uint16_t m_server_port;
         std::atomic<bool> m_connected{false};
         bool m_verbose = true;
-        on_response_received m_on_response;
+        on_data_received m_on_data_received;
+        on_connected m_on_connected;
         on_disconnected m_on_disconnected;
+        on_packet_lost m_on_packet_lost;
 
         // Pending channel-open negotiation state
         int m_pending_channel_id = -1;    // channel id awaiting ACK, or -1

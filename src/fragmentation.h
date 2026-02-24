@@ -78,15 +78,19 @@ namespace entanglement
     // The sender can now release its source buffer.
     using on_message_acked = std::function<void(uint32_t message_id)>;
 
-    // Called when an incomplete fragmented message is expired (timeout).
-    // The app should release the buffer it provided via on_allocate_message.
-    using on_message_expired =
-        std::function<void(const endpoint_key &sender, uint32_t message_id, uint8_t channel_id, uint8_t *app_buffer)>;
+    // Reason an incomplete fragmented message was discarded.
+    enum class message_fail_reason : uint8_t
+    {
+        expired, // Reassembly timeout elapsed before all fragments arrived
+        evicted, // Slot was reclaimed to make room for a newer message
+    };
 
-    // Called when an incomplete message is evicted to make room for a new one.
-    // Includes progress info so the app knows how much was lost.
-    using on_message_evicted = std::function<void(const endpoint_key &sender, uint32_t message_id, uint8_t channel_id,
-                                                  uint8_t *app_buffer, uint8_t received_count, uint8_t fragment_count)>;
+    // Called when an incomplete fragmented message is discarded (timeout or eviction).
+    // The app should release the buffer it provided via on_allocate_message.
+    // received_count / fragment_count indicate how much data was collected.
+    using on_message_failed =
+        std::function<void(const endpoint_key &sender, uint32_t message_id, uint8_t channel_id, uint8_t *app_buffer,
+                           message_fail_reason reason, uint8_t received_count, uint8_t fragment_count)>;
 
     // -----------------------------------------------------------------------
     // fragment_result — rich return from process_fragment.
@@ -159,8 +163,7 @@ namespace entanglement
     public:
         void set_on_allocate(on_allocate_message cb) { m_on_allocate = std::move(cb); }
         void set_on_complete(on_message_complete cb) { m_on_complete = std::move(cb); }
-        void set_on_expired(on_message_expired cb) { m_on_expired = std::move(cb); }
-        void set_on_evicted(on_message_evicted cb) { m_on_evicted = std::move(cb); }
+        void set_on_failed(on_message_failed cb) { m_on_failed = std::move(cb); }
 
         // Process one incoming fragment.  Calls on_allocate / on_complete as needed.
         // Returns a fragment_result indicating what happened.
@@ -196,8 +199,7 @@ namespace entanglement
         reassembly_entry m_entries[MAX_INCOMING_FRAGMENTED_MESSAGES]{};
         on_allocate_message m_on_allocate;
         on_message_complete m_on_complete;
-        on_message_expired m_on_expired;
-        on_message_evicted m_on_evicted;
+        on_message_failed m_on_failed;
         int64_t m_reassembly_timeout_us = REASSEMBLY_TIMEOUT_US;
 
         reassembly_entry *find_entry(const endpoint_key &sender, uint32_t message_id);

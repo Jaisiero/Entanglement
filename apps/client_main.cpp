@@ -231,7 +231,7 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
     // =========================================================================
     // SIMPLE ECHO callback (non-fragmented responses from server)
     // =========================================================================
-    cli.set_on_response(
+    cli.set_on_data_received(
         [&](const packet_header & /*hdr*/, const uint8_t *payload, size_t size)
         {
             if (size >= SOAK_MSG_SIZE)
@@ -274,7 +274,8 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
             delete[] data;
         });
 
-    cli.set_on_message_expired([&](const endpoint_key &, uint32_t, uint8_t, uint8_t *buf) { delete[] buf; });
+    cli.set_on_message_failed([&](const endpoint_key &, uint32_t, uint8_t, uint8_t *buf, message_fail_reason, uint8_t,
+                                  uint8_t) { delete[] buf; });
 
     // =========================================================================
     // LOSS callback (simple retransmission only)

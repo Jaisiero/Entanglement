@@ -14,8 +14,8 @@
 namespace entanglement
 {
 
-    // Callback: data packet from a connected client
-    using on_packet_received =
+    // Callback: data packet from a connected client (non-fragmented)
+    using on_client_data_received =
         std::function<void(const packet_header &header, const uint8_t *payload, size_t payload_size,
                            const std::string &sender_address, uint16_t sender_port)>;
 
@@ -55,6 +55,7 @@ namespace entanglement
 
         // Check connection timeouts and send heartbeats. Call from your game loop after poll().
         // Returns the number of connections that timed out.
+        // If a loss_callback is provided it overrides the stored one for this call.
         int update();
 
         // Same as update(), but also collects reliable packet losses from all connections
@@ -62,10 +63,11 @@ namespace entanglement
         int update(on_server_packet_lost loss_callback);
 
         // Callbacks
-        void set_on_packet_received(on_packet_received callback);
+        void set_on_client_data_received(on_client_data_received callback);
         void set_on_client_connected(on_client_connected callback);
         void set_on_client_disconnected(on_client_disconnected callback);
         void set_on_channel_requested(on_channel_requested callback);
+        void set_on_packet_lost(on_server_packet_lost callback);
 
         // Send a data packet to a connected client
         int send_to(packet_header &header, const void *payload, const std::string &address, uint16_t port);
@@ -102,8 +104,7 @@ namespace entanglement
         // Fragmentation: receiver callbacks
         void set_on_allocate_message(on_allocate_message cb);
         void set_on_message_complete(on_message_complete cb);
-        void set_on_message_expired(on_message_expired cb);
-        void set_on_message_evicted(on_message_evicted cb);
+        void set_on_message_failed(on_message_failed cb);
 
         // Override the reassembly timeout (default: REASSEMBLY_TIMEOUT_US).
         void set_reassembly_timeout(int64_t timeout_us);
@@ -127,13 +128,13 @@ namespace entanglement
         // Stored callback templates (applied to each new connection's reassembler)
         on_allocate_message m_frag_alloc_cb;
         on_message_complete m_frag_complete_cb;
-        on_message_expired m_frag_expired_cb;
-        on_message_evicted m_frag_evicted_cb;
+        on_message_failed m_frag_failed_cb;
 
-        on_packet_received m_on_packet_received;
+        on_client_data_received m_on_client_data_received;
         on_client_connected m_on_client_connected;
         on_client_disconnected m_on_client_disconnected;
         on_channel_requested m_on_channel_requested;
+        on_server_packet_lost m_on_packet_lost;
 
         // Connection pool + index
         std::unique_ptr<std::array<udp_connection, MAX_CONNECTIONS>> m_pool;

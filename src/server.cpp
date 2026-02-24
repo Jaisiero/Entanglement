@@ -133,9 +133,9 @@ namespace entanglement
                 continue;
             }
 
-            if (is_new && m_on_packet_received)
+            if (is_new && m_on_client_data_received)
             {
-                m_on_packet_received(header, payload, header.payload_size, sender_addr, sender_port);
+                m_on_client_data_received(header, payload, header.payload_size, sender_addr, sender_port);
             }
             ++count;
         }
@@ -180,8 +180,9 @@ namespace entanglement
             }
 
             // Collect losses for this connection
-            if (loss_callback)
+            if (loss_callback || m_on_packet_lost)
             {
+                auto &cb = loss_callback ? loss_callback : m_on_packet_lost;
                 lost_packet_info lost[MAX_LOSSES_PER_UPDATE];
                 int loss_count = conn.collect_losses(now, lost, MAX_LOSSES_PER_UPDATE);
                 if (loss_count > 0)
@@ -189,7 +190,7 @@ namespace entanglement
                     inet_ntop(AF_INET, &key.address, addr_buf, sizeof(addr_buf));
                     for (int l = 0; l < loss_count; ++l)
                     {
-                        loss_callback(lost[l], addr_buf, key.port);
+                        cb(lost[l], addr_buf, key.port);
                     }
                 }
             }
@@ -235,9 +236,9 @@ namespace entanglement
 
     // --- Callbacks ---
 
-    void server::set_on_packet_received(on_packet_received callback)
+    void server::set_on_client_data_received(on_client_data_received callback)
     {
-        m_on_packet_received = std::move(callback);
+        m_on_client_data_received = std::move(callback);
     }
 
     void server::set_on_client_connected(on_client_connected callback)
@@ -253,6 +254,11 @@ namespace entanglement
     void server::set_on_channel_requested(on_channel_requested callback)
     {
         m_on_channel_requested = std::move(callback);
+    }
+
+    void server::set_on_packet_lost(on_server_packet_lost callback)
+    {
+        m_on_packet_lost = std::move(callback);
     }
 
     // --- Sending ---
@@ -418,10 +424,8 @@ namespace entanglement
             ra.set_on_allocate(m_frag_alloc_cb);
         if (m_frag_complete_cb)
             ra.set_on_complete(m_frag_complete_cb);
-        if (m_frag_expired_cb)
-            ra.set_on_expired(m_frag_expired_cb);
-        if (m_frag_evicted_cb)
-            ra.set_on_evicted(m_frag_evicted_cb);
+        if (m_frag_failed_cb)
+            ra.set_on_failed(m_frag_failed_cb);
         if (m_reassembly_timeout_us != REASSEMBLY_TIMEOUT_US)
             ra.set_reassembly_timeout(m_reassembly_timeout_us);
 
@@ -657,18 +661,11 @@ namespace entanglement
             (*m_pool)[idx].reassembler().set_on_complete(cb);
     }
 
-    void server::set_on_message_expired(on_message_expired cb)
+    void server::set_on_message_failed(on_message_failed cb)
     {
-        m_frag_expired_cb = cb;
+        m_frag_failed_cb = cb;
         for (auto &[key, idx] : m_index)
-            (*m_pool)[idx].reassembler().set_on_expired(cb);
-    }
-
-    void server::set_on_message_evicted(on_message_evicted cb)
-    {
-        m_frag_evicted_cb = cb;
-        for (auto &[key, idx] : m_index)
-            (*m_pool)[idx].reassembler().set_on_evicted(cb);
+            (*m_pool)[idx].reassembler().set_on_failed(cb);
     }
 
     void server::set_reassembly_timeout(int64_t timeout_us)

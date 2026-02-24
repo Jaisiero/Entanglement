@@ -11,7 +11,7 @@
 // stored by sequence; fragmented echoes are stored by message_id.
 // This ensures 100% end-to-end delivery under simulated packet loss.
 //
-// Simple messages   → set_on_packet_received   → echo via send_to
+// Simple messages   → set_on_client_data_received   → echo via send_to
 // Fragmented messages → set_on_message_complete → echo via send_payload_to
 // ============================================================================
 
@@ -459,9 +459,9 @@ int main(int argc, char *argv[])
         });
 
     // =========================================================================
-    // SIMPLE MESSAGES → on_packet_received
+    // SIMPLE MESSAGES → on_client_data_received
     // =========================================================================
-    srv.set_on_packet_received(
+    srv.set_on_client_data_received(
         [&](const packet_header &hdr, const uint8_t *payload, size_t size, const std::string &addr, uint16_t p)
         {
             ++g_total_simple_packets;
@@ -583,9 +583,10 @@ int main(int argc, char *argv[])
             delete[] data;
         });
 
-    // Incomplete message expired
-    srv.set_on_message_expired(
-        [&](const endpoint_key &sender, uint32_t /*msg_id*/, uint8_t /*ch_id*/, uint8_t *buf)
+    // Incomplete message failed (expired or evicted)
+    srv.set_on_message_failed(
+        [&](const endpoint_key &sender, uint32_t /*msg_id*/, uint8_t /*ch_id*/, uint8_t *buf,
+            message_fail_reason /*reason*/, uint8_t /*received*/, uint8_t /*total*/)
         {
             std::string addr;
             uint16_t p = 0;

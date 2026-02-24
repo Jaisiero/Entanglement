@@ -22,8 +22,9 @@ namespace entanglement
             // fragment_count, the ID has been recycled — evict the stale entry.
             if (entry->fragment_count != fhdr.fragment_count)
             {
-                if (m_on_expired)
-                    m_on_expired(entry->sender, entry->message_id, entry->channel_id, entry->app_buffer);
+                if (m_on_failed)
+                    m_on_failed(entry->sender, entry->message_id, entry->channel_id, entry->app_buffer,
+                                message_fail_reason::expired, entry->received_count, entry->fragment_count);
                 entry->reset();
                 entry = nullptr; // fall through to allocate new
             }
@@ -139,8 +140,9 @@ namespace entanglement
             auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - e.created_time).count();
             if (elapsed > timeout_us)
             {
-                if (m_on_expired)
-                    m_on_expired(e.sender, e.message_id, e.channel_id, e.app_buffer);
+                if (m_on_failed)
+                    m_on_failed(e.sender, e.message_id, e.channel_id, e.app_buffer, message_fail_reason::expired,
+                                e.received_count, e.fragment_count);
                 e.reset();
                 ++evicted;
             }
@@ -154,8 +156,9 @@ namespace entanglement
         {
             if (e.active)
             {
-                if (m_on_expired)
-                    m_on_expired(e.sender, e.message_id, e.channel_id, e.app_buffer);
+                if (m_on_failed)
+                    m_on_failed(e.sender, e.message_id, e.channel_id, e.app_buffer, message_fail_reason::expired,
+                                e.received_count, e.fragment_count);
                 e.reset();
             }
         }
@@ -190,12 +193,10 @@ namespace entanglement
 
         if (victim)
         {
-            // Notify via on_evicted (preferred) or fall back to on_expired
-            if (m_on_evicted)
-                m_on_evicted(victim->sender, victim->message_id, victim->channel_id, victim->app_buffer,
-                             victim->received_count, victim->fragment_count);
-            else if (m_on_expired)
-                m_on_expired(victim->sender, victim->message_id, victim->channel_id, victim->app_buffer);
+            // Notify via on_failed
+            if (m_on_failed)
+                m_on_failed(victim->sender, victim->message_id, victim->channel_id, victim->app_buffer,
+                            message_fail_reason::evicted, victim->received_count, victim->fragment_count);
             victim->reset();
         }
 

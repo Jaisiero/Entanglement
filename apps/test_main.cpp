@@ -691,7 +691,7 @@ static bool test_full_echo_cycle()
     std::atomic<bool> stop_flag{false};
     std::atomic<int> echo_count{0};
 
-    srv.set_on_packet_received(
+    srv.set_on_client_data_received(
         [&](const packet_header &header, const uint8_t *payload, size_t payload_size, const std::string &addr,
             uint16_t port)
         {
@@ -720,7 +720,7 @@ static bool test_full_echo_cycle()
 
     std::atomic<int> responses{0};
     std::string last_response;
-    c.set_on_response(
+    c.set_on_data_received(
         [&](const packet_header &, const uint8_t *payload, size_t size)
         {
             last_response = std::string(reinterpret_cast<const char *>(payload), size);
@@ -1371,7 +1371,7 @@ static bool test_channel_echo_integration()
     srv.channels().register_defaults();
     std::atomic<bool> stop_flag{false};
 
-    srv.set_on_packet_received(
+    srv.set_on_client_data_received(
         [&](const packet_header &header, const uint8_t *payload, size_t payload_size, const std::string &addr,
             uint16_t port)
         {
@@ -1401,7 +1401,7 @@ static bool test_channel_echo_integration()
 
     std::atomic<int> responses{0};
     std::string last_response;
-    c.set_on_response(
+    c.set_on_data_received(
         [&](const packet_header &hdr, const uint8_t *payload, size_t size)
         {
             last_response = std::string(reinterpret_cast<const char *>(payload), size);
@@ -1612,14 +1612,14 @@ static bool test_channel_negotiation_accepted()
     // Send data on the negotiated channel and verify echo
     std::atomic<int> responses{0};
     std::string last_response;
-    c.set_on_response(
+    c.set_on_data_received(
         [&](const packet_header &, const uint8_t *payload, size_t size)
         {
             last_response = std::string(reinterpret_cast<const char *>(payload), size);
             responses++;
         });
 
-    srv.set_on_packet_received(
+    srv.set_on_client_data_received(
         [&](const packet_header &header, const uint8_t *payload, size_t payload_size, const std::string &addr,
             uint16_t port)
         {
@@ -2085,8 +2085,8 @@ static bool test_small_message_no_fragment()
     std::atomic<bool> stop_flag{false};
     std::atomic<uint8_t> last_flags{0xFF};
 
-    srv.set_on_packet_received([&](const packet_header &header, const uint8_t *, size_t, const std::string &, uint16_t)
-                               { last_flags = header.flags; });
+    srv.set_on_client_data_received([&](const packet_header &header, const uint8_t *, size_t, const std::string &,
+                                        uint16_t) { last_flags = header.flags; });
 
     TEST_ASSERT(srv.start(), "server should start");
 
@@ -2329,8 +2329,8 @@ static bool test_reassembly_timeout()
                        { return app_buffer.data(); });
     ra.set_on_complete([&](const endpoint_key &, uint32_t, uint8_t, uint8_t *, size_t)
                        { TEST_ASSERT(false, "on_complete should NOT fire for expired message"); });
-    ra.set_on_expired(
-        [&](const endpoint_key &, uint32_t msg_id, uint8_t, uint8_t *buf)
+    ra.set_on_failed(
+        [&](const endpoint_key &, uint32_t msg_id, uint8_t, uint8_t *buf, message_fail_reason, uint8_t, uint8_t)
         {
             expired_callback = true;
             expired_msg_id = msg_id;
@@ -2383,7 +2383,8 @@ static bool test_message_id_wrap_protection()
 
     bool complete = false;
     ra.set_on_complete([&](const endpoint_key &, uint32_t, uint8_t, uint8_t *, size_t) { complete = true; });
-    ra.set_on_expired([&](const endpoint_key &, uint32_t, uint8_t, uint8_t *) { expired_called = true; });
+    ra.set_on_failed([&](const endpoint_key &, uint32_t, uint8_t, uint8_t *, message_fail_reason, uint8_t, uint8_t)
+                     { expired_called = true; });
 
     endpoint_key ep{};
 
@@ -2479,13 +2480,13 @@ static bool test_scatter_gather_e2e()
 }
 
 // ============================================================================
-// TEST 52: set_on_message_expired E2E — server expires incomplete message
+// TEST 52: set_on_message_failed (expired) E2E — server expires incomplete message
 // ============================================================================
 // Verifies the full integration path:
-//   server.set_on_message_expired(cb) → reassembler.set_on_expired(cb)
+//   server.set_on_message_failed(cb) → reassembler.set_on_failed(cb)
 //   server.update() → reassembler.cleanup_stale(now, m_reassembly_timeout_us)
 
-static bool test_set_on_message_expired_e2e()
+static bool test_set_on_message_failed_expired_e2e()
 {
     server srv(9930);
     srv.channels().register_defaults();
@@ -2502,9 +2503,12 @@ static bool test_set_on_message_expired_e2e()
                                 { return srv_buffer.data(); });
     srv.set_on_message_complete([&](const endpoint_key &, uint32_t, uint8_t, uint8_t *, size_t)
                                 { TEST_ASSERT(false, "on_complete should NOT fire for expired message"); });
-    srv.set_on_message_expired(
-        [&](const endpoint_key &, uint32_t msg_id, uint8_t ch_id, uint8_t *buf)
+    srv.set_on_message_failed(
+        [&](const endpoint_key &, uint32_t msg_id, uint8_t ch_id, uint8_t *buf, message_fail_reason reason, uint8_t,
+            uint8_t)
         {
+            if (reason != message_fail_reason::expired)
+                return;
             expired_msg_id = msg_id;
             expired_ch_id = ch_id;
             expired_fired.store(true);
@@ -2553,7 +2557,7 @@ static bool test_set_on_message_expired_e2e()
     while (!expired_fired.load() && std::chrono::steady_clock::now() < deadline)
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
-    TEST_ASSERT(expired_fired.load(), "set_on_message_expired should have fired via server.update()");
+    TEST_ASSERT(expired_fired.load(), "set_on_message_failed should have fired via server.update()");
     TEST_ASSERT(!expired_check_failed, "expired callback should provide app buffer");
     TEST_ASSERT(expired_msg_id == 42, "expired message_id should be 42");
     TEST_ASSERT(expired_ch_id == channels::RELIABLE.id, "expired channel_id should match");
@@ -2689,7 +2693,8 @@ static bool test_reassembler_clear()
     int alloc_idx = 0;
     ra.set_on_allocate([&](const endpoint_key &, uint32_t, uint8_t, uint8_t, size_t) -> uint8_t *
                        { return bufs[alloc_idx++].data(); });
-    ra.set_on_expired([&](const endpoint_key &, uint32_t, uint8_t, uint8_t *) { expired_count++; });
+    ra.set_on_failed([&](const endpoint_key &, uint32_t, uint8_t, uint8_t *, message_fail_reason, uint8_t, uint8_t)
+                     { expired_count++; });
 
     endpoint_key ep{};
     for (uint32_t i = 0; i < 5; ++i)
@@ -2728,8 +2733,8 @@ static bool test_reassembler_eviction()
     uint32_t evicted_msg_id = 0;
     uint8_t evicted_received = 0;
     uint8_t evicted_total = 0;
-    ra.set_on_evicted(
-        [&](const endpoint_key &, uint32_t msg_id, uint8_t, uint8_t *, uint8_t recv, uint8_t total)
+    ra.set_on_failed(
+        [&](const endpoint_key &, uint32_t msg_id, uint8_t, uint8_t *, message_fail_reason, uint8_t recv, uint8_t total)
         {
             evicted_called = true;
             evicted_msg_id = msg_id;
@@ -2800,8 +2805,8 @@ static bool test_reassembler_eviction_picks_least()
                        { return bufs[alloc_idx++].data(); });
 
     uint32_t evicted_msg_id = 0;
-    ra.set_on_evicted([&](const endpoint_key &, uint32_t msg_id, uint8_t, uint8_t *, uint8_t, uint8_t)
-                      { evicted_msg_id = msg_id; });
+    ra.set_on_failed([&](const endpoint_key &, uint32_t msg_id, uint8_t, uint8_t *, message_fail_reason, uint8_t,
+                         uint8_t) { evicted_msg_id = msg_id; });
 
     endpoint_key ep{};
 
@@ -2838,10 +2843,10 @@ static bool test_reassembler_eviction_picks_least()
 }
 
 // ============================================================================
-// TEST 58: on_message_evicted callback — falls back to on_expired if not set
+// TEST 58: on_message_failed fires with reason=evicted on capacity overflow
 // ============================================================================
 
-static bool test_eviction_falls_back_to_expired()
+static bool test_eviction_fires_on_failed()
 {
     fragment_reassembler ra;
 
@@ -2851,14 +2856,15 @@ static bool test_eviction_falls_back_to_expired()
     ra.set_on_allocate([&](const endpoint_key &, uint32_t, uint8_t, uint8_t, size_t) -> uint8_t *
                        { return bufs[alloc_idx++].data(); });
 
-    // NO on_evicted set — on_expired should fire as fallback
-    bool expired_fallback = false;
-    uint32_t expired_msg_id = 0;
-    ra.set_on_expired(
-        [&](const endpoint_key &, uint32_t msg_id, uint8_t, uint8_t *)
+    bool failed_fired = false;
+    uint32_t failed_msg_id = 0;
+    message_fail_reason failed_reason{};
+    ra.set_on_failed(
+        [&](const endpoint_key &, uint32_t msg_id, uint8_t, uint8_t *, message_fail_reason reason, uint8_t, uint8_t)
         {
-            expired_fallback = true;
-            expired_msg_id = msg_id;
+            failed_fired = true;
+            failed_msg_id = msg_id;
+            failed_reason = reason;
         });
 
     endpoint_key ep{};
@@ -2876,8 +2882,9 @@ static bool test_eviction_falls_back_to_expired()
         ra.process_fragment(ep, 0, fh, data, 50);
     }
 
-    TEST_ASSERT(expired_fallback, "on_expired should fire as fallback when on_evicted is not set");
-    TEST_ASSERT(expired_msg_id == 1, "oldest entry should be evicted");
+    TEST_ASSERT(failed_fired, "on_message_failed should fire on eviction");
+    TEST_ASSERT(failed_msg_id == 1, "oldest entry should be evicted");
+    TEST_ASSERT(failed_reason == message_fail_reason::evicted, "reason should be evicted");
 
     return true;
 }
@@ -2954,12 +2961,12 @@ static bool test_per_connection_reassembler_isolation()
 }
 
 // ============================================================================
-// TEST 60: set_on_message_evicted E2E — server eviction callback
+// TEST 60: set_on_message_failed (evicted) E2E — server eviction callback
 // ============================================================================
 // Fill a connection's reassembler to capacity, then send one more message.
-// Verify on_message_evicted fires via the server API.
+// Verify on_message_failed fires with reason=evicted via the server API.
 
-static bool test_set_on_message_evicted_e2e()
+static bool test_set_on_message_failed_evicted_e2e()
 {
     server srv(9932);
     srv.channels().register_defaults();
@@ -2980,9 +2987,12 @@ static bool test_set_on_message_evicted_e2e()
 
     std::atomic<bool> evicted_fired{false};
     std::atomic<uint32_t> evicted_msg_id{0};
-    srv.set_on_message_evicted(
-        [&](const endpoint_key &, uint32_t msg_id, uint8_t, uint8_t *, uint8_t recv, uint8_t total)
+    srv.set_on_message_failed(
+        [&](const endpoint_key &, uint32_t msg_id, uint8_t, uint8_t *, message_fail_reason reason, uint8_t recv,
+            uint8_t total)
         {
+            if (reason != message_fail_reason::evicted)
+                return;
             evicted_fired.store(true);
             evicted_msg_id.store(msg_id);
         });
@@ -3047,7 +3057,8 @@ static bool test_set_on_message_evicted_e2e()
     while (!evicted_fired.load() && std::chrono::steady_clock::now() < deadline)
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
 
-    TEST_ASSERT(evicted_fired.load(), "on_message_evicted should have fired via server per-connection reassembler");
+    TEST_ASSERT(evicted_fired.load(),
+                "on_message_failed (evicted) should have fired via server per-connection reassembler");
     TEST_ASSERT(evicted_msg_id.load() == 1, "msg_id=1 should be evicted (first, min progress)");
 
     c.disconnect();
@@ -3180,7 +3191,8 @@ static bool test_connection_reset_clears_reassembler()
     std::vector<uint8_t> buf(MAX_FRAGMENT_PAYLOAD * 2, 0);
     ra.set_on_allocate([&](const endpoint_key &, uint32_t, uint8_t, uint8_t, size_t) -> uint8_t *
                        { return buf.data(); });
-    ra.set_on_expired([&](const endpoint_key &, uint32_t, uint8_t, uint8_t *) { expired_count++; });
+    ra.set_on_failed([&](const endpoint_key &, uint32_t, uint8_t, uint8_t *, message_fail_reason, uint8_t, uint8_t)
+                     { expired_count++; });
 
     // Add 3 incomplete messages
     endpoint_key ep{};
@@ -3215,7 +3227,7 @@ static bool test_ordered_simple_delivery()
     std::atomic<bool> stop_flag{false};
 
     // Server echoes every simple packet back on the same channel
-    srv.set_on_packet_received(
+    srv.set_on_client_data_received(
         [&](const packet_header &header, const uint8_t *payload, size_t payload_size, const std::string &addr,
             uint16_t port)
         {
@@ -3247,7 +3259,7 @@ static bool test_ordered_simple_delivery()
     std::vector<uint32_t> echo_order;
     std::atomic<bool> echo_received{false};
 
-    c.set_on_response(
+    c.set_on_data_received(
         [&](const packet_header &, const uint8_t *payload, size_t size)
         {
             if (size >= sizeof(uint32_t))
@@ -3339,7 +3351,8 @@ static bool test_ordered_fragmented_delivery()
             delete[] data;
         });
 
-    srv.set_on_message_expired([&](const endpoint_key &, uint32_t, uint8_t, uint8_t *buf) { delete[] buf; });
+    srv.set_on_message_failed([&](const endpoint_key &, uint32_t, uint8_t, uint8_t *buf, message_fail_reason, uint8_t,
+                                  uint8_t) { delete[] buf; });
 
     TEST_ASSERT(srv.start(), "server should start");
 
@@ -3378,7 +3391,8 @@ static bool test_ordered_fragmented_delivery()
             delete[] data;
         });
 
-    c.set_on_message_expired([&](const endpoint_key &, uint32_t, uint8_t, uint8_t *buf) { delete[] buf; });
+    c.set_on_message_failed([&](const endpoint_key &, uint32_t, uint8_t, uint8_t *buf, message_fail_reason, uint8_t,
+                                uint8_t) { delete[] buf; });
 
     TEST_ASSERT(c.connect(), "client should connect");
 
@@ -3447,7 +3461,7 @@ static bool test_ordered_mixed_delivery()
         });
 
     // Echo simple packets
-    srv.set_on_packet_received(
+    srv.set_on_client_data_received(
         [&](const packet_header &header, const uint8_t *payload, size_t payload_size, const std::string &addr,
             uint16_t port)
         {
@@ -3469,7 +3483,8 @@ static bool test_ordered_mixed_delivery()
             delete[] data;
         });
 
-    srv.set_on_message_expired([&](const endpoint_key &, uint32_t, uint8_t, uint8_t *buf) { delete[] buf; });
+    srv.set_on_message_failed([&](const endpoint_key &, uint32_t, uint8_t, uint8_t *buf, message_fail_reason, uint8_t,
+                                  uint8_t) { delete[] buf; });
 
     TEST_ASSERT(srv.start(), "server should start");
 
@@ -3492,7 +3507,7 @@ static bool test_ordered_mixed_delivery()
     std::vector<uint32_t> echo_order;
     std::atomic<bool> echo_received{false};
 
-    c.set_on_response(
+    c.set_on_data_received(
         [&](const packet_header &hdr, const uint8_t *payload, size_t size)
         {
             if (hdr.channel_id == channels::ORDERED.id && size >= sizeof(uint32_t))
@@ -3520,7 +3535,8 @@ static bool test_ordered_mixed_delivery()
             delete[] data;
         });
 
-    c.set_on_message_expired([&](const endpoint_key &, uint32_t, uint8_t, uint8_t *buf) { delete[] buf; });
+    c.set_on_message_failed([&](const endpoint_key &, uint32_t, uint8_t, uint8_t *buf, message_fail_reason, uint8_t,
+                                uint8_t) { delete[] buf; });
 
     TEST_ASSERT(c.connect(), "client should connect");
 
@@ -3642,7 +3658,7 @@ int main()
     register_test("Reassembly timeout", test_reassembly_timeout);
     register_test("message_id wrap protection", test_message_id_wrap_protection);
     register_test("Scatter-gather E2E", test_scatter_gather_e2e);
-    register_test("set_on_message_expired E2E", test_set_on_message_expired_e2e);
+    register_test("set_on_message_failed (expired) E2E", test_set_on_message_failed_expired_e2e);
 
     // -- Reassembler defense layers --
     register_test("fragment_result all values", test_fragment_result_values);
@@ -3650,9 +3666,9 @@ int main()
     register_test("Reassembler clear()", test_reassembler_clear);
     register_test("Reassembler eviction", test_reassembler_eviction);
     register_test("Eviction picks least progress", test_reassembler_eviction_picks_least);
-    register_test("Eviction falls back on_expired", test_eviction_falls_back_to_expired);
+    register_test("Eviction fires on_message_failed", test_eviction_fires_on_failed);
     register_test("Per-connection reassembler isolation", test_per_connection_reassembler_isolation);
-    register_test("set_on_message_evicted E2E", test_set_on_message_evicted_e2e);
+    register_test("set_on_message_failed (evicted) E2E", test_set_on_message_failed_evicted_e2e);
     register_test("Client backpressure throttle", test_client_backpressure_throttle);
     register_test("Server backpressure throttle", test_server_backpressure_throttle);
     register_test("Connection reset clears reassembler", test_connection_reset_clears_reassembler);
