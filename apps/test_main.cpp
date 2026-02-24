@@ -3200,6 +3200,384 @@ static bool test_connection_reset_clears_reassembler()
     return true;
 }
 
+// ============================================================================
+// TEST: Ordered simple messages delivered in order
+// ============================================================================
+// Sends N simple messages on the RELIABLE_ORDERED channel one at a time,
+// waiting for each echo before sending the next. Verifies the echoes arrive
+// in strict ascending msg_id order.
+// ============================================================================
+
+static bool test_ordered_simple_delivery()
+{
+    server srv(9940);
+    srv.channels().register_defaults();
+    std::atomic<bool> stop_flag{false};
+
+    // Server echoes every simple packet back on the same channel
+    srv.set_on_packet_received(
+        [&](const packet_header &header, const uint8_t *payload, size_t payload_size, const std::string &addr,
+            uint16_t port)
+        {
+            packet_header resp{};
+            resp.flags = header.flags;
+            resp.channel_id = header.channel_id;
+            resp.payload_size = static_cast<uint16_t>(payload_size);
+            srv.send_to(resp, payload, addr, port);
+        });
+
+    TEST_ASSERT(srv.start(), "server should start");
+
+    std::thread server_thread(
+        [&]()
+        {
+            while (!stop_flag.load())
+            {
+                srv.poll();
+                srv.update();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+
+    client c("127.0.0.1", 9940);
+    c.set_verbose(false);
+    c.channels().register_defaults();
+
+    // Track echo arrival order
+    std::vector<uint32_t> echo_order;
+    std::atomic<bool> echo_received{false};
+
+    c.set_on_response(
+        [&](const packet_header &, const uint8_t *payload, size_t size)
+        {
+            if (size >= sizeof(uint32_t))
+            {
+                uint32_t mid;
+                std::memcpy(&mid, payload, sizeof(uint32_t));
+                echo_order.push_back(mid);
+                echo_received = true;
+            }
+        });
+
+    TEST_ASSERT(c.connect(), "client should connect");
+
+    constexpr int NUM_MSGS = 20;
+
+    for (int i = 0; i < NUM_MSGS; ++i)
+    {
+        // Build payload: just the msg_id as first 4 bytes
+        uint32_t msg_id = static_cast<uint32_t>(i);
+        uint8_t payload[8] = {};
+        std::memcpy(payload, &msg_id, sizeof(uint32_t));
+
+        packet_header hdr{};
+        hdr.channel_id = channels::ORDERED.id;
+        hdr.payload_size = sizeof(payload);
+        c.send(hdr, payload);
+
+        // Wait for echo before sending next (ordered gating)
+        echo_received = false;
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (!echo_received.load() && std::chrono::steady_clock::now() < deadline)
+        {
+            c.poll();
+            c.update(nullptr);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        TEST_ASSERT(echo_received.load(), "echo should be received for each ordered message");
+    }
+
+    // Verify ordering: all echoes must be in strict ascending order
+    TEST_ASSERT(static_cast<int>(echo_order.size()) == NUM_MSGS, "should receive all echoes");
+    int violations = 0;
+    for (size_t i = 1; i < echo_order.size(); ++i)
+    {
+        if (echo_order[i] <= echo_order[i - 1])
+            ++violations;
+    }
+    TEST_ASSERT(violations == 0, "ordered echoes must have zero order violations");
+
+    c.disconnect();
+    stop_flag = true;
+    server_thread.join();
+    srv.stop();
+    return true;
+}
+
+// ============================================================================
+// TEST: Ordered fragmented messages delivered in order
+// ============================================================================
+// Sends N fragmented messages on the RELIABLE_ORDERED channel one at a time,
+// waiting for each reassembled echo before sending the next. Verifies
+// the echoes arrive in strict ascending msg_id order.
+// ============================================================================
+
+static bool test_ordered_fragmented_delivery()
+{
+    server srv(9941);
+    srv.channels().register_defaults();
+    std::atomic<bool> stop_flag{false};
+
+    // Server reassembles and echoes back
+    srv.set_on_allocate_message([&](const endpoint_key &, uint32_t, uint8_t, uint8_t, size_t max_size) -> uint8_t *
+                                { return new uint8_t[max_size]; });
+
+    std::string srv_echo_addr;
+    uint16_t srv_echo_port = 0;
+
+    srv.set_on_client_connected(
+        [&](const endpoint_key &, const std::string &addr, uint16_t port)
+        {
+            srv_echo_addr = addr;
+            srv_echo_port = port;
+        });
+
+    srv.set_on_message_complete(
+        [&](const endpoint_key &, uint32_t, uint8_t ch_id, uint8_t *data, size_t total)
+        {
+            srv.send_payload_to(data, total, ch_id, srv_echo_addr, srv_echo_port);
+            delete[] data;
+        });
+
+    srv.set_on_message_expired([&](const endpoint_key &, uint32_t, uint8_t, uint8_t *buf) { delete[] buf; });
+
+    TEST_ASSERT(srv.start(), "server should start");
+
+    std::thread server_thread(
+        [&]()
+        {
+            while (!stop_flag.load())
+            {
+                srv.poll();
+                srv.update();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+
+    client c("127.0.0.1", 9941);
+    c.set_verbose(false);
+    c.channels().register_defaults();
+
+    // Track echo arrival order (from reassembled fragmented echoes)
+    std::vector<uint32_t> echo_order;
+    std::atomic<bool> echo_received{false};
+
+    c.set_on_allocate_message([&](const endpoint_key &, uint32_t, uint8_t, uint8_t, size_t max_size) -> uint8_t *
+                              { return new uint8_t[max_size]; });
+
+    c.set_on_message_complete(
+        [&](const endpoint_key &, uint32_t, uint8_t, uint8_t *data, size_t total_size)
+        {
+            if (total_size >= sizeof(uint32_t))
+            {
+                uint32_t mid;
+                std::memcpy(&mid, data, sizeof(uint32_t));
+                echo_order.push_back(mid);
+                echo_received = true;
+            }
+            delete[] data;
+        });
+
+    c.set_on_message_expired([&](const endpoint_key &, uint32_t, uint8_t, uint8_t *buf) { delete[] buf; });
+
+    TEST_ASSERT(c.connect(), "client should connect");
+
+    constexpr int NUM_MSGS = 10;
+    constexpr size_t FRAG_SIZE = 2500; // > MAX_PAYLOAD_SIZE to trigger fragmentation
+
+    for (int i = 0; i < NUM_MSGS; ++i)
+    {
+        // Build payload: msg_id as first 4 bytes, rest is fill
+        std::vector<uint8_t> buf(FRAG_SIZE, 0xAB);
+        uint32_t msg_id = static_cast<uint32_t>(i);
+        std::memcpy(buf.data(), &msg_id, sizeof(uint32_t));
+
+        c.send_payload(buf.data(), buf.size(), 0, channels::ORDERED.id);
+
+        // Wait for reassembled echo before sending next
+        echo_received = false;
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!echo_received.load() && std::chrono::steady_clock::now() < deadline)
+        {
+            c.poll();
+            c.update(nullptr);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        TEST_ASSERT(echo_received.load(), "fragmented echo should be received for each ordered message");
+    }
+
+    // Verify ordering
+    TEST_ASSERT(static_cast<int>(echo_order.size()) == NUM_MSGS, "should receive all fragmented echoes");
+    int violations = 0;
+    for (size_t i = 1; i < echo_order.size(); ++i)
+    {
+        if (echo_order[i] <= echo_order[i - 1])
+            ++violations;
+    }
+    TEST_ASSERT(violations == 0, "ordered fragmented echoes must have zero order violations");
+
+    c.disconnect();
+    stop_flag = true;
+    server_thread.join();
+    srv.stop();
+    return true;
+}
+
+// ============================================================================
+// TEST: Mixed simple+fragmented ordered messages delivered in order
+// ============================================================================
+// Sends alternating simple and fragmented messages on the RELIABLE_ORDERED
+// channel, one at a time. Verifies the combined echo arrival order is correct.
+// ============================================================================
+
+static bool test_ordered_mixed_delivery()
+{
+    server srv(9942);
+    srv.channels().register_defaults();
+    std::atomic<bool> stop_flag{false};
+
+    std::string srv_echo_addr;
+    uint16_t srv_echo_port = 0;
+
+    srv.set_on_client_connected(
+        [&](const endpoint_key &, const std::string &addr, uint16_t port)
+        {
+            srv_echo_addr = addr;
+            srv_echo_port = port;
+        });
+
+    // Echo simple packets
+    srv.set_on_packet_received(
+        [&](const packet_header &header, const uint8_t *payload, size_t payload_size, const std::string &addr,
+            uint16_t port)
+        {
+            packet_header resp{};
+            resp.flags = header.flags;
+            resp.channel_id = header.channel_id;
+            resp.payload_size = static_cast<uint16_t>(payload_size);
+            srv.send_to(resp, payload, addr, port);
+        });
+
+    // Echo fragmented messages
+    srv.set_on_allocate_message([&](const endpoint_key &, uint32_t, uint8_t, uint8_t, size_t max_size) -> uint8_t *
+                                { return new uint8_t[max_size]; });
+
+    srv.set_on_message_complete(
+        [&](const endpoint_key &, uint32_t, uint8_t ch_id, uint8_t *data, size_t total)
+        {
+            srv.send_payload_to(data, total, ch_id, srv_echo_addr, srv_echo_port);
+            delete[] data;
+        });
+
+    srv.set_on_message_expired([&](const endpoint_key &, uint32_t, uint8_t, uint8_t *buf) { delete[] buf; });
+
+    TEST_ASSERT(srv.start(), "server should start");
+
+    std::thread server_thread(
+        [&]()
+        {
+            while (!stop_flag.load())
+            {
+                srv.poll();
+                srv.update();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+
+    client c("127.0.0.1", 9942);
+    c.set_verbose(false);
+    c.channels().register_defaults();
+
+    // Track combined echo arrival order from both simple and fragmented echoes
+    std::vector<uint32_t> echo_order;
+    std::atomic<bool> echo_received{false};
+
+    c.set_on_response(
+        [&](const packet_header &hdr, const uint8_t *payload, size_t size)
+        {
+            if (hdr.channel_id == channels::ORDERED.id && size >= sizeof(uint32_t))
+            {
+                uint32_t mid;
+                std::memcpy(&mid, payload, sizeof(uint32_t));
+                echo_order.push_back(mid);
+                echo_received = true;
+            }
+        });
+
+    c.set_on_allocate_message([&](const endpoint_key &, uint32_t, uint8_t, uint8_t, size_t max_size) -> uint8_t *
+                              { return new uint8_t[max_size]; });
+
+    c.set_on_message_complete(
+        [&](const endpoint_key &, uint32_t, uint8_t ch_id, uint8_t *data, size_t total_size)
+        {
+            if (ch_id == channels::ORDERED.id && total_size >= sizeof(uint32_t))
+            {
+                uint32_t mid;
+                std::memcpy(&mid, data, sizeof(uint32_t));
+                echo_order.push_back(mid);
+                echo_received = true;
+            }
+            delete[] data;
+        });
+
+    c.set_on_message_expired([&](const endpoint_key &, uint32_t, uint8_t, uint8_t *buf) { delete[] buf; });
+
+    TEST_ASSERT(c.connect(), "client should connect");
+
+    // Interleave: simple(0), frag(1), simple(2), frag(3), simple(4), ...
+    constexpr int NUM_MSGS = 12;
+    constexpr size_t FRAG_SIZE = 2500;
+
+    for (int i = 0; i < NUM_MSGS; ++i)
+    {
+        bool use_frag = (i % 2 == 1);
+        uint32_t msg_id = static_cast<uint32_t>(i);
+
+        if (use_frag)
+        {
+            std::vector<uint8_t> buf(FRAG_SIZE, 0xCD);
+            std::memcpy(buf.data(), &msg_id, sizeof(uint32_t));
+            c.send_payload(buf.data(), buf.size(), 0, channels::ORDERED.id);
+        }
+        else
+        {
+            uint8_t payload[8] = {};
+            std::memcpy(payload, &msg_id, sizeof(uint32_t));
+            packet_header hdr{};
+            hdr.channel_id = channels::ORDERED.id;
+            hdr.payload_size = sizeof(payload);
+            c.send(hdr, payload);
+        }
+
+        // Wait for echo before sending next
+        echo_received = false;
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!echo_received.load() && std::chrono::steady_clock::now() < deadline)
+        {
+            c.poll();
+            c.update(nullptr);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        TEST_ASSERT(echo_received.load(), "echo should arrive for each mixed ordered message");
+    }
+
+    // Verify combined ordering
+    TEST_ASSERT(static_cast<int>(echo_order.size()) == NUM_MSGS, "should receive all mixed echoes");
+    int violations = 0;
+    for (size_t i = 1; i < echo_order.size(); ++i)
+    {
+        if (echo_order[i] <= echo_order[i - 1])
+            ++violations;
+    }
+    TEST_ASSERT(violations == 0, "mixed ordered echoes must have zero order violations");
+
+    c.disconnect();
+    stop_flag = true;
+    server_thread.join();
+    srv.stop();
+    return true;
+}
+
 int main()
 {
     platform_init();
@@ -3278,6 +3656,11 @@ int main()
     register_test("Client backpressure throttle", test_client_backpressure_throttle);
     register_test("Server backpressure throttle", test_server_backpressure_throttle);
     register_test("Connection reset clears reassembler", test_connection_reset_clears_reassembler);
+
+    // -- Ordered delivery --
+    register_test("Ordered simple delivery", test_ordered_simple_delivery);
+    register_test("Ordered fragmented delivery", test_ordered_fragmented_delivery);
+    register_test("Ordered mixed delivery", test_ordered_mixed_delivery);
 
     std::cout << "========================================" << std::endl;
     std::cout << " Entanglement Test Battery" << std::endl;

@@ -2,7 +2,7 @@
 // Entanglement — Soak Test Client v4.0  (Simple + Fragmented, Full Retransmit)
 // ============================================================================
 //
-// Usage: EntanglementClient [-s ip] [-p port] [-t min] [-c clients] [-d drop%]
+// Usage: EntanglementClient [-s ip] [-p port] [-t min] [-c clients] [-d drop%] [-m modes]
 //
 // Sends both SIMPLE (9-byte) and FRAGMENTED (2500-byte) messages on all
 // three default channels, giving 6 independent streams:
@@ -165,7 +165,8 @@ static void build_frag_payload(std::vector<uint8_t> &buf, uint32_t msg_id, uint3
 // ============================================================================
 // Single client soak test run
 // ============================================================================
-static client_result run_client(int id, const char *server_ip, uint16_t port, int duration_seconds, double drop_rate)
+static client_result run_client(int id, const char *server_ip, uint16_t port, int duration_seconds, double drop_rate,
+                                bool enable_reliable, bool enable_ordered, bool enable_unreliable)
 {
     client_result result;
     result.id = id;
@@ -212,6 +213,10 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
     std::unordered_map<uint64_t, int> frag_retries;
     constexpr int MAX_FRAG_RETRIES = 10;
 
+    // --- Ordered channel gating (one message in flight at a time) ---
+    bool ordered_simple_pending = false;
+    bool ordered_frag_pending = false;
+
     client cli(server_ip, port);
     cli.set_verbose(false);
     cli.channels().register_defaults();
@@ -236,6 +241,10 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
                 auto it = simple_idx.find(msg.channel_id);
                 if (it != simple_idx.end())
                     result.streams[it->second].record_echo(msg.msg_id);
+
+                // Ordered gating: unblock next send on this ordered channel
+                if (msg.channel_id == channels::ORDERED.id)
+                    ordered_simple_pending = false;
             }
             ++result.total_simple_echoes;
         });
@@ -256,6 +265,10 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
                 auto it = frag_idx.find(msg.channel_id);
                 if (it != frag_idx.end())
                     result.streams[it->second].record_echo(msg.msg_id);
+
+                // Ordered gating: unblock next fragmented send on this ordered channel
+                if (msg.channel_id == channels::ORDERED.id)
+                    ordered_frag_pending = false;
             }
             ++result.total_frag_echoes;
             delete[] data;
@@ -380,6 +393,7 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
     auto last_progress = t_start;
     constexpr auto PROGRESS_INTERVAL = std::chrono::seconds(10);
     int cycle = 0;
+    const bool ch_enabled[3] = {enable_reliable, enable_ordered, enable_unreliable};
 
     // Stream rotation: cycle through 6 streams one message at a time.
     // 0=simple-rel, 1=frag-rel, 2=simple-ord, 3=frag-ord, 4=simple-unr, 5=frag-unr
@@ -410,7 +424,18 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
         bool send_simple = (stream % 2 == 0); // even=simple, odd=frag
         ++cycle;
 
+        // Skip disabled channel types
+        if (!ch_enabled[ch_index])
+            continue;
+
         uint8_t ch_id = ch_ids[ch_index];
+
+        // Ordered gating: skip if previous ordered message is still pending echo
+        if (ch_id == channels::ORDERED.id)
+        {
+            if ((send_simple && ordered_simple_pending) || (!send_simple && ordered_frag_pending))
+                continue; // cycle advanced — poll/update will run next iteration
+        }
 
         if (send_simple)
         {
@@ -431,6 +456,10 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
             auto sit = simple_idx.find(ch_id);
             if (sit != simple_idx.end())
                 ++result.streams[sit->second].total_packets;
+
+            // Mark ordered channel as pending (wait for echo before sending next)
+            if (ch_id == channels::ORDERED.id)
+                ordered_simple_pending = true;
 
             ++simple_sent[ch_index];
             ++result.total_data_packets_sent;
@@ -454,6 +483,10 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
                 // Store payload for potential fragment retransmission
                 if (lib_message_id != 0)
                     frag_payloads[lib_message_id] = frag_buf;
+
+                // Mark ordered channel as pending (wait for echo before sending next)
+                if (ch_id == channels::ORDERED.id)
+                    ordered_frag_pending = true;
 
                 ++frag_sent[ch_index];
                 // Each fragmented message generates ceil(2500/1160)=3 packets
@@ -499,8 +532,11 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
     }
 
     // --- Drain echoes + detect remaining losses ---
-    int expected_reliable = result.streams[S_REL].messages_sent + result.streams[S_ORD].messages_sent +
-                            result.streams[F_REL].messages_sent + result.streams[F_ORD].messages_sent;
+    int expected_reliable = 0;
+    if (enable_reliable)
+        expected_reliable += result.streams[S_REL].messages_sent + result.streams[F_REL].messages_sent;
+    if (enable_ordered)
+        expected_reliable += result.streams[S_ORD].messages_sent + result.streams[F_ORD].messages_sent;
 
     auto drain_start = std::chrono::steady_clock::now();
     constexpr auto MAX_DRAIN = std::chrono::seconds(20);
@@ -514,8 +550,11 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
         if (now - drain_start > MAX_DRAIN)
             break;
 
-        int confirmed = result.streams[S_REL].echoes_received + result.streams[S_ORD].echoes_received +
-                        result.streams[F_REL].echoes_received + result.streams[F_ORD].echoes_received;
+        int confirmed = 0;
+        if (enable_reliable)
+            confirmed += result.streams[S_REL].echoes_received + result.streams[F_REL].echoes_received;
+        if (enable_ordered)
+            confirmed += result.streams[S_ORD].echoes_received + result.streams[F_ORD].echoes_received;
         if (confirmed >= expected_reliable)
         {
             // Give a bit more time for remaining echoes
@@ -639,6 +678,9 @@ int main(int argc, char *argv[])
     int duration_minutes = 1;
     int num_clients = 1;
     double drop_rate = 0.0;
+    bool enable_reliable = true;
+    bool enable_ordered = true;
+    bool enable_unreliable = true;
 
     // --- Parse args ---
     for (int i = 1; i < argc; ++i)
@@ -671,21 +713,37 @@ int main(int argc, char *argv[])
             if (drop_rate > 1.0)
                 drop_rate = 1.0;
         }
+        else if ((std::strcmp(argv[i], "-m") == 0 || std::strcmp(argv[i], "--modes") == 0) && i + 1 < argc)
+        {
+            enable_reliable = enable_ordered = enable_unreliable = false;
+            std::string modes = argv[++i];
+            for (char c : modes)
+            {
+                if (c == 'r' || c == 'R')
+                    enable_reliable = true;
+                else if (c == 'o' || c == 'O')
+                    enable_ordered = true;
+                else if (c == 'u' || c == 'U')
+                    enable_unreliable = true;
+            }
+        }
         else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0)
         {
-            std::cout << "Usage: EntanglementClient [-s ip] [-p port] [-t minutes] [-c clients] [-d drop%]"
+            std::cout << "Usage: EntanglementClient [-s ip] [-p port] [-t minutes] [-c clients] [-d drop%] [-m modes]"
                       << std::endl;
             std::cout << "  -s, --server   Server IP (default: 127.0.0.1)" << std::endl;
             std::cout << "  -p, --port     Server port (default: " << DEFAULT_PORT << ")" << std::endl;
             std::cout << "  -t, --time     Duration in minutes (default: 1)" << std::endl;
             std::cout << "  -c, --clients  Number of clients (default: 1)" << std::endl;
             std::cout << "  -d, --drop     Simulated drop rate in percent (default: 0)" << std::endl;
+            std::cout << "  -m, --modes    Channel modes to test: r=reliable, o=ordered, u=unreliable" << std::endl;
+            std::cout << "                 Comma-separated (default: r,o,u = all)" << std::endl;
             return 0;
         }
         else
         {
             std::cerr << "Unknown argument: " << argv[i] << std::endl;
-            std::cerr << "Usage: EntanglementClient [-s ip] [-p port] [-t minutes] [-c clients] [-d drop%]"
+            std::cerr << "Usage: EntanglementClient [-s ip] [-p port] [-t minutes] [-c clients] [-d drop%] [-m modes]"
                       << std::endl;
             return 1;
         }
@@ -698,7 +756,15 @@ int main(int argc, char *argv[])
     std::cout << " Server:    " << server_ip << ":" << server_port << std::endl;
     std::cout << " Duration:  " << duration_minutes << " min (" << duration_seconds << "s)" << std::endl;
     std::cout << " Clients:   " << num_clients << std::endl;
-    std::cout << " Streams:   6 (3 simple + 3 fragmented)" << std::endl;
+    int num_modes = (int)enable_reliable + (int)enable_ordered + (int)enable_unreliable;
+    std::cout << " Modes:     ";
+    if (enable_reliable)
+        std::cout << "reliable ";
+    if (enable_ordered)
+        std::cout << "ordered ";
+    if (enable_unreliable)
+        std::cout << "unreliable ";
+    std::cout << "(" << num_modes << " modes, " << (num_modes * 2) << " streams)" << std::endl;
     std::cout << " Simple payload:  " << SOAK_MSG_SIZE << " bytes" << std::endl;
     std::cout << " Frag payload:    " << FRAG_PAYLOAD_SIZE << " bytes (~"
               << ((FRAG_PAYLOAD_SIZE + MAX_FRAGMENT_PAYLOAD - 1) / MAX_FRAGMENT_PAYLOAD) << " fragments)" << std::endl;
@@ -715,8 +781,13 @@ int main(int argc, char *argv[])
 
     for (int i = 0; i < num_clients; ++i)
     {
-        threads.emplace_back([&results, i, server_ip, server_port, duration_seconds, drop_rate]()
-                             { results[i] = run_client(i, server_ip, server_port, duration_seconds, drop_rate); });
+        threads.emplace_back(
+            [&results, i, server_ip, server_port, duration_seconds, drop_rate, enable_reliable, enable_ordered,
+             enable_unreliable]()
+            {
+                results[i] = run_client(i, server_ip, server_port, duration_seconds, drop_rate, enable_reliable,
+                                        enable_ordered, enable_unreliable);
+            });
     }
 
     for (auto &t : threads)
@@ -741,6 +812,7 @@ int main(int argc, char *argv[])
 
     // Per-stream aggregates: [0..5] same order as result.streams
     int64_t agg_stream_sent[6] = {}, agg_stream_echo[6] = {}, agg_stream_violations[6] = {};
+    const bool ch_enabled[3] = {enable_reliable, enable_ordered, enable_unreliable};
 
     for (auto &r : results)
     {
@@ -773,6 +845,8 @@ int main(int argc, char *argv[])
 
         for (int s = 0; s < 6; ++s)
         {
+            if (!ch_enabled[s % 3])
+                continue;
             print_stream(r.streams[s]);
             agg_stream_sent[s] += r.streams[s].messages_sent;
             agg_stream_echo[s] += r.streams[s].echoes_received;
@@ -798,22 +872,32 @@ int main(int argc, char *argv[])
     std::cout << "  Losses:                " << agg_losses << std::endl;
     std::cout << std::endl;
     std::cout << "  --- Simple Streams ---" << std::endl;
-    std::cout << "  Reliable:              " << agg_stream_echo[S_REL] << " / " << agg_stream_sent[S_REL] << " ("
-              << fmt_pct(agg_stream_echo[S_REL], agg_stream_sent[S_REL]) << ")" << std::endl;
-    std::cout << "  Ordered:               " << agg_stream_echo[S_ORD] << " / " << agg_stream_sent[S_ORD] << " ("
-              << fmt_pct(agg_stream_echo[S_ORD], agg_stream_sent[S_ORD]) << ")" << std::endl;
-    std::cout << "  Ord. violations:       " << agg_stream_violations[S_ORD] << std::endl;
-    std::cout << "  Unreliable:            " << agg_stream_echo[S_UNR] << " / " << agg_stream_sent[S_UNR] << " ("
-              << fmt_pct(agg_stream_echo[S_UNR], agg_stream_sent[S_UNR]) << ")" << std::endl;
+    if (enable_reliable)
+        std::cout << "  Reliable:              " << agg_stream_echo[S_REL] << " / " << agg_stream_sent[S_REL] << " ("
+                  << fmt_pct(agg_stream_echo[S_REL], agg_stream_sent[S_REL]) << ")" << std::endl;
+    if (enable_ordered)
+    {
+        std::cout << "  Ordered:               " << agg_stream_echo[S_ORD] << " / " << agg_stream_sent[S_ORD] << " ("
+                  << fmt_pct(agg_stream_echo[S_ORD], agg_stream_sent[S_ORD]) << ")" << std::endl;
+        std::cout << "  Ord. violations:       " << agg_stream_violations[S_ORD] << std::endl;
+    }
+    if (enable_unreliable)
+        std::cout << "  Unreliable:            " << agg_stream_echo[S_UNR] << " / " << agg_stream_sent[S_UNR] << " ("
+                  << fmt_pct(agg_stream_echo[S_UNR], agg_stream_sent[S_UNR]) << ")" << std::endl;
     std::cout << std::endl;
     std::cout << "  --- Fragmented Streams ---" << std::endl;
-    std::cout << "  Reliable:              " << agg_stream_echo[F_REL] << " / " << agg_stream_sent[F_REL] << " ("
-              << fmt_pct(agg_stream_echo[F_REL], agg_stream_sent[F_REL]) << ")" << std::endl;
-    std::cout << "  Ordered:               " << agg_stream_echo[F_ORD] << " / " << agg_stream_sent[F_ORD] << " ("
-              << fmt_pct(agg_stream_echo[F_ORD], agg_stream_sent[F_ORD]) << ")" << std::endl;
-    std::cout << "  Ord. violations:       " << agg_stream_violations[F_ORD] << std::endl;
-    std::cout << "  Unreliable:            " << agg_stream_echo[F_UNR] << " / " << agg_stream_sent[F_UNR] << " ("
-              << fmt_pct(agg_stream_echo[F_UNR], agg_stream_sent[F_UNR]) << ")" << std::endl;
+    if (enable_reliable)
+        std::cout << "  Reliable:              " << agg_stream_echo[F_REL] << " / " << agg_stream_sent[F_REL] << " ("
+                  << fmt_pct(agg_stream_echo[F_REL], agg_stream_sent[F_REL]) << ")" << std::endl;
+    if (enable_ordered)
+    {
+        std::cout << "  Ordered:               " << agg_stream_echo[F_ORD] << " / " << agg_stream_sent[F_ORD] << " ("
+                  << fmt_pct(agg_stream_echo[F_ORD], agg_stream_sent[F_ORD]) << ")" << std::endl;
+        std::cout << "  Ord. violations:       " << agg_stream_violations[F_ORD] << std::endl;
+    }
+    if (enable_unreliable)
+        std::cout << "  Unreliable:            " << agg_stream_echo[F_UNR] << " / " << agg_stream_sent[F_UNR] << " ("
+                  << fmt_pct(agg_stream_echo[F_UNR], agg_stream_sent[F_UNR]) << ")" << std::endl;
 
     if (global_elapsed.count() > 0)
     {
@@ -824,50 +908,94 @@ int main(int argc, char *argv[])
     // --- Verdicts ---
     std::cout << "\n=============================================\n" << std::endl;
 
+    bool all_pass = true;
+
     // Simple verdicts
-    int64_t simple_rel_sent = agg_stream_sent[S_REL] + agg_stream_sent[S_ORD];
-    int64_t simple_rel_echo = agg_stream_echo[S_REL] + agg_stream_echo[S_ORD];
-    bool simple_rel_pass = (simple_rel_echo == simple_rel_sent);
-    bool simple_ord_pass = (agg_stream_violations[S_ORD] == 0);
+    if (enable_reliable || enable_ordered)
+    {
+        int64_t simple_rel_sent = 0, simple_rel_echo = 0;
+        if (enable_reliable)
+        {
+            simple_rel_sent += agg_stream_sent[S_REL];
+            simple_rel_echo += agg_stream_echo[S_REL];
+        }
+        if (enable_ordered)
+        {
+            simple_rel_sent += agg_stream_sent[S_ORD];
+            simple_rel_echo += agg_stream_echo[S_ORD];
+        }
+        bool simple_rel_pass = (simple_rel_echo == simple_rel_sent);
+        if (!simple_rel_pass)
+            all_pass = false;
 
-    if (simple_rel_pass)
-        std::cout << "  SIMPLE RELIABLE DELIVERED:                [PASS]" << std::endl;
-    else
-        std::cout << "  SIMPLE RELIABLE DELIVERED:                [FAIL] (" << (simple_rel_sent - simple_rel_echo)
-                  << " missing)" << std::endl;
+        if (simple_rel_pass)
+            std::cout << "  SIMPLE RELIABLE DELIVERED:                [PASS]" << std::endl;
+        else
+            std::cout << "  SIMPLE RELIABLE DELIVERED:                [FAIL] (" << (simple_rel_sent - simple_rel_echo)
+                      << " missing)" << std::endl;
+    }
 
-    if (simple_rel_pass && simple_ord_pass)
-        std::cout << "  SIMPLE ORDERED DELIVERY + ORDER:          [PASS]" << std::endl;
-    else if (!simple_ord_pass)
-        std::cout << "  SIMPLE ORDERED DELIVERY + ORDER:          [FAIL] (" << agg_stream_violations[S_ORD]
-                  << " violations)" << std::endl;
+    if (enable_ordered)
+    {
+        bool simple_ord_pass = (agg_stream_violations[S_ORD] == 0);
+        if (!simple_ord_pass)
+            all_pass = false;
 
-    std::cout << "  SIMPLE UNRELIABLE DELIVERY:               "
-              << fmt_pct(agg_stream_echo[S_UNR], agg_stream_sent[S_UNR]) << std::endl;
+        if (simple_ord_pass)
+            std::cout << "  SIMPLE ORDERED DELIVERY + ORDER:          [PASS]" << std::endl;
+        else
+            std::cout << "  SIMPLE ORDERED DELIVERY + ORDER:          [FAIL] (" << agg_stream_violations[S_ORD]
+                      << " violations)" << std::endl;
+    }
 
-    // Frag verdicts (with retransmission — same standard as simple)
-    int64_t frag_rel_sent = agg_stream_sent[F_REL] + agg_stream_sent[F_ORD];
-    int64_t frag_rel_echo = agg_stream_echo[F_REL] + agg_stream_echo[F_ORD];
-    bool frag_rel_pass = (frag_rel_echo == frag_rel_sent);
-    bool frag_ord_pass = (agg_stream_violations[F_ORD] == 0);
+    if (enable_unreliable)
+        std::cout << "  SIMPLE UNRELIABLE DELIVERY:               "
+                  << fmt_pct(agg_stream_echo[S_UNR], agg_stream_sent[S_UNR]) << std::endl;
 
-    if (frag_rel_pass)
-        std::cout << "  FRAG RELIABLE DELIVERED:                 [PASS]" << std::endl;
-    else
-        std::cout << "  FRAG RELIABLE DELIVERED:                 [FAIL] (" << (frag_rel_sent - frag_rel_echo)
-                  << " missing)" << std::endl;
+    // Frag verdicts
+    if (enable_reliable || enable_ordered)
+    {
+        int64_t frag_rel_sent = 0, frag_rel_echo = 0;
+        if (enable_reliable)
+        {
+            frag_rel_sent += agg_stream_sent[F_REL];
+            frag_rel_echo += agg_stream_echo[F_REL];
+        }
+        if (enable_ordered)
+        {
+            frag_rel_sent += agg_stream_sent[F_ORD];
+            frag_rel_echo += agg_stream_echo[F_ORD];
+        }
+        bool frag_rel_pass = (frag_rel_echo == frag_rel_sent);
+        if (!frag_rel_pass)
+            all_pass = false;
 
-    if (frag_ord_pass)
-        std::cout << "  FRAG ORDERED INTACT:                     [PASS]" << std::endl;
-    else
-        std::cout << "  FRAG ORDERED INTACT:                     [FAIL] (" << agg_stream_violations[F_ORD]
-                  << " violations)" << std::endl;
+        if (frag_rel_pass)
+            std::cout << "  FRAG RELIABLE DELIVERED:                 [PASS]" << std::endl;
+        else
+            std::cout << "  FRAG RELIABLE DELIVERED:                 [FAIL] (" << (frag_rel_sent - frag_rel_echo)
+                      << " missing)" << std::endl;
+    }
 
-    std::cout << "  FRAG UNRELIABLE DELIVERY:                "
-              << fmt_pct(agg_stream_echo[F_UNR], agg_stream_sent[F_UNR]) << std::endl;
+    if (enable_ordered)
+    {
+        bool frag_ord_pass = (agg_stream_violations[F_ORD] == 0);
+        if (!frag_ord_pass)
+            all_pass = false;
+
+        if (frag_ord_pass)
+            std::cout << "  FRAG ORDERED INTACT:                     [PASS]" << std::endl;
+        else
+            std::cout << "  FRAG ORDERED INTACT:                     [FAIL] (" << agg_stream_violations[F_ORD]
+                      << " violations)" << std::endl;
+    }
+
+    if (enable_unreliable)
+        std::cout << "  FRAG UNRELIABLE DELIVERY:                "
+                  << fmt_pct(agg_stream_echo[F_UNR], agg_stream_sent[F_UNR]) << std::endl;
 
     std::cout << "\n=============================================" << std::endl;
 
     platform_shutdown();
-    return (simple_rel_pass && simple_ord_pass && frag_rel_pass && frag_ord_pass) ? 0 : 1;
+    return all_pass ? 0 : 1;
 }
