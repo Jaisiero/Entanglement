@@ -36,3 +36,6 @@ target_link_libraries(EntanglementClient PRIVATE entanglement_core)
 
 add_executable(EntanglementTests apps/test_main.cpp)
 target_link_libraries(EntanglementTests PRIVATE entanglement_core)
+
+add_executable(EntanglementChurnTest apps/churn_test_main.cpp)
+target_link_libraries(EntanglementChurnTest PRIVATE entanglement_core)

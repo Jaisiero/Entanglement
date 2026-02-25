@@ -16,6 +16,7 @@
 #include <cstring>
 #include <functional>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -3594,6 +3595,560 @@ static bool test_ordered_mixed_delivery()
     return true;
 }
 
+// ============================================================================
+// TEST: Server start / stop / restart cycle
+// ============================================================================
+// Start a server, stop it, start it again on the same port. Verify a client
+// can connect after the restart and exchange data.
+// ============================================================================
+
+static bool test_server_start_stop_restart()
+{
+    server srv(9950);
+    srv.set_verbose(false);
+
+    // First start
+    TEST_ASSERT(succeeded(srv.start()), "first start should succeed");
+    TEST_ASSERT(srv.is_running(), "server should be running after start");
+
+    // Stop
+    srv.stop();
+    TEST_ASSERT(!srv.is_running(), "server should NOT be running after stop");
+
+    // Small pause for OS to release socket
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    // Restart on the same port
+    TEST_ASSERT(succeeded(srv.start()), "restart should succeed on same port");
+    TEST_ASSERT(srv.is_running(), "server should be running after restart");
+
+    // Run a server loop, connect a client, send+echo
+    std::atomic<bool> stop_flag{false};
+    std::atomic<int> echoes{0};
+
+    srv.set_on_client_data_received(
+        [&](const packet_header &header, const uint8_t *payload, size_t payload_size, const std::string &addr,
+            uint16_t port)
+        {
+            packet_header resp{};
+            resp.flags = header.flags;
+            resp.payload_size = static_cast<uint16_t>(payload_size);
+            srv.send_to(resp, payload, addr, port);
+        });
+
+    std::thread server_thread(
+        [&]()
+        {
+            while (!stop_flag.load())
+            {
+                srv.poll();
+                srv.update();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+
+    client c("127.0.0.1", 9950);
+    c.set_verbose(false);
+    c.set_on_data_received([&](const packet_header &, const uint8_t *, size_t) { echoes++; });
+
+    TEST_ASSERT(succeeded(c.connect()), "client should connect to restarted server");
+    c.send_payload("RESTART", 7);
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (echoes.load() == 0 && std::chrono::steady_clock::now() < deadline)
+    {
+        c.poll();
+        c.update(nullptr);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    TEST_ASSERT(echoes.load() >= 1, "should receive echo after restart");
+
+    c.disconnect();
+    stop_flag = true;
+    server_thread.join();
+    srv.stop();
+    return true;
+}
+
+// ============================================================================
+// TEST: Server disconnect_client forces a specific client off
+// ============================================================================
+// Connect 3 clients, server calls disconnect_client on the second one.
+// Verify connection_count drops and only the targeted client is removed.
+// ============================================================================
+
+static bool test_server_disconnect_client()
+{
+    server srv(9951);
+    srv.set_verbose(false);
+    srv.channels().register_defaults();
+
+    std::atomic<bool> stop_flag{false};
+    std::vector<endpoint_key> connected_keys;
+    std::mutex key_mutex;
+
+    srv.set_on_client_connected(
+        [&](const endpoint_key &key, const std::string &, uint16_t)
+        {
+            std::lock_guard<std::mutex> lk(key_mutex);
+            connected_keys.push_back(key);
+        });
+
+    TEST_ASSERT(succeeded(srv.start()), "server should start");
+
+    std::thread server_thread(
+        [&]()
+        {
+            while (!stop_flag.load())
+            {
+                srv.poll();
+                srv.update();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+
+    // Connect 3 clients
+    client c1("127.0.0.1", 9951), c2("127.0.0.1", 9951), c3("127.0.0.1", 9951);
+    c1.set_verbose(false);
+    c2.set_verbose(false);
+    c3.set_verbose(false);
+    TEST_ASSERT(succeeded(c1.connect()), "c1 should connect");
+    TEST_ASSERT(succeeded(c2.connect()), "c2 should connect");
+    TEST_ASSERT(succeeded(c3.connect()), "c3 should connect");
+
+    // Wait for server to register all 3
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (srv.connection_count() < 3 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    TEST_ASSERT(srv.connection_count() == 3, "server should have 3 connections");
+
+    // Disconnect the second client via server API
+    endpoint_key target;
+    {
+        std::lock_guard<std::mutex> lk(key_mutex);
+        TEST_ASSERT(connected_keys.size() == 3, "should have 3 keys");
+        target = connected_keys[1];
+    }
+    srv.disconnect_client(target);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    TEST_ASSERT(srv.connection_count() == 2, "server should have 2 connections after disconnect_client");
+
+    c1.disconnect();
+    c2.disconnect();
+    c3.disconnect();
+    stop_flag = true;
+    server_thread.join();
+    srv.stop();
+    return true;
+}
+
+// ============================================================================
+// TEST: Server disconnect_all removes every connection
+// ============================================================================
+// Connect multiple clients, call disconnect_all, verify pool is emptied.
+// ============================================================================
+
+static bool test_server_disconnect_all()
+{
+    server srv(9952);
+    srv.set_verbose(false);
+
+    std::atomic<bool> stop_flag{false};
+
+    TEST_ASSERT(succeeded(srv.start()), "server should start");
+
+    std::thread server_thread(
+        [&]()
+        {
+            while (!stop_flag.load())
+            {
+                srv.poll();
+                srv.update();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+
+    // Connect 4 clients
+    constexpr int N = 4;
+    std::vector<std::unique_ptr<client>> clients;
+    for (int i = 0; i < N; ++i)
+    {
+        auto c = std::make_unique<client>("127.0.0.1", 9952);
+        c->set_verbose(false);
+        TEST_ASSERT(succeeded(c->connect()), ("client " + std::to_string(i) + " should connect").c_str());
+        clients.push_back(std::move(c));
+    }
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (srv.connection_count() < N && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    TEST_ASSERT(srv.connection_count() == static_cast<size_t>(N), "server should have N connections");
+
+    // disconnect_all
+    srv.disconnect_all();
+    TEST_ASSERT(srv.connection_count() == 0, "server should have 0 connections after disconnect_all");
+
+    for (auto &c : clients)
+        c->disconnect();
+    clients.clear();
+
+    stop_flag = true;
+    server_thread.join();
+    srv.stop();
+    return true;
+}
+
+// ============================================================================
+// TEST: Client reconnects after clean disconnect
+// ============================================================================
+// Client connects, exchanges data, disconnects, then reconnects to the same
+// server and exchanges data again.
+// ============================================================================
+
+static bool test_reconnect_after_disconnect()
+{
+    test_server_ctx ctx(9953);
+    ctx.srv.set_verbose(false);
+
+    std::atomic<int> server_data_count{0};
+    ctx.srv.set_on_client_data_received(
+        [&](const packet_header &, const uint8_t *, size_t, const std::string &, uint16_t) { server_data_count++; });
+
+    TEST_ASSERT(ctx.start(), "server should start");
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    // First connection
+    {
+        client c("127.0.0.1", 9953);
+        c.set_verbose(false);
+        TEST_ASSERT(succeeded(c.connect()), "first connect should succeed");
+        c.send_payload("HI1", 3);
+
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (server_data_count.load() == 0 && std::chrono::steady_clock::now() < deadline)
+        {
+            c.poll();
+            c.update(nullptr);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        TEST_ASSERT(server_data_count.load() >= 1, "server should receive data on first connection");
+        c.disconnect();
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    int count_after_first = server_data_count.load();
+
+    // Second connection (same server)
+    {
+        client c("127.0.0.1", 9953);
+        c.set_verbose(false);
+        TEST_ASSERT(succeeded(c.connect()), "reconnect should succeed");
+        c.send_payload("HI2", 3);
+
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (server_data_count.load() == count_after_first && std::chrono::steady_clock::now() < deadline)
+        {
+            c.poll();
+            c.update(nullptr);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        TEST_ASSERT(server_data_count.load() > count_after_first,
+                     "server should receive data on second connection");
+        c.disconnect();
+    }
+
+    return true;
+}
+
+// ============================================================================
+// TEST: Reconnect reuses the freed pool slot
+// ============================================================================
+// A client connects, the server sees the connection. Client disconnects,
+// server processes it. A new client connects — the server should reuse
+// the freed slot (connection_count stays at 1, not 2).
+// ============================================================================
+
+static bool test_reconnect_slot_reuse()
+{
+    server srv(9954);
+    srv.set_verbose(false);
+    std::atomic<bool> stop_flag{false};
+    std::atomic<int> connect_count{0};
+    std::atomic<int> disconnect_count{0};
+
+    srv.set_on_client_connected([&](const endpoint_key &, const std::string &, uint16_t) { connect_count++; });
+    srv.set_on_client_disconnected([&](const endpoint_key &, const std::string &, uint16_t) { disconnect_count++; });
+
+    TEST_ASSERT(succeeded(srv.start()), "server should start");
+
+    std::thread server_thread(
+        [&]()
+        {
+            while (!stop_flag.load())
+            {
+                srv.poll();
+                srv.update();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+
+    // First client connects and disconnects
+    {
+        client c("127.0.0.1", 9954);
+        c.set_verbose(false);
+        TEST_ASSERT(succeeded(c.connect()), "first connect should succeed");
+
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (connect_count.load() < 1 && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        TEST_ASSERT(srv.connection_count() == 1, "should have 1 connection");
+
+        c.disconnect();
+    }
+
+    // Wait for server to process disconnect
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (disconnect_count.load() < 1 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    TEST_ASSERT(srv.connection_count() == 0, "should have 0 after disconnect");
+
+    // Second client connects — should reuse the freed slot
+    {
+        client c("127.0.0.1", 9954);
+        c.set_verbose(false);
+        TEST_ASSERT(succeeded(c.connect()), "second connect should succeed");
+
+        deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (connect_count.load() < 2 && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        TEST_ASSERT(srv.connection_count() == 1, "should have 1 connection (slot reused)");
+        TEST_ASSERT(connect_count.load() == 2, "should have had 2 total connections");
+
+        c.disconnect();
+    }
+
+    stop_flag = true;
+    server_thread.join();
+    srv.stop();
+    return true;
+}
+
+// ============================================================================
+// TEST: Zero-length payload
+// ============================================================================
+// Sends a 0-byte payload from client to server. The server must receive
+// the packet without crashing (payload_size == 0).
+// ============================================================================
+
+static bool test_zero_length_payload()
+{
+    server srv(9955);
+    srv.set_verbose(false);
+    std::atomic<bool> stop_flag{false};
+    std::atomic<int> data_received{0};
+    std::atomic<uint16_t> last_payload_size{9999};
+
+    srv.set_on_client_data_received(
+        [&](const packet_header &header, const uint8_t *, size_t payload_size, const std::string &, uint16_t)
+        {
+            last_payload_size = static_cast<uint16_t>(payload_size);
+            data_received++;
+        });
+
+    TEST_ASSERT(succeeded(srv.start()), "server should start");
+
+    std::thread server_thread(
+        [&]()
+        {
+            while (!stop_flag.load())
+            {
+                srv.poll();
+                srv.update();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+
+    client c("127.0.0.1", 9955);
+    c.set_verbose(false);
+    TEST_ASSERT(succeeded(c.connect()), "client should connect");
+
+    // Send zero-length payload via send() with empty body
+    packet_header hdr{};
+    hdr.payload_size = 0;
+    c.send(hdr, nullptr);
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (data_received.load() == 0 && std::chrono::steady_clock::now() < deadline)
+    {
+        c.poll();
+        c.update(nullptr);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    TEST_ASSERT(data_received.load() >= 1, "server should receive the zero-length packet");
+    TEST_ASSERT(last_payload_size.load() == 0, "payload_size should be 0");
+
+    c.disconnect();
+    stop_flag = true;
+    server_thread.join();
+    srv.stop();
+    return true;
+}
+
+// ============================================================================
+// TEST: Exact MAX_PAYLOAD_SIZE boundary (no fragmentation)
+// ============================================================================
+// Sends exactly MAX_PAYLOAD_SIZE bytes. This is the largest payload that
+// fits in a single packet (no fragmentation). Verify it arrives intact.
+// ============================================================================
+
+static bool test_exact_max_payload()
+{
+    server srv(9956);
+    srv.set_verbose(false);
+    srv.channels().register_defaults();
+    std::atomic<bool> stop_flag{false};
+    std::atomic<int> data_received{0};
+    std::atomic<size_t> received_size{0};
+    std::atomic<bool> data_intact{false};
+
+    const size_t MAX_PAYLOAD = MAX_PACKET_SIZE - PACKET_HEADER_SIZE;
+
+    srv.set_on_client_data_received(
+        [&](const packet_header &, const uint8_t *payload, size_t payload_size, const std::string &, uint16_t)
+        {
+            received_size = payload_size;
+            // Check that every byte matches the pattern
+            bool ok = (payload_size == MAX_PAYLOAD);
+            for (size_t i = 0; ok && i < payload_size; ++i)
+                ok = (payload[i] == static_cast<uint8_t>(i & 0xFF));
+            data_intact = ok;
+            data_received++;
+        });
+
+    TEST_ASSERT(succeeded(srv.start()), "server should start");
+
+    std::thread server_thread(
+        [&]()
+        {
+            while (!stop_flag.load())
+            {
+                srv.poll();
+                srv.update();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+
+    client c("127.0.0.1", 9956);
+    c.set_verbose(false);
+    c.channels().register_defaults();
+    TEST_ASSERT(succeeded(c.connect()), "client should connect");
+
+    // Build payload: sequential bytes
+    std::vector<uint8_t> buf(MAX_PAYLOAD);
+    for (size_t i = 0; i < MAX_PAYLOAD; ++i)
+        buf[i] = static_cast<uint8_t>(i & 0xFF);
+
+    int sent = c.send_payload(buf.data(), buf.size(), 0, channels::RELIABLE.id);
+    TEST_ASSERT(sent > 0, "send should succeed");
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (data_received.load() == 0 && std::chrono::steady_clock::now() < deadline)
+    {
+        c.poll();
+        c.update(nullptr);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    TEST_ASSERT(data_received.load() >= 1, "server should receive the max-payload packet");
+    TEST_ASSERT(received_size.load() == MAX_PAYLOAD, "received size should match MAX_PAYLOAD");
+    TEST_ASSERT(data_intact.load(), "payload data should be intact byte-for-byte");
+
+    c.disconnect();
+    stop_flag = true;
+    server_thread.join();
+    srv.stop();
+    return true;
+}
+
+// ============================================================================
+// TEST: Server stop() with connected clients (graceful shutdown)
+// ============================================================================
+// Several clients are connected and actively exchanging data. The server
+// calls stop() — verify it doesn't crash and cleans up properly.
+// ============================================================================
+
+static bool test_server_stop_with_clients()
+{
+    server srv(9957);
+    srv.set_verbose(false);
+    std::atomic<bool> stop_flag{false};
+
+    srv.set_on_client_data_received(
+        [&](const packet_header &header, const uint8_t *payload, size_t payload_size, const std::string &addr,
+            uint16_t port)
+        {
+            packet_header resp{};
+            resp.flags = header.flags;
+            resp.payload_size = static_cast<uint16_t>(payload_size);
+            srv.send_to(resp, payload, addr, port);
+        });
+
+    TEST_ASSERT(succeeded(srv.start()), "server should start");
+
+    std::thread server_thread(
+        [&]()
+        {
+            while (!stop_flag.load())
+            {
+                srv.poll();
+                srv.update();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            srv.stop();
+        });
+
+    // Connect 3 clients and send some data
+    constexpr int N = 3;
+    std::vector<std::unique_ptr<client>> clients;
+    for (int i = 0; i < N; ++i)
+    {
+        auto c = std::make_unique<client>("127.0.0.1", 9957);
+        c->set_verbose(false);
+        TEST_ASSERT(succeeded(c->connect()), ("client " + std::to_string(i) + " should connect").c_str());
+        c->send_payload("DATA", 4);
+        clients.push_back(std::move(c));
+    }
+
+    // Let data exchange happen for 200ms
+    auto pump_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+    while (std::chrono::steady_clock::now() < pump_until)
+    {
+        for (auto &c : clients)
+        {
+            c->poll();
+            c->update(nullptr);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    TEST_ASSERT(srv.connection_count() == N, "server should have N connections before stop");
+
+    // Stop server while clients are still connected
+    stop_flag = true;
+    server_thread.join();
+
+    // Server has stopped — verify clean state
+    TEST_ASSERT(!srv.is_running(), "server should not be running");
+    TEST_ASSERT(srv.connection_count() == 0, "stop() should have disconnected all");
+
+    // Clients can call disconnect without crashing
+    for (auto &c : clients)
+        c->disconnect();
+    clients.clear();
+
+    return true;
+}
+
 int main()
 {
     platform_init();
@@ -3677,6 +4232,20 @@ int main()
     register_test("Ordered simple delivery", test_ordered_simple_delivery);
     register_test("Ordered fragmented delivery", test_ordered_fragmented_delivery);
     register_test("Ordered mixed delivery", test_ordered_mixed_delivery);
+
+    // -- Server lifecycle --
+    register_test("Server start/stop/restart", test_server_start_stop_restart);
+    register_test("Server disconnect_client", test_server_disconnect_client);
+    register_test("Server disconnect_all", test_server_disconnect_all);
+    register_test("Server stop with clients", test_server_stop_with_clients);
+
+    // -- Reconnection & slot reuse --
+    register_test("Reconnect after disconnect", test_reconnect_after_disconnect);
+    register_test("Reconnect slot reuse", test_reconnect_slot_reuse);
+
+    // -- Boundary payloads --
+    register_test("Zero-length payload", test_zero_length_payload);
+    register_test("Exact MAX_PAYLOAD_SIZE", test_exact_max_payload);
 
     std::cout << "========================================" << std::endl;
     std::cout << " Entanglement Test Battery" << std::endl;
