@@ -8,7 +8,9 @@ namespace entanglement
 {
 
     client::client(const std::string &server_address, uint16_t server_port)
-        : m_server_address(server_address), m_server_port(server_port)
+        : m_server_address(server_address),
+          m_server_port(server_port),
+          m_server_endpoint(endpoint_from_string(server_address, server_port))
     {
     }
 
@@ -120,89 +122,20 @@ namespace entanglement
     {
         bool reliable = m_channels.is_reliable(header.channel_id);
         m_connection.prepare_header(header, reliable);
-        return m_socket.send_packet(header, payload, m_server_address, m_server_port);
+        return m_socket.send_packet(header, payload, m_server_endpoint);
     }
 
     int client::send_payload(const void *data, size_t size, uint8_t flags, uint8_t channel_id, uint32_t *out_message_id)
     {
-        // Single-packet path (no fragmentation overhead)
-        if (size <= MAX_PAYLOAD_SIZE)
-        {
-            if (out_message_id)
-                *out_message_id = 0;
-            packet_header header{};
-            header.flags = flags;
-            header.shard_id = 0;
-            header.channel_id = channel_id;
-            header.reserved = 0;
-            header.payload_size = static_cast<uint16_t>(size);
-            return send(header, data);
-        }
-
-        // Fragmented send — check backpressure from server
-        if (m_connection.is_fragment_backpressured())
-        {
-            return static_cast<int>(error_code::backpressured);
-        }
-
-        // --- Fragmented send (zero-copy from user buffer) ---
-        const uint8_t *src = static_cast<const uint8_t *>(data);
-        uint8_t fragment_count = static_cast<uint8_t>((size + MAX_FRAGMENT_PAYLOAD - 1) / MAX_FRAGMENT_PAYLOAD);
-
-        // Validate: uint8_t count means max 255 fragments
-        if (fragment_count == 0)
-            return static_cast<int>(error_code::invalid_argument);
-
-        uint32_t message_id = m_connection.next_message_id();
-        int total_sent = 0;
-
-        for (uint8_t i = 0; i < fragment_count; ++i)
-        {
-            size_t offset = static_cast<size_t>(i) * MAX_FRAGMENT_PAYLOAD;
-            size_t chunk = (std::min)(MAX_FRAGMENT_PAYLOAD, size - offset);
-
-            int result = send_fragment(message_id, i, fragment_count, src + offset, chunk, flags, channel_id);
-            if (result <= 0)
-                return result;
-            total_sent += static_cast<int>(chunk);
-        }
-
-        // Register for ACK tracking (sender side)
-        m_connection.register_pending_message(message_id, fragment_count);
-
-        if (out_message_id)
-            *out_message_id = message_id;
-
-        return total_sent;
+        return m_connection.send_payload(m_socket, m_channels, data, size, flags, channel_id, m_server_endpoint,
+                                         out_message_id);
     }
 
     int client::send_fragment(uint32_t message_id, uint8_t index, uint8_t count, const void *data, size_t size,
-                              uint8_t flags, uint8_t channel_id)
+                              uint8_t flags, uint8_t channel_id, uint32_t channel_sequence)
     {
-        // Build fragment header on stack (4 bytes)
-        fragment_header fhdr{message_id, index, count};
-
-        packet_header header{};
-        header.flags = flags | FLAG_FRAGMENT;
-        header.shard_id = 0;
-        header.channel_id = channel_id;
-        header.reserved = 0;
-        header.payload_size = static_cast<uint16_t>(FRAGMENT_HEADER_SIZE + size);
-
-        bool reliable = m_channels.is_reliable(channel_id);
-        m_connection.prepare_header(header, reliable);
-
-        // Tag the sent_packet_entry with fragment info for loss tracking
-        size_t idx = header.sequence % SEQUENCE_BUFFER_SIZE;
-        auto &entry = m_connection.send_buffer_entry(idx);
-        entry.message_id = message_id;
-        entry.fragment_index = index;
-        entry.fragment_count = count;
-
-        // Scatter-gather: [packet_header] + [fragment_header] + [user data] — zero intermediate copy
-        const void *segments[2] = {&fhdr, data};
-        size_t seg_sizes[2] = {FRAGMENT_HEADER_SIZE, size};
-        return m_socket.send_packet_gather(header, segments, seg_sizes, 2, m_server_address, m_server_port);
+        return m_connection.send_fragment(m_socket, m_channels, message_id, index, count, data, size, flags, channel_id,
+                                          m_server_endpoint, channel_sequence);
     }
 
     int client::poll(int max_packets)
@@ -210,12 +143,11 @@ namespace entanglement
         int count = 0;
         packet_header header{};
         uint8_t payload[MAX_PAYLOAD_SIZE];
-        std::string sender_addr;
-        uint16_t sender_port = 0;
+        endpoint_key sender{};
 
         while (count < max_packets)
         {
-            int result = m_socket.recv_packet(header, payload, MAX_PAYLOAD_SIZE, sender_addr, sender_port);
+            int result = m_socket.recv_packet(header, payload, MAX_PAYLOAD_SIZE, sender);
             if (result <= 0)
                 break;
 
@@ -239,22 +171,13 @@ namespace entanglement
             {
                 fragment_header fhdr;
                 std::memcpy(&fhdr, payload, FRAGMENT_HEADER_SIZE);
-                endpoint_key server_ep{}; // zeroed — single server
-                auto result = m_connection.reassembler().process_fragment(server_ep, header.channel_id, fhdr,
-                                                                          payload + FRAGMENT_HEADER_SIZE,
-                                                                          header.payload_size - FRAGMENT_HEADER_SIZE);
+                auto frag_result = m_connection.reassembler().process_fragment(
+                    sender, header.channel_id, fhdr, payload + FRAGMENT_HEADER_SIZE,
+                    header.payload_size - FRAGMENT_HEADER_SIZE, header.channel_sequence);
 
                 // If reassembler is full/under pressure, send backpressure to server
-                if (result == fragment_result::slots_full)
-                {
-                    if (!m_connection.backpressure_sent())
-                    {
-                        uint8_t bp[2] = {CONTROL_BACKPRESSURE, 0};
-                        send_control_payload(bp, 2);
-                        m_connection.set_backpressure_sent(true);
-                    }
-                }
-                else if (m_connection.reassembler().usage_percent() >= BACKPRESSURE_HIGH_WATERMARK)
+                if (frag_result == fragment_result::slots_full ||
+                    m_connection.reassembler().usage_percent() >= BACKPRESSURE_HIGH_WATERMARK)
                 {
                     if (!m_connection.backpressure_sent())
                     {
@@ -271,7 +194,36 @@ namespace entanglement
             // Data packets — only when connected
             if (m_connection.state() == connection_state::CONNECTED && m_on_data_received)
             {
-                m_on_data_received(header, payload, header.payload_size);
+                // RELIABLE_ORDERED channels: hold-back queue ensures in-order delivery
+                if (m_channels.is_ordered(header.channel_id))
+                {
+                    if (m_connection.is_ordered_next(header.channel_id, header.channel_sequence))
+                    {
+                        // Expected packet — deliver immediately
+                        m_on_data_received(header, payload, header.payload_size);
+                        m_connection.advance_ordered_seq(header.channel_id);
+
+                        // Drain any consecutive buffered items (simple + fragmented)
+                        drain_ordered_channel(header.channel_id);
+                    }
+                    else if (header.channel_sequence > m_connection.expected_ordered_seq(header.channel_id))
+                    {
+                        // Future packet — buffer for later delivery
+                        if (!m_connection.buffer_ordered_packet(header, payload, header.payload_size))
+                        {
+                            // Buffer full — force-skip gap and retry
+                            m_connection.skip_ordered_gap(header.channel_id);
+                            drain_ordered_channel(header.channel_id);
+                            // Try buffering again (now there's space)
+                            m_connection.buffer_ordered_packet(header, payload, header.payload_size);
+                        }
+                    }
+                    // else: channel_sequence < expected → stale duplicate, ignore
+                }
+                else
+                {
+                    m_on_data_received(header, payload, header.payload_size);
+                }
             }
             ++count;
         }
@@ -364,7 +316,44 @@ namespace entanglement
 
     void client::set_on_message_complete(on_message_complete cb)
     {
-        m_connection.reassembler().set_on_complete(std::move(cb));
+        m_app_on_message_complete = cb;
+        m_connection.reassembler().set_on_complete(
+            [this](const endpoint_key &sender, uint32_t msg_id, uint8_t ch_id, uint8_t *data, size_t total_size)
+            {
+                uint32_t chan_seq = m_connection.reassembler().last_completed_channel_sequence();
+                if (m_channels.is_ordered(ch_id) && chan_seq > 0)
+                {
+                    if (m_connection.is_ordered_next(ch_id, chan_seq))
+                    {
+                        // Expected message — deliver immediately
+                        if (m_app_on_message_complete)
+                            m_app_on_message_complete(sender, msg_id, ch_id, data, total_size);
+                        m_connection.advance_ordered_seq(ch_id);
+                        drain_ordered_channel(ch_id);
+                    }
+                    else if (chan_seq > m_connection.expected_ordered_seq(ch_id))
+                    {
+                        // Future message — buffer
+                        if (!m_connection.buffer_ordered_message(sender, msg_id, ch_id, data, total_size, chan_seq))
+                        {
+                            // Buffer full — force skip and drain, then retry
+                            m_connection.skip_ordered_gap(ch_id);
+                            drain_ordered_channel(ch_id);
+                            m_connection.buffer_ordered_message(sender, msg_id, ch_id, data, total_size, chan_seq);
+                        }
+                    }
+                    // else: stale duplicate — deliver anyway to avoid leaking the buffer
+                    else if (m_app_on_message_complete)
+                    {
+                        m_app_on_message_complete(sender, msg_id, ch_id, data, total_size);
+                    }
+                }
+                else
+                {
+                    if (m_app_on_message_complete)
+                        m_app_on_message_complete(sender, msg_id, ch_id, data, total_size);
+                }
+            });
     }
 
     void client::set_on_message_failed(on_message_failed cb)
@@ -390,7 +379,7 @@ namespace entanglement
         header.payload_size = static_cast<uint16_t>(size);
         // Control channel is always reliable
         m_connection.prepare_header(header, true);
-        m_socket.send_packet(header, payload, m_server_address, m_server_port);
+        m_socket.send_packet(header, payload, m_server_endpoint);
     }
 
     void client::handle_control(const uint8_t *payload, size_t payload_size)
@@ -548,6 +537,33 @@ namespace entanglement
         m_pending_channel_id = -1;
         m_channels.unregister_channel(static_cast<uint8_t>(id));
         return static_cast<int>(error_code::channel_timeout);
+    }
+
+    void client::drain_ordered_channel(uint8_t channel_id)
+    {
+        while (true)
+        {
+            // Check simple packet buffer
+            if (auto *pkt = m_connection.peek_next_ordered(channel_id))
+            {
+                if (m_on_data_received)
+                    m_on_data_received(pkt->header, pkt->payload, pkt->payload_size);
+                m_connection.advance_ordered_seq(channel_id);
+                m_connection.release_ordered_packet(pkt);
+                continue;
+            }
+            // Check fragmented message buffer
+            if (auto *msg = m_connection.peek_next_ordered_message(channel_id))
+            {
+                if (m_app_on_message_complete)
+                    m_app_on_message_complete(msg->sender, msg->message_id, msg->channel_id, msg->data,
+                                              msg->total_size);
+                m_connection.advance_ordered_seq(channel_id);
+                m_connection.release_ordered_message(msg);
+                continue;
+            }
+            break;
+        }
     }
 
 } // namespace entanglement

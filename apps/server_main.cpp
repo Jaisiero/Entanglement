@@ -155,11 +155,12 @@ static uint64_t make_echo_key(uint16_t port, uint64_t id)
     return (static_cast<uint64_t>(port) << 48) ^ id;
 }
 
-// Simple echoes: (port⊕sequence → {payload, channel_id})
+// Simple echoes: (port⊕sequence → {payload, channel_id, channel_sequence})
 struct simple_echo_entry
 {
     std::vector<uint8_t> payload;
     uint8_t channel_id = 0;
+    uint32_t channel_sequence = 0; // original ordering position (for retransmit)
 };
 static std::unordered_map<uint64_t, simple_echo_entry> g_simple_echo_payloads;
 
@@ -510,6 +511,7 @@ int main(int argc, char *argv[])
                 simple_echo_entry entry;
                 entry.payload.assign(payload, payload + size);
                 entry.channel_id = hdr.channel_id;
+                entry.channel_sequence = reply.channel_sequence; // preserve for retransmit
                 g_simple_echo_payloads[make_echo_key(p, reply.sequence)] = std::move(entry);
             }
 
@@ -625,7 +627,8 @@ int main(int argc, char *argv[])
             size_t chunk = (std::min)(MAX_FRAGMENT_PAYLOAD, entry.payload.size() - offset);
 
             srv.send_fragment_to(info.message_id, info.fragment_index, info.fragment_count,
-                                 entry.payload.data() + offset, chunk, 0, info.channel_id, addr, p);
+                                 entry.payload.data() + offset, chunk, 0, info.channel_id, addr, p,
+                                 info.channel_sequence);
             ++g_total_echo_retransmissions;
             return;
         }
@@ -640,6 +643,7 @@ int main(int argc, char *argv[])
 
         packet_header reply{};
         reply.channel_id = entry.channel_id;
+        reply.channel_sequence = entry.channel_sequence;
         reply.payload_size = static_cast<uint16_t>(entry.payload.size());
         srv.send_to(reply, entry.payload.data(), addr, p);
 
@@ -647,6 +651,7 @@ int main(int argc, char *argv[])
         simple_echo_entry new_entry;
         new_entry.payload = entry.payload;
         new_entry.channel_id = entry.channel_id;
+        new_entry.channel_sequence = entry.channel_sequence;
         g_simple_echo_payloads.erase(it);
         g_simple_echo_payloads[make_echo_key(p, reply.sequence)] = std::move(new_entry);
         ++g_total_echo_retransmissions;

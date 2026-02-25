@@ -1,5 +1,6 @@
 #pragma once
 
+#include "endpoint_key.h"
 #include "packet_header.h"
 #include "platform.h"
 #include <functional>
@@ -33,24 +34,23 @@ namespace entanglement
         // Create and bind to a local port (0 = any available port)
         error_code bind(uint16_t port, const std::string &address = "0.0.0.0");
 
-        // Send raw data to a remote address
-        int send_to(const void *data, size_t size, const std::string &address, uint16_t port);
+        // Send raw data to a remote endpoint
+        int send_to(const void *data, size_t size, const endpoint_key &dest);
 
-        // Receive raw data, fills sender address/port
-        int recv_from(void *buffer, size_t buffer_size, std::string &sender_address, uint16_t &sender_port);
+        // Receive raw data, fills sender endpoint
+        int recv_from(void *buffer, size_t buffer_size, endpoint_key &sender);
 
         // Send a packet with header + payload
-        int send_packet(const packet_header &header, const void *payload, const std::string &address, uint16_t port);
+        int send_packet(const packet_header &header, const void *payload, const endpoint_key &dest);
 
         // Send a packet with header + multiple payload segments (scatter-gather, zero-copy).
         // Segments are sent contiguously after the header without intermediate buffer copies.
         // segments/sizes arrays must have 'count' elements (max MAX_GATHER_SEGMENTS).
         int send_packet_gather(const packet_header &header, const void *const *segments, const size_t *sizes,
-                               size_t count, const std::string &address, uint16_t port);
+                               size_t count, const endpoint_key &dest);
 
         // Receive a packet, splits header and payload
-        int recv_packet(packet_header &header, void *payload, size_t payload_capacity, std::string &sender_address,
-                        uint16_t &sender_port);
+        int recv_packet(packet_header &header, void *payload, size_t payload_capacity, endpoint_key &sender);
 
         // Set non-blocking mode
         error_code set_non_blocking(bool enabled);

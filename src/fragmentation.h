@@ -121,6 +121,7 @@ namespace entanglement
         uint8_t received_count = 0;
         size_t last_fragment_size = 0;                      // size of the last fragment (index == count-1)
         uint8_t *app_buffer = nullptr;                      // pointer returned by on_allocate_message
+        uint32_t channel_sequence = 0;                      // ordering sequence (from fragment 0) for RELIABLE_ORDERED
         uint32_t received_bitmap[8]{};                      // 256 bits — covers up to 255 fragments
         std::chrono::steady_clock::time_point created_time; // for timeout-based eviction
 
@@ -134,6 +135,7 @@ namespace entanglement
             received_count = 0;
             last_fragment_size = 0;
             app_buffer = nullptr;
+            channel_sequence = 0;
             std::memset(received_bitmap, 0, sizeof(received_bitmap));
             created_time = {};
         }
@@ -167,8 +169,14 @@ namespace entanglement
 
         // Process one incoming fragment.  Calls on_allocate / on_complete as needed.
         // Returns a fragment_result indicating what happened.
+        // channel_sequence is captured for fragment 0 of RELIABLE_ORDERED messages.
         fragment_result process_fragment(const endpoint_key &sender, uint8_t channel_id, const fragment_header &fhdr,
-                                         const uint8_t *frag_data, size_t frag_data_size);
+                                         const uint8_t *frag_data, size_t frag_data_size,
+                                         uint32_t channel_sequence = 0);
+
+        // Channel sequence of the last message that completed reassembly.
+        // Valid immediately after process_fragment returns fragment_result::completed.
+        uint32_t last_completed_channel_sequence() const { return m_last_completed_channel_seq; }
 
         // Expire incomplete messages older than timeout_us microseconds.
         // Calls on_message_expired for each evicted entry.  Returns count evicted.
@@ -201,6 +209,20 @@ namespace entanglement
         on_message_complete m_on_complete;
         on_message_failed m_on_failed;
         int64_t m_reassembly_timeout_us = REASSEMBLY_TIMEOUT_US;
+        uint32_t m_last_completed_channel_seq = 0;
+
+        // --- Recently-completed message tracking ---
+        // Prevents spurious reassembly entries from retransmitted fragments
+        // of already-completed messages (caused by ACK loss in the reverse
+        // direction).  Without this, the reassembler slowly fills with
+        // phantom entries that can evict legitimate in-progress messages.
+        static constexpr size_t COMPLETED_TRACKING_SIZE = 512;
+        uint32_t m_completed_ids[COMPLETED_TRACKING_SIZE]{};
+        size_t m_completed_write_idx = 0;
+        size_t m_completed_count = 0;
+
+        void record_completed(uint32_t msg_id);
+        bool was_recently_completed(uint32_t msg_id) const;
 
         reassembly_entry *find_entry(const endpoint_key &sender, uint32_t message_id);
         reassembly_entry *allocate_entry();

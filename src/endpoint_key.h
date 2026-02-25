@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <string>
 
 namespace entanglement
 {
@@ -23,5 +24,11 @@ namespace entanglement
             return std::hash<uint64_t>{}((static_cast<uint64_t>(k.address) << 16) | k.port);
         }
     };
+
+    // Build endpoint_key from dotted-decimal string + port (calls inet_pton once)
+    endpoint_key endpoint_from_string(const std::string &ip, uint16_t port);
+
+    // Convert endpoint_key address to dotted-decimal string (calls inet_ntop)
+    std::string endpoint_address_string(const endpoint_key &key);
 
 } // namespace entanglement

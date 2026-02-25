@@ -58,8 +58,9 @@ namespace entanglement
 
         // Send a single fragment (for retransmission or custom fragmented sends).
         // The fragment is tagged with FLAG_FRAGMENT and carries the given message_id/index/count.
+        // channel_sequence: if non-zero, preserved on the header (for fragment 0 of ordered retransmissions).
         int send_fragment(uint32_t message_id, uint8_t index, uint8_t count, const void *data, size_t size,
-                          uint8_t flags, uint8_t channel_id);
+                          uint8_t flags, uint8_t channel_id, uint32_t channel_sequence = 0);
 
         // Receive and dispatch incoming packets
         int poll(int max_packets = DEFAULT_MAX_POLL_PACKETS);
@@ -126,12 +127,14 @@ namespace entanglement
         channel_manager m_channels;
         std::string m_server_address;
         uint16_t m_server_port;
+        endpoint_key m_server_endpoint; // precomputed from address + port
         std::atomic<bool> m_connected{false};
         bool m_verbose = true;
         on_data_received m_on_data_received;
         on_connected m_on_connected;
         on_disconnected m_on_disconnected;
         on_packet_lost m_on_packet_lost;
+        on_message_complete m_app_on_message_complete; // app callback (wrapped for ordered delivery)
 
         // Pending channel-open negotiation state
         int m_pending_channel_id = -1;    // channel id awaiting ACK, or -1
@@ -145,6 +148,9 @@ namespace entanglement
 
         // Dispatch incoming control packet
         void handle_control(const uint8_t *payload, size_t payload_size);
+
+        // Drain ordered delivery buffers (simple + fragmented) for a channel
+        void drain_ordered_channel(uint8_t channel_id);
     };
 
 } // namespace entanglement

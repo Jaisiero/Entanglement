@@ -1,5 +1,5 @@
 // ============================================================================
-// Entanglement — Soak Test Client v4.0  (Simple + Fragmented, Full Retransmit)
+// Entanglement — Soak Test Client v6.0  (Simple + Fragmented, Full Retransmit)
 // ============================================================================
 //
 // Usage: EntanglementClient [-s ip] [-p port] [-t min] [-c clients] [-d drop%] [-m modes]
@@ -213,13 +213,30 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
     std::unordered_map<uint64_t, int> frag_retries;
     constexpr int MAX_FRAG_RETRIES = 10;
 
-    // --- Ordered channel gating (one message in flight at a time) ---
+    // --- Ordered channel gating with timeout recovery ---
+    // One ordered message per type (simple/frag) in flight at a time.
+    // If the echo doesn't arrive within ORDERED_RETRY_TIMEOUT, the message
+    // is retransmitted to ensure progress on both nodes with the same msg_id.
+    constexpr auto ORDERED_RETRY_TIMEOUT = std::chrono::seconds(3);
+
     bool ordered_simple_pending = false;
+    uint32_t ordered_simple_pending_msg_id = 0;
+    std::chrono::steady_clock::time_point ordered_simple_send_time{};
+
     bool ordered_frag_pending = false;
+    uint32_t ordered_frag_pending_msg_id = 0;
+    uint32_t ordered_frag_lib_msg_id = 0;
+    std::vector<uint8_t> ordered_frag_pending_payload;
+    std::chrono::steady_clock::time_point ordered_frag_send_time{};
 
     client cli(server_ip, port);
     cli.set_verbose(false);
     cli.channels().register_defaults();
+
+    // Shorten reassembly timeout so stale echo entries are evicted faster.
+    // With RTO ~50ms, even multiply-retransmitted fragments complete well
+    // within 5s. This keeps reassembler slot pressure low during drain.
+    cli.set_reassembly_timeout(5'000'000); // 5 seconds
 
 #ifdef ENTANGLEMENT_SIMULATE_LOSS
     if (drop_rate > 0.0)
@@ -242,8 +259,10 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
                 if (it != simple_idx.end())
                     result.streams[it->second].record_echo(msg.msg_id);
 
-                // Ordered gating: unblock next send on this ordered channel
-                if (msg.channel_id == channels::ORDERED.id)
+                // Ordered gating: unblock only if this echo matches the pending msg_id.
+                // Stale/duplicate echoes from retransmissions must NOT open the gate
+                // for a different message, as that would violate ordering.
+                if (msg.channel_id == channels::ORDERED.id && msg.msg_id == ordered_simple_pending_msg_id)
                     ordered_simple_pending = false;
             }
             ++result.total_simple_echoes;
@@ -266,16 +285,33 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
                 if (it != frag_idx.end())
                     result.streams[it->second].record_echo(msg.msg_id);
 
-                // Ordered gating: unblock next fragmented send on this ordered channel
-                if (msg.channel_id == channels::ORDERED.id)
+                // Ordered gating: unblock only if this echo matches the pending msg_id.
+                // Stale/duplicate echoes from retransmissions must NOT open the gate
+                // for a different message, as that would violate ordering.
+                if (msg.channel_id == channels::ORDERED.id && msg.msg_id == ordered_frag_pending_msg_id)
+                {
                     ordered_frag_pending = false;
+                    if (ordered_frag_lib_msg_id != 0)
+                    {
+                        frag_payloads.erase(ordered_frag_lib_msg_id);
+                        ordered_frag_lib_msg_id = 0;
+                    }
+                }
             }
             ++result.total_frag_echoes;
             delete[] data;
         });
 
-    cli.set_on_message_failed([&](const endpoint_key &, uint32_t, uint8_t, uint8_t *buf, message_fail_reason, uint8_t,
-                                  uint8_t) { delete[] buf; });
+    cli.set_on_message_failed(
+        [&](const endpoint_key &, uint32_t, uint8_t ch_id, uint8_t *buf, message_fail_reason, uint8_t, uint8_t)
+        {
+            // If a fragmented echo on the ordered channel expired/was evicted,
+            // force an immediate retry by backdating the send timestamp so the
+            // timeout-recovery lambda fires on the very next loop iteration.
+            if (ch_id == channels::ORDERED.id && ordered_frag_pending)
+                ordered_frag_send_time = std::chrono::steady_clock::time_point{};
+            delete[] buf;
+        });
 
     // =========================================================================
     // LOSS callback (simple retransmission only)
@@ -304,9 +340,24 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
             // Look up stored payload
             auto pit = frag_payloads.find(info.message_id);
             if (pit == frag_payloads.end())
-                return; // payload not found (shouldn't happen)
+                return; // payload already cleaned up or not found
 
             const auto &payload = pit->second;
+
+            // Skip retransmission if echo already received for this app-level message.
+            // Without this, re-sent fragments spawn new sequences that also time out
+            // and chain into an unbounded retransmission spiral.
+            if (payload.size() >= SOAK_MSG_SIZE)
+            {
+                soak_msg app_hdr;
+                std::memcpy(&app_hdr, payload.data(), SOAK_MSG_SIZE);
+                auto fit = frag_idx.find(app_hdr.channel_id);
+                if (fit != frag_idx.end() && result.streams[fit->second].confirmed_ids.count(app_hdr.msg_id))
+                {
+                    return; // echo confirmed — skip retransmission (payload kept for drain sweep)
+                }
+            }
+
             size_t offset = static_cast<size_t>(info.fragment_index) * MAX_FRAGMENT_PAYLOAD;
             if (offset >= payload.size())
                 return; // safety check
@@ -314,6 +365,10 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
 
             cli.send_fragment(info.message_id, info.fragment_index, info.fragment_count, payload.data() + offset, chunk,
                               0, info.channel_id);
+
+            // Reset ordered gating timer so the timeout recovery knows we just retried
+            if (info.channel_id == channels::ORDERED.id)
+                ordered_frag_send_time = std::chrono::steady_clock::now();
 
             if (it != frag_idx.end())
             {
@@ -340,6 +395,12 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
         if (!cli.channels().is_reliable(mi.channel_id))
             return;
 
+        // Skip retransmission if echo already received — prevents unbounded
+        // retransmission chains where each re-sent packet times out and
+        // spawns yet another retransmission, starving real traffic.
+        if (sit != simple_idx.end() && result.streams[sit->second].confirmed_ids.count(mi.msg_id))
+            return;
+
         // Retransmit simple message
         soak_msg payload;
         payload.msg_id = mi.msg_id;
@@ -352,6 +413,11 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
         cli.send(hdr, &payload);
 
         seq_to_msg[hdr.sequence] = mi;
+
+        // Reset ordered gating timer so the timeout recovery knows we just retried
+        if (mi.channel_id == channels::ORDERED.id)
+            ordered_simple_send_time = std::chrono::steady_clock::now();
+
         if (sit != simple_idx.end())
         {
             ++result.streams[sit->second].retransmissions;
@@ -400,10 +466,87 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
     // 0=simple-rel, 1=frag-rel, 2=simple-ord, 3=frag-ord, 4=simple-unr, 5=frag-unr
     // This avoids bursting 9 packets (3 frag messages) which overwhelms the cwnd.
 
+    // Lambda: retransmit pending ordered messages on timeout.
+    // Ensures forward progress even if the normal loss-detection chain breaks
+    // (e.g. send-buffer wrap before RTO fires).
+    auto retry_ordered_timeouts = [&]()
+    {
+        auto now = std::chrono::steady_clock::now();
+
+        if (ordered_simple_pending && (now - ordered_simple_send_time) > ORDERED_RETRY_TIMEOUT)
+        {
+            soak_msg payload;
+            payload.msg_id = ordered_simple_pending_msg_id;
+            payload.total_expected = 0;
+            payload.channel_id = channels::ORDERED.id;
+
+            packet_header hdr{};
+            hdr.channel_id = channels::ORDERED.id;
+            hdr.payload_size = static_cast<uint16_t>(SOAK_MSG_SIZE);
+            cli.send(hdr, &payload);
+
+            // Do NOT add to seq_to_msg — the timeout mechanism handles ordered
+            // retries independently. Adding would let the loss handler also
+            // retransmit, creating a duplicate chain that amplifies traffic.
+            ++result.streams[S_ORD].retransmissions;
+            ++result.streams[S_ORD].total_packets;
+            ++result.total_retransmissions;
+            ++result.total_data_packets_sent;
+
+            ordered_simple_send_time = now;
+        }
+
+        if (ordered_frag_pending && (now - ordered_frag_send_time) > ORDERED_RETRY_TIMEOUT)
+        {
+            if (ordered_frag_lib_msg_id != 0 && !ordered_frag_pending_payload.empty())
+            {
+                // Resend all fragments using the SAME library message_id.
+                // This lets the server's reassembler accumulate fragments across
+                // retries, and the loss handler can retransmit individual ones.
+                const auto &pl = ordered_frag_pending_payload;
+                uint8_t frag_count =
+                    static_cast<uint8_t>((pl.size() + MAX_FRAGMENT_PAYLOAD - 1) / MAX_FRAGMENT_PAYLOAD);
+
+                for (uint8_t i = 0; i < frag_count; ++i)
+                {
+                    size_t off = static_cast<size_t>(i) * MAX_FRAGMENT_PAYLOAD;
+                    size_t chunk = (std::min)(MAX_FRAGMENT_PAYLOAD, pl.size() - off);
+                    cli.send_fragment(ordered_frag_lib_msg_id, i, frag_count, pl.data() + off, chunk, 0,
+                                      channels::ORDERED.id);
+                }
+
+                ++result.streams[F_ORD].retransmissions;
+                result.total_data_packets_sent += frag_count;
+                ++result.total_retransmissions;
+            }
+            else
+            {
+                // No lib_message_id yet — use send_payload to create one
+                uint32_t lib_message_id = 0;
+                int sent = cli.send_payload(ordered_frag_pending_payload.data(), ordered_frag_pending_payload.size(), 0,
+                                            channels::ORDERED.id, &lib_message_id);
+                if (sent > 0)
+                {
+                    if (lib_message_id != 0)
+                        frag_payloads[lib_message_id] = ordered_frag_pending_payload;
+                    ordered_frag_lib_msg_id = lib_message_id;
+                    ++result.streams[F_ORD].retransmissions;
+                    result.total_data_packets_sent += 3;
+                    ++result.total_retransmissions;
+                }
+            }
+
+            ordered_frag_send_time = now;
+        }
+    };
+
     while (std::chrono::steady_clock::now() < deadline)
     {
         cli.poll();
         cli.update(on_loss);
+
+        // Ordered gating timeout recovery — retransmit same msg_id if echo is overdue
+        retry_ordered_timeouts();
 
         if (!cli.can_send())
         {
@@ -460,7 +603,11 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
 
             // Mark ordered channel as pending (wait for echo before sending next)
             if (ch_id == channels::ORDERED.id)
+            {
                 ordered_simple_pending = true;
+                ordered_simple_pending_msg_id = msg_id;
+                ordered_simple_send_time = std::chrono::steady_clock::now();
+            }
 
             ++simple_sent[ch_index];
             ++result.total_data_packets_sent;
@@ -487,7 +634,13 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
 
                 // Mark ordered channel as pending (wait for echo before sending next)
                 if (ch_id == channels::ORDERED.id)
+                {
                     ordered_frag_pending = true;
+                    ordered_frag_pending_msg_id = msg_id;
+                    ordered_frag_lib_msg_id = lib_message_id;
+                    ordered_frag_pending_payload = frag_buf;
+                    ordered_frag_send_time = std::chrono::steady_clock::now();
+                }
 
                 ++frag_sent[ch_index];
                 // Each fragmented message generates ceil(2500/1160)=3 packets
@@ -533,6 +686,10 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
     }
 
     // --- Drain echoes + detect remaining losses ---
+    // Active-sweep drain: when progress stalls, retransmit ALL fragments of
+    // every unconfirmed reliable message. This handles the case where the
+    // server's reassembler evicted a partial message (timeout/slot pressure)
+    // and single-fragment retransmissions can never complete it.
     int expected_reliable = 0;
     if (enable_reliable)
         expected_reliable += result.streams[S_REL].messages_sent + result.streams[F_REL].messages_sent;
@@ -540,12 +697,136 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
         expected_reliable += result.streams[S_ORD].messages_sent + result.streams[F_ORD].messages_sent;
 
     auto drain_start = std::chrono::steady_clock::now();
-    constexpr auto MAX_DRAIN = std::chrono::seconds(20);
+    constexpr auto MAX_DRAIN = std::chrono::seconds(120);
+    constexpr auto DRAIN_SWEEP_INTERVAL = std::chrono::seconds(10);
+    auto last_drain_progress = drain_start;
+    auto next_sweep_time = drain_start + DRAIN_SWEEP_INTERVAL;
+    int last_drain_confirmed = 0;
+    int drain_sweeps = 0;
+
+    // Lambda: sweep all unconfirmed reliable messages, retransmitting them fully.
+    auto drain_sweep = [&]()
+    {
+        int sweep_frag = 0, sweep_simple = 0;
+
+        // 1) Unconfirmed frag reliable — retransmit ALL fragments from stored payloads
+        for (auto &[lib_msg_id, payload] : frag_payloads)
+        {
+            if (payload.size() < SOAK_MSG_SIZE)
+                continue;
+            soak_msg app_hdr;
+            std::memcpy(&app_hdr, payload.data(), SOAK_MSG_SIZE);
+
+            // Only sweep non-ordered reliable (ordered has its own retry mechanism)
+            if (app_hdr.channel_id == channels::ORDERED.id)
+                continue;
+            if (!cli.channels().is_reliable(app_hdr.channel_id))
+                continue;
+            auto fit = frag_idx.find(app_hdr.channel_id);
+            if (fit == frag_idx.end())
+                continue;
+            if (result.streams[fit->second].confirmed_ids.count(app_hdr.msg_id))
+                continue;
+
+            // Retransmit all fragments of this unconfirmed message
+            uint8_t frag_count =
+                static_cast<uint8_t>((payload.size() + MAX_FRAGMENT_PAYLOAD - 1) / MAX_FRAGMENT_PAYLOAD);
+            for (uint8_t i = 0; i < frag_count; ++i)
+            {
+                size_t off = static_cast<size_t>(i) * MAX_FRAGMENT_PAYLOAD;
+                size_t chunk = (std::min)(MAX_FRAGMENT_PAYLOAD, payload.size() - off);
+                cli.send_fragment(lib_msg_id, i, frag_count, payload.data() + off, chunk, 0, app_hdr.channel_id);
+            }
+            ++result.streams[fit->second].retransmissions;
+            result.total_data_packets_sent += frag_count;
+            ++result.total_retransmissions;
+            ++sweep_frag;
+        }
+
+        // 2) Unconfirmed simple reliable — retransmit as fresh packets
+        if (enable_reliable)
+        {
+            for (uint32_t mid = 0; mid < static_cast<uint32_t>(result.streams[S_REL].messages_sent); ++mid)
+            {
+                if (result.streams[S_REL].confirmed_ids.count(mid))
+                    continue;
+
+                soak_msg payload;
+                payload.msg_id = mid;
+                payload.total_expected = 0;
+                payload.channel_id = channels::RELIABLE.id;
+
+                packet_header hdr{};
+                hdr.channel_id = channels::RELIABLE.id;
+                hdr.payload_size = static_cast<uint16_t>(SOAK_MSG_SIZE);
+                cli.send(hdr, &payload);
+                seq_to_msg[hdr.sequence] = {channels::RELIABLE.id, mid};
+
+                ++result.streams[S_REL].retransmissions;
+                ++result.streams[S_REL].total_packets;
+                ++result.total_retransmissions;
+                ++result.total_data_packets_sent;
+                ++sweep_simple;
+            }
+        }
+
+        // 3) Pending ordered-frag — retransmit with a fresh library message_id.
+        //    A fresh ID creates a new echo cycle on the server, bypassing any
+        //    stale reassembly state on the client side (e.g. clogged slots from
+        //    previous echo attempts whose fragments were partially lost).
+        if (ordered_frag_pending && !ordered_frag_pending_payload.empty())
+        {
+            uint32_t new_lib_msg_id = 0;
+            int sent = cli.send_payload(ordered_frag_pending_payload.data(), ordered_frag_pending_payload.size(), 0,
+                                        channels::ORDERED.id, &new_lib_msg_id);
+            if (sent > 0 && new_lib_msg_id != 0)
+            {
+                frag_payloads[new_lib_msg_id] = ordered_frag_pending_payload;
+                ordered_frag_lib_msg_id = new_lib_msg_id;
+                ordered_frag_send_time = std::chrono::steady_clock::now();
+                ++result.streams[F_ORD].retransmissions;
+                result.total_data_packets_sent += 3;
+                ++result.total_retransmissions;
+                ++sweep_frag;
+            }
+        }
+
+        // 4) Pending ordered-simple — retransmit
+        if (ordered_simple_pending)
+        {
+            soak_msg payload;
+            payload.msg_id = ordered_simple_pending_msg_id;
+            payload.total_expected = 0;
+            payload.channel_id = channels::ORDERED.id;
+
+            packet_header hdr{};
+            hdr.channel_id = channels::ORDERED.id;
+            hdr.payload_size = static_cast<uint16_t>(SOAK_MSG_SIZE);
+            cli.send(hdr, &payload);
+
+            ordered_simple_send_time = std::chrono::steady_clock::now();
+            ++result.streams[S_ORD].retransmissions;
+            ++result.streams[S_ORD].total_packets;
+            ++result.total_retransmissions;
+            ++result.total_data_packets_sent;
+            ++sweep_simple;
+        }
+
+        ++drain_sweeps;
+        {
+            std::lock_guard<std::mutex> lk(g_cout_mutex);
+            std::cout << "[client " << id << "] Drain sweep #" << drain_sweeps << ": frag=" << sweep_frag
+                      << " simple=" << sweep_simple << std::endl;
+        }
+    };
 
     while (true)
     {
         cli.poll();
         cli.update(on_loss);
+
+        // Continue retransmitting pending ordered messages during drain
+        retry_ordered_timeouts();
 
         auto now = std::chrono::steady_clock::now();
         if (now - drain_start > MAX_DRAIN)
@@ -558,11 +839,28 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
             confirmed += result.streams[S_ORD].echoes_received + result.streams[F_ORD].echoes_received;
         if (confirmed >= expected_reliable)
         {
-            // Give a bit more time for remaining echoes
+            // All reliable echoes received — final flush
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
             cli.poll();
             cli.update(on_loss);
             break;
+        }
+
+        // Track progress
+        if (confirmed > last_drain_confirmed)
+        {
+            last_drain_confirmed = confirmed;
+            last_drain_progress = now;
+        }
+
+        // Active sweep: when no progress for DRAIN_SWEEP_INTERVAL, retransmit
+        // ALL unconfirmed reliable messages. This handles server-side reassembly
+        // eviction and echo-only losses that the per-fragment loss handler misses.
+        if (now >= next_sweep_time && confirmed < expected_reliable)
+        {
+            drain_sweep();
+            next_sweep_time = now + DRAIN_SWEEP_INTERVAL;
+            last_drain_progress = now; // reset progress tracker
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(2));

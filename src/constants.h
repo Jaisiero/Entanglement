@@ -129,4 +129,9 @@ namespace entanglement
     constexpr size_t MAX_INCOMING_FRAGMENTED_MESSAGES = 64;          // receiver: per-connection concurrent reassemblies
     constexpr int64_t REASSEMBLY_TIMEOUT_US = 15'000'000;            // 15 s — accommodate fragment retransmissions
 
+    // --- Ordered delivery (receive-side hold-back for RELIABLE_ORDERED) ---
+    constexpr size_t ORDERED_BUFFER_SIZE = 16;                               // Per-connection buffered out-of-order packets
+    constexpr size_t MAX_ORDERED_PAYLOAD = MAX_PACKET_SIZE - PACKET_HEADER_SIZE; // Max storable payload (~1166 bytes)
+    constexpr size_t ORDERED_MSG_BUFFER_SIZE = 8;                             // Per-connection buffered out-of-order fragmented messages
+
 } // namespace entanglement

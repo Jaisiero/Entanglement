@@ -1,4 +1,6 @@
 #include "udp_connection.h"
+#include "channel_manager.h"
+#include "udp_socket.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -45,6 +47,17 @@ namespace entanglement
         // Reset backpressure flags
         m_fragment_backpressured = false;
         m_backpressure_sent = false;
+
+        // Reset ordered delivery state — expected sequence starts at 1
+        // (sender's first channel_sequence = ++0 = 1)
+        for (size_t i = 0; i < MAX_CHANNELS; ++i)
+        {
+            m_recv_channel_seq[i] = 1;
+        }
+        for (auto &op : m_ordered_buffer)
+            op.active = false;
+        for (auto &om : m_ordered_msg_buffer)
+            om.active = false;
     }
 
     // --- Sending side ---
@@ -63,7 +76,13 @@ namespace entanglement
         header.sequence = seq;
         header.ack = m_remote_sequence;
         header.ack_bitmap = m_recv_bitmap;
-        header.channel_sequence = ++m_channel_sequences[header.channel_id];
+
+        // For fragment packets: keep whatever channel_sequence the caller set
+        // (non-zero for fragment 0 of ordered messages, zero for all others).
+        // For simple packets: preserve caller-set value (retransmissions on
+        // RELIABLE_ORDERED), otherwise auto-assign the next monotonic value.
+        if (!(header.flags & FLAG_FRAGMENT) && header.channel_sequence == 0)
+            header.channel_sequence = ++m_channel_sequences[header.channel_id];
 
         // Register metadata in send buffer (no payload copy)
         size_t index = seq % SEQUENCE_BUFFER_SIZE;
@@ -76,6 +95,7 @@ namespace entanglement
         entry.channel_id = header.channel_id;
         entry.shard_id = header.shard_id;
         entry.payload_size = header.payload_size;
+        entry.channel_sequence = header.channel_sequence;
         entry.message_id = 0;
         entry.fragment_index = 0;
         entry.send_time = std::chrono::steady_clock::now();
@@ -281,6 +301,7 @@ namespace entanglement
             out[count].channel_id = entry.channel_id;
             out[count].shard_id = entry.shard_id;
             out[count].payload_size = entry.payload_size;
+            out[count].channel_sequence = entry.channel_sequence;
             out[count].message_id = entry.message_id;
             out[count].fragment_index = entry.fragment_index;
             out[count].fragment_count = entry.fragment_count;
@@ -387,8 +408,187 @@ namespace entanglement
 
         // RTO = SRTT + max(G, K * RTTVAR)
         m_rto = static_cast<int64_t>(
-            m_srtt + std::max(static_cast<double>(CLOCK_GRANULARITY_US), RTT_VARIANCE_MULTIPLIER * m_rttvar));
-        m_rto = std::clamp(m_rto, MIN_RTO_US, MAX_RTO_US);
+            m_srtt + (std::max)(static_cast<double>(CLOCK_GRANULARITY_US), RTT_VARIANCE_MULTIPLIER * m_rttvar));
+        m_rto = (std::clamp)(m_rto, MIN_RTO_US, MAX_RTO_US);
+    }
+
+    // --- Ordered delivery (receive-side hold-back for RELIABLE_ORDERED) ---
+
+    bool udp_connection::buffer_ordered_packet(const packet_header &hdr, const uint8_t *data, uint16_t size)
+    {
+        for (auto &slot : m_ordered_buffer)
+        {
+            if (!slot.active)
+            {
+                slot.active = true;
+                slot.channel_sequence = hdr.channel_sequence;
+                slot.header = hdr;
+                slot.payload_size = size;
+                if (size > 0 && data)
+                    std::memcpy(slot.payload, data, size);
+                return true;
+            }
+        }
+        return false; // buffer full
+    }
+
+    ordered_pending_packet *udp_connection::peek_next_ordered(uint8_t ch_id)
+    {
+        uint32_t expected = m_recv_channel_seq[ch_id];
+        for (auto &slot : m_ordered_buffer)
+        {
+            if (slot.active && slot.header.channel_id == ch_id && slot.channel_sequence == expected)
+                return &slot;
+        }
+        return nullptr;
+    }
+
+    int udp_connection::skip_ordered_gap(uint8_t ch_id)
+    {
+        // Find the lowest buffered channel_sequence across both simple and message buffers
+        uint32_t lowest = UINT32_MAX;
+        for (auto &slot : m_ordered_buffer)
+        {
+            if (slot.active && slot.header.channel_id == ch_id)
+            {
+                if (slot.channel_sequence < lowest)
+                    lowest = slot.channel_sequence;
+            }
+        }
+        for (auto &slot : m_ordered_msg_buffer)
+        {
+            if (slot.active && slot.channel_id == ch_id)
+            {
+                if (slot.channel_sequence < lowest)
+                    lowest = slot.channel_sequence;
+            }
+        }
+        if (lowest == UINT32_MAX)
+            return 0; // nothing buffered
+
+        // Advance expected to the lowest buffered sequence
+        m_recv_channel_seq[ch_id] = lowest;
+        return 1;
+    }
+
+    // --- Ordered delivery for fragmented messages ---
+
+    bool udp_connection::buffer_ordered_message(const endpoint_key &sender, uint32_t message_id, uint8_t channel_id,
+                                                uint8_t *data, size_t total_size, uint32_t channel_sequence)
+    {
+        for (auto &slot : m_ordered_msg_buffer)
+        {
+            if (!slot.active)
+            {
+                slot.active = true;
+                slot.channel_sequence = channel_sequence;
+                slot.channel_id = channel_id;
+                slot.sender = sender;
+                slot.message_id = message_id;
+                slot.data = data;
+                slot.total_size = total_size;
+                return true;
+            }
+        }
+        return false; // buffer full
+    }
+
+    ordered_pending_message *udp_connection::peek_next_ordered_message(uint8_t ch_id)
+    {
+        uint32_t expected = m_recv_channel_seq[ch_id];
+        for (auto &slot : m_ordered_msg_buffer)
+        {
+            if (slot.active && slot.channel_id == ch_id && slot.channel_sequence == expected)
+                return &slot;
+        }
+        return nullptr;
+    }
+
+    // --- Unified send helpers (shared by client and server) ---
+
+    int udp_connection::send_payload(udp_socket &socket, const channel_manager &channels, const void *data, size_t size,
+                                     uint8_t flags, uint8_t channel_id, const endpoint_key &dest,
+                                     uint32_t *out_message_id)
+    {
+        // Single-packet path (no fragmentation overhead)
+        if (size <= MAX_PAYLOAD_SIZE)
+        {
+            if (out_message_id)
+                *out_message_id = 0;
+            packet_header header{};
+            header.flags = flags;
+            header.channel_id = channel_id;
+            header.payload_size = static_cast<uint16_t>(size);
+            bool reliable = channels.is_reliable(channel_id);
+            prepare_header(header, reliable);
+            return socket.send_packet(header, data, dest);
+        }
+
+        // Fragmented send — check backpressure from remote
+        if (m_fragment_backpressured)
+            return static_cast<int>(error_code::backpressured);
+
+        const uint8_t *src = static_cast<const uint8_t *>(data);
+        uint8_t fragment_count = static_cast<uint8_t>((size + MAX_FRAGMENT_PAYLOAD - 1) / MAX_FRAGMENT_PAYLOAD);
+        if (fragment_count == 0)
+            return static_cast<int>(error_code::invalid_argument);
+
+        uint32_t message_id = next_message_id();
+        int total_sent = 0;
+
+        // For RELIABLE_ORDERED channels, allocate a single channel_sequence for the
+        // whole message — carried on fragment 0 so the receiver can enforce ordering.
+        uint32_t msg_channel_seq = 0;
+        if (channels.is_ordered(channel_id))
+            msg_channel_seq = ++m_channel_sequences[channel_id];
+
+        for (uint8_t i = 0; i < fragment_count; ++i)
+        {
+            size_t offset = static_cast<size_t>(i) * MAX_FRAGMENT_PAYLOAD;
+            size_t chunk = (std::min)(MAX_FRAGMENT_PAYLOAD, size - offset);
+
+            uint32_t frag_chan_seq = (i == 0) ? msg_channel_seq : 0;
+            int result = send_fragment(socket, channels, message_id, i, fragment_count, src + offset, chunk, flags,
+                                       channel_id, dest, frag_chan_seq);
+            if (result <= 0)
+                return result;
+            total_sent += static_cast<int>(chunk);
+        }
+
+        register_pending_message(message_id, fragment_count);
+
+        if (out_message_id)
+            *out_message_id = message_id;
+
+        return total_sent;
+    }
+
+    int udp_connection::send_fragment(udp_socket &socket, const channel_manager &channels, uint32_t message_id,
+                                      uint8_t index, uint8_t count, const void *data, size_t size, uint8_t flags,
+                                      uint8_t channel_id, const endpoint_key &dest, uint32_t channel_sequence)
+    {
+        fragment_header fhdr{message_id, index, count};
+
+        packet_header header{};
+        header.flags = flags | FLAG_FRAGMENT;
+        header.channel_id = channel_id;
+        header.channel_sequence = channel_sequence; // non-zero only for fragment 0 of ordered messages
+        header.payload_size = static_cast<uint16_t>(FRAGMENT_HEADER_SIZE + size);
+
+        bool reliable = channels.is_reliable(channel_id);
+        prepare_header(header, reliable);
+
+        // Tag fragment metadata for loss tracking
+        size_t idx = header.sequence % SEQUENCE_BUFFER_SIZE;
+        auto &entry = m_send_buffer[idx];
+        entry.message_id = message_id;
+        entry.fragment_index = index;
+        entry.fragment_count = count;
+
+        // Scatter-gather: [packet_header] + [fragment_header] + [user data]
+        const void *segments[2] = {&fhdr, data};
+        size_t seg_sizes[2] = {FRAGMENT_HEADER_SIZE, size};
+        return socket.send_packet_gather(header, segments, seg_sizes, 2, dest);
     }
 
 } // namespace entanglement

@@ -12,6 +12,10 @@
 namespace entanglement
 {
 
+    // Forward declarations for send helpers
+    class udp_socket;
+    class channel_manager;
+
     // --- Sent packet entry (metadata only, no payload copy) ---
 
     struct sent_packet_entry
@@ -24,6 +28,7 @@ namespace entanglement
         uint8_t channel_id = 0;
         uint16_t shard_id = 0;
         uint16_t payload_size = 0;
+        uint32_t channel_sequence = 0; // Per-channel ordering sequence (for retransmission)
         uint32_t message_id = 0;    // Non-zero if this packet is a fragment
         uint8_t fragment_index = 0; // Which fragment within the message
         uint8_t fragment_count = 0; // Total fragments in the message (0 if not a fragment)
@@ -39,9 +44,34 @@ namespace entanglement
         uint8_t channel_id = 0;
         uint16_t shard_id = 0;
         uint16_t payload_size = 0;
+        uint32_t channel_sequence = 0; // Per-channel ordering sequence (pass back on retransmit)
         uint32_t message_id = 0;    // Non-zero if this was a fragment
         uint8_t fragment_index = 0; // Which fragment within the message
         uint8_t fragment_count = 0; // Total fragments in the message
+    };
+
+    // --- Ordered delivery buffer entry (receive-side hold-back for RELIABLE_ORDERED) ---
+
+    struct ordered_pending_packet
+    {
+        bool active = false;
+        uint32_t channel_sequence = 0;
+        packet_header header{};
+        uint8_t payload[MAX_ORDERED_PAYLOAD]{};
+        uint16_t payload_size = 0;
+    };
+
+    // --- Ordered delivery buffer entry for completed fragmented messages ---
+
+    struct ordered_pending_message
+    {
+        bool active = false;
+        uint32_t channel_sequence = 0;
+        uint8_t channel_id = 0;
+        endpoint_key sender{};
+        uint32_t message_id = 0;
+        uint8_t *data = nullptr; // app-allocated buffer (ownership held until delivery)
+        size_t total_size = 0;
     };
 
     // --- Connection state ---
@@ -138,6 +168,21 @@ namespace entanglement
         congestion_info congestion() const { return m_cc.info(); }
         congestion_control &cc() { return m_cc; }
 
+        // --- Unified send helpers (shared by client and server) ---
+
+        // Send a user message (auto-fragments if needed).
+        // Returns bytes of user data sent, or a negative error_code.
+        int send_payload(udp_socket &socket, const channel_manager &channels, const void *data, size_t size,
+                         uint8_t flags, uint8_t channel_id, const endpoint_key &dest,
+                         uint32_t *out_message_id = nullptr);
+
+        // Send a single fragment (for retransmission or custom fragmented sends).
+        // Returns bytes sent, or negative on error.
+        // channel_sequence: if non-zero, preserved on the header (for fragment 0 of ordered messages).
+        int send_fragment(udp_socket &socket, const channel_manager &channels, uint32_t message_id, uint8_t index,
+                          uint8_t count, const void *data, size_t size, uint8_t flags, uint8_t channel_id,
+                          const endpoint_key &dest, uint32_t channel_sequence = 0);
+
         // --- Fragment reassembly (receiver side, per-connection) ---
 
         fragment_reassembler &reassembler() { return m_reassembler; }
@@ -152,6 +197,46 @@ namespace entanglement
         // Receiver side: we already sent CONTROL_BACKPRESSURE to sender
         bool backpressure_sent() const { return m_backpressure_sent; }
         void set_backpressure_sent(bool sent) { m_backpressure_sent = sent; }
+
+        // --- Ordered delivery (receive-side hold-back for RELIABLE_ORDERED) ---
+
+        // Expected next channel_sequence for a given channel (starts at 1)
+        uint32_t expected_ordered_seq(uint8_t ch_id) const { return m_recv_channel_seq[ch_id]; }
+
+        // Check if this channel_sequence is the expected next (i.e. deliverable now)
+        bool is_ordered_next(uint8_t ch_id, uint32_t ch_seq) const { return ch_seq == m_recv_channel_seq[ch_id]; }
+
+        // Advance the expected sequence after delivering a packet
+        void advance_ordered_seq(uint8_t ch_id)
+        {
+            ++m_recv_channel_seq[ch_id];
+        }
+
+        // Buffer an out-of-order packet for later delivery. Returns true if buffered.
+        bool buffer_ordered_packet(const packet_header &hdr, const uint8_t *data, uint16_t size);
+
+        // Retrieve the next buffered packet matching the expected sequence.
+        // Returns nullptr if none available.
+        ordered_pending_packet *peek_next_ordered(uint8_t ch_id);
+
+        // Release (deactivate) a buffered packet after delivery.
+        void release_ordered_packet(ordered_pending_packet *pkt) { pkt->active = false; }
+
+        // Force-skip: advance expected sequence past a gap when buffer is full.
+        // Returns the number of packets delivered via skip (0 if nothing to skip to).
+        int skip_ordered_gap(uint8_t ch_id);
+
+        // --- Ordered delivery for fragmented messages (receive-side) ---
+
+        // Buffer a completed fragmented message for later ordered delivery.
+        bool buffer_ordered_message(const endpoint_key &sender, uint32_t message_id, uint8_t channel_id,
+                                    uint8_t *data, size_t total_size, uint32_t channel_sequence);
+
+        // Retrieve the next buffered message matching the expected sequence.
+        ordered_pending_message *peek_next_ordered_message(uint8_t ch_id);
+
+        // Release (deactivate) a buffered message after delivery.
+        void release_ordered_message(ordered_pending_message *msg) { msg->active = false; }
 
     private:
         bool m_active = false;
@@ -194,6 +279,11 @@ namespace entanglement
         // Fragment flow control (backpressure)
         bool m_fragment_backpressured = false; // sender side: remote told us to throttle
         bool m_backpressure_sent = false;      // receiver side: we sent throttle signal
+
+        // Ordered delivery (receive-side hold-back for RELIABLE_ORDERED)
+        uint32_t m_recv_channel_seq[MAX_CHANNELS]{}; // expected next per-channel seq (init 1 on first use)
+        ordered_pending_packet m_ordered_buffer[ORDERED_BUFFER_SIZE]{};
+        ordered_pending_message m_ordered_msg_buffer[ORDERED_MSG_BUFFER_SIZE]{};
 
         // Helper: mark a sent packet as acked.
         // take_rtt_sample: true for primary ACK (header.ack), false for bitmap entries

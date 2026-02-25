@@ -81,8 +81,10 @@ namespace entanglement
 
         // Send a single fragment to a connected client (for retransmission or custom fragmented sends).
         // Returns bytes sent, or a negative error_code on failure.
+        // channel_sequence: if non-zero, preserved on the header (for fragment 0 of ordered retransmissions).
         int send_fragment_to(uint32_t message_id, uint8_t index, uint8_t count, const void *data, size_t size,
-                             uint8_t flags, uint8_t channel_id, const std::string &address, uint16_t port);
+                             uint8_t flags, uint8_t channel_id, const std::string &address, uint16_t port,
+                             uint32_t channel_sequence = 0);
 
         // Disconnect a specific client
         void disconnect_client(const endpoint_key &key);
@@ -128,6 +130,7 @@ namespace entanglement
         // Stored callback templates (applied to each new connection's reassembler)
         on_allocate_message m_frag_alloc_cb;
         on_message_complete m_frag_complete_cb;
+        on_message_complete m_app_on_message_complete; // app callback (wrapped for ordered delivery)
         on_message_failed m_frag_failed_cb;
 
         on_client_data_received m_on_client_data_received;
@@ -146,22 +149,22 @@ namespace entanglement
 
         // Control packet handling
         void handle_control(const endpoint_key &key, const packet_header &header, const uint8_t *payload,
-                            size_t payload_size, const std::string &address, uint16_t port);
+                            size_t payload_size);
 
         // Send a control packet through an established connection
-        void send_control_to(udp_connection *conn, uint8_t control_type, const std::string &address, uint16_t port);
+        void send_control_to(udp_connection *conn, uint8_t control_type, const endpoint_key &dest);
 
         // Send a multi-byte control payload through an established connection
-        void send_control_payload_to(udp_connection *conn, const void *payload, size_t size, const std::string &address,
-                                     uint16_t port);
+        void send_control_payload_to(udp_connection *conn, const void *payload, size_t size, const endpoint_key &dest);
 
         // Send a control packet without a connection (e.g. CONNECTION_DENIED)
-        void send_raw_control(uint8_t control_type, const std::string &address, uint16_t port);
+        void send_raw_control(uint8_t control_type, const endpoint_key &dest);
 
-        // Send a single fragment to a client (internal — takes connection pointer)
-        int send_fragment_to_impl(udp_connection *conn, uint32_t message_id, uint8_t index, uint8_t count,
-                                  const void *data, size_t size, uint8_t flags, uint8_t channel_id,
-                                  const std::string &address, uint16_t port);
+        // Apply ordered-delivery wrapper to a connection's on_complete callback
+        void setup_ordered_complete_wrapper(udp_connection &conn);
+
+        // Drain ordered delivery buffers (simple + fragmented) for a channel on a connection
+        void drain_ordered_conn(udp_connection &conn, uint8_t channel_id);
     };
 
 } // namespace entanglement

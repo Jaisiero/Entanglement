@@ -6,7 +6,7 @@ namespace entanglement
 
     fragment_result fragment_reassembler::process_fragment(const endpoint_key &sender, uint8_t channel_id,
                                                            const fragment_header &fhdr, const uint8_t *frag_data,
-                                                           size_t frag_data_size)
+                                                           size_t frag_data_size, uint32_t channel_sequence)
     {
         if (fhdr.fragment_count == 0 || fhdr.fragment_index >= fhdr.fragment_count)
             return fragment_result::invalid;
@@ -32,6 +32,16 @@ namespace entanglement
 
         if (!entry)
         {
+            // Reject fragments for messages that already completed reassembly.
+            // These are spurious retransmissions caused by ACK loss in the
+            // reverse direction: the sender retransmits a fragment it thinks
+            // was lost, but the receiver already assembled and delivered the
+            // full message.  Without this check, these ghost fragments
+            // allocate reassembly slots that never complete, eventually
+            // evicting legitimate in-progress messages.
+            if (was_recently_completed(fhdr.message_id))
+                return fragment_result::duplicate;
+
             entry = allocate_entry();
 
             // Layer 3a: try aggressive cleanup (half timeout) to free stale slots
@@ -76,6 +86,10 @@ namespace entanglement
             std::memset(entry->received_bitmap, 0, sizeof(entry->received_bitmap));
         }
 
+        // Capture channel_sequence from whichever fragment carries it (fragment 0 for ordered channels)
+        if (channel_sequence > 0)
+            entry->channel_sequence = channel_sequence;
+
         // Consistency check (after wrap protection, counts always match here)
         if (entry->fragment_count != fhdr.fragment_count)
             return fragment_result::invalid;
@@ -103,9 +117,11 @@ namespace entanglement
         // All fragments received — notify app
         if (m_on_complete)
         {
+            m_last_completed_channel_seq = entry->channel_sequence;
             m_on_complete(entry->sender, entry->message_id, entry->channel_id, entry->app_buffer, entry->total_size());
         }
 
+        record_completed(entry->message_id);
         entry->reset();
         return fragment_result::completed;
     }
@@ -201,6 +217,25 @@ namespace entanglement
         }
 
         return victim;
+    }
+
+    void fragment_reassembler::record_completed(uint32_t msg_id)
+    {
+        m_completed_ids[m_completed_write_idx] = msg_id;
+        m_completed_write_idx = (m_completed_write_idx + 1) % COMPLETED_TRACKING_SIZE;
+        if (m_completed_count < COMPLETED_TRACKING_SIZE)
+            ++m_completed_count;
+    }
+
+    bool fragment_reassembler::was_recently_completed(uint32_t msg_id) const
+    {
+        size_t n = (m_completed_count < COMPLETED_TRACKING_SIZE) ? m_completed_count : COMPLETED_TRACKING_SIZE;
+        for (size_t i = 0; i < n; ++i)
+        {
+            if (m_completed_ids[i] == msg_id)
+                return true;
+        }
+        return false;
     }
 
 } // namespace entanglement

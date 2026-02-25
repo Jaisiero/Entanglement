@@ -82,19 +82,19 @@ namespace entanglement
         return error_code::ok;
     }
 
-    int udp_socket::send_to(const void *data, size_t size, const std::string &address, uint16_t port)
+    int udp_socket::send_to(const void *data, size_t size, const endpoint_key &dest)
     {
-        sockaddr_in dest{};
-        dest.sin_family = AF_INET;
-        dest.sin_port = htons(port);
-        inet_pton(AF_INET, address.c_str(), &dest.sin_addr);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(dest.port);
+        addr.sin_addr.s_addr = dest.address;
 
         int sent = sendto(m_socket, static_cast<const char *>(data), static_cast<int>(size), 0,
-                          reinterpret_cast<sockaddr *>(&dest), sizeof(dest));
+                          reinterpret_cast<sockaddr *>(&addr), sizeof(addr));
         return sent;
     }
 
-    int udp_socket::recv_from(void *buffer, size_t buffer_size, std::string &sender_address, uint16_t &sender_port)
+    int udp_socket::recv_from(void *buffer, size_t buffer_size, endpoint_key &sender)
     {
         sockaddr_in from{};
         socklen_t_ from_len = sizeof(from);
@@ -108,30 +108,27 @@ namespace entanglement
             if (should_drop())
                 return -1; // simulate network loss
 #endif
-            char addr_str[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &from.sin_addr, addr_str, sizeof(addr_str));
-            sender_address = addr_str;
-            sender_port = ntohs(from.sin_port);
+            sender.address = from.sin_addr.s_addr;
+            sender.port = ntohs(from.sin_port);
         }
 
         return received;
     }
 
-    int udp_socket::send_packet(const packet_header &header, const void *payload, const std::string &address,
-                                uint16_t port)
+    int udp_socket::send_packet(const packet_header &header, const void *payload, const endpoint_key &dest)
     {
         // Delegate to scatter-gather with a single payload segment
         if (payload && header.payload_size > 0)
         {
             const void *seg = payload;
             size_t seg_size = header.payload_size;
-            return send_packet_gather(header, &seg, &seg_size, 1, address, port);
+            return send_packet_gather(header, &seg, &seg_size, 1, dest);
         }
-        return send_packet_gather(header, nullptr, nullptr, 0, address, port);
+        return send_packet_gather(header, nullptr, nullptr, 0, dest);
     }
 
     int udp_socket::send_packet_gather(const packet_header &header, const void *const *segments, const size_t *sizes,
-                                       size_t count, const std::string &address, uint16_t port)
+                                       size_t count, const endpoint_key &dest)
     {
         // Validate total size
         size_t payload_total = 0;
@@ -152,10 +149,10 @@ namespace entanglement
             return -1;
         }
 
-        sockaddr_in dest{};
-        dest.sin_family = AF_INET;
-        dest.sin_port = htons(port);
-        inet_pton(AF_INET, address.c_str(), &dest.sin_addr);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(dest.port);
+        addr.sin_addr.s_addr = dest.address;
 
 #ifdef ENTANGLEMENT_PLATFORM_WINDOWS
         // WSASend scatter-gather — no intermediate buffer copy
@@ -171,7 +168,7 @@ namespace entanglement
 
         DWORD bytes_sent = 0;
         int result = WSASendTo(m_socket, bufs, static_cast<DWORD>(count + 1), &bytes_sent, 0,
-                               reinterpret_cast<sockaddr *>(&dest), sizeof(dest), nullptr, nullptr);
+                               reinterpret_cast<sockaddr *>(&addr), sizeof(addr), nullptr, nullptr);
         return (result == 0) ? static_cast<int>(bytes_sent) : -1;
 #else
         // sendmsg scatter-gather — no intermediate buffer copy
@@ -186,8 +183,8 @@ namespace entanglement
         }
 
         struct msghdr msg{};
-        msg.msg_name = &dest;
-        msg.msg_namelen = sizeof(dest);
+        msg.msg_name = &addr;
+        msg.msg_namelen = sizeof(addr);
         msg.msg_iov = iov;
         msg.msg_iovlen = static_cast<int>(count + 1);
 
@@ -195,12 +192,11 @@ namespace entanglement
 #endif
     }
 
-    int udp_socket::recv_packet(packet_header &header, void *payload, size_t payload_capacity,
-                                std::string &sender_address, uint16_t &sender_port)
+    int udp_socket::recv_packet(packet_header &header, void *payload, size_t payload_capacity, endpoint_key &sender)
     {
         uint8_t buffer[MAX_PACKET_SIZE];
 
-        int received = recv_from(buffer, MAX_PACKET_SIZE, sender_address, sender_port);
+        int received = recv_from(buffer, MAX_PACKET_SIZE, sender);
         if (received < static_cast<int>(sizeof(packet_header)))
         {
             return -1;
