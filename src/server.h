@@ -56,11 +56,7 @@ namespace entanglement
         // Check connection timeouts and send heartbeats. Call from your game loop after poll().
         // Returns the number of connections that timed out.
         // If a loss_callback is provided it overrides the stored one for this call.
-        int update();
-
-        // Same as update(), but also collects reliable packet losses from all connections
-        // and invokes loss_callback for each one. Returns number of timed-out connections.
-        int update(on_server_packet_lost loss_callback);
+        int update(on_server_packet_lost loss_callback = nullptr);
 
         // Callbacks
         void set_on_client_data_received(on_client_data_received callback);
@@ -69,19 +65,26 @@ namespace entanglement
         void set_on_channel_requested(on_channel_requested callback);
         void set_on_packet_lost(on_server_packet_lost callback);
 
-        // Send a data packet to a connected client
+        // Send a data packet to a connected client (by endpoint_key)
+        int send_to(packet_header &header, const void *payload, const endpoint_key &dest);
+
+        // Send a data packet to a connected client (by address string + port)
         int send_to(packet_header &header, const void *payload, const std::string &address, uint16_t port);
 
-        // Send payload to a connected client, auto-fragmenting if needed.
-        // If out_message_id is non-null, the library message_id is written there
-        // (only meaningful for fragmented sends; 0 for single-packet sends).
-        // Returns bytes of user data sent, or a negative error_code on failure.
+        // Send payload to a connected client (by endpoint_key), auto-fragmenting if needed.
+        int send_payload_to(const void *data, size_t size, uint8_t channel_id, const endpoint_key &dest,
+                            uint8_t flags = 0, uint32_t *out_message_id = nullptr);
+
+        // Send payload to a connected client (by address string + port), auto-fragmenting if needed.
         int send_payload_to(const void *data, size_t size, uint8_t channel_id, const std::string &address,
                             uint16_t port, uint8_t flags = 0, uint32_t *out_message_id = nullptr);
 
-        // Send a single fragment to a connected client (for retransmission or custom fragmented sends).
-        // Returns bytes sent, or a negative error_code on failure.
-        // channel_sequence: if non-zero, preserved on the header (for fragment 0 of ordered retransmissions).
+        // Send a single fragment to a connected client (by endpoint_key).
+        int send_fragment_to(uint32_t message_id, uint8_t index, uint8_t count, const void *data, size_t size,
+                             uint8_t flags, uint8_t channel_id, const endpoint_key &dest,
+                             uint32_t channel_sequence = 0);
+
+        // Send a single fragment to a connected client (by address string + port).
         int send_fragment_to(uint32_t message_id, uint8_t index, uint8_t count, const void *data, size_t size,
                              uint8_t flags, uint8_t channel_id, const std::string &address, uint16_t port,
                              uint32_t channel_sequence = 0);
@@ -112,6 +115,7 @@ namespace entanglement
         void set_reassembly_timeout(int64_t timeout_us);
 
         // Fragment flow control: check if a specific client asked us to stop sending fragments
+        bool is_fragment_throttled(const endpoint_key &dest) const;
         bool is_fragment_throttled(const std::string &address, uint16_t port) const;
 
         // Channel configuration
@@ -129,7 +133,6 @@ namespace entanglement
 
         // Stored callback templates (applied to each new connection's reassembler)
         on_allocate_message m_frag_alloc_cb;
-        on_message_complete m_frag_complete_cb;
         on_message_complete m_app_on_message_complete; // app callback (wrapped for ordered delivery)
         on_message_failed m_frag_failed_cb;
 
@@ -159,12 +162,6 @@ namespace entanglement
 
         // Send a control packet without a connection (e.g. CONNECTION_DENIED)
         void send_raw_control(uint8_t control_type, const endpoint_key &dest);
-
-        // Apply ordered-delivery wrapper to a connection's on_complete callback
-        void setup_ordered_complete_wrapper(udp_connection &conn);
-
-        // Drain ordered delivery buffers (simple + fragmented) for a channel on a connection
-        void drain_ordered_conn(udp_connection &conn, uint8_t channel_id);
     };
 
 } // namespace entanglement

@@ -102,10 +102,9 @@ namespace entanglement
             {
                 fragment_header fhdr;
                 std::memcpy(&fhdr, payload, FRAGMENT_HEADER_SIZE);
-                auto frag_result = conn->reassembler().process_fragment(sender, header.channel_id, fhdr,
-                                                                        payload + FRAGMENT_HEADER_SIZE,
-                                                                        header.payload_size - FRAGMENT_HEADER_SIZE,
-                                                                        header.channel_sequence);
+                auto frag_result = conn->reassembler().process_fragment(
+                    sender, header.channel_id, fhdr, payload + FRAGMENT_HEADER_SIZE,
+                    header.payload_size - FRAGMENT_HEADER_SIZE, header.channel_sequence);
 
                 // If reassembler is full/under pressure, send backpressure to this client
                 if (frag_result == fragment_result::slots_full ||
@@ -125,33 +124,8 @@ namespace entanglement
 
             if (is_new && m_on_client_data_received)
             {
-                // RELIABLE_ORDERED channels: hold-back queue ensures in-order delivery
-                if (m_channels.is_ordered(header.channel_id))
-                {
-                    if (conn->is_ordered_next(header.channel_id, header.channel_sequence))
-                    {
-                        // Expected packet — deliver immediately
-                        std::string addr_str = endpoint_address_string(sender);
-                        m_on_client_data_received(header, payload, header.payload_size, addr_str, sender.port);
-                        conn->advance_ordered_seq(header.channel_id);
-
-                        // Drain any consecutive buffered items (simple + fragmented)
-                        drain_ordered_conn(*conn, header.channel_id);
-                    }
-                    else if (header.channel_sequence > conn->expected_ordered_seq(header.channel_id))
-                    {
-                        // Future packet — buffer for later delivery
-                        if (!conn->buffer_ordered_packet(header, payload, header.payload_size))
-                        {
-                            // Buffer full — force-skip gap and retry
-                            conn->skip_ordered_gap(header.channel_id);
-                            drain_ordered_conn(*conn, header.channel_id);
-                            conn->buffer_ordered_packet(header, payload, header.payload_size);
-                        }
-                    }
-                    // else: channel_sequence < expected → stale duplicate, ignore
-                }
-                else
+                // RELIABLE_ORDERED channels: deliver_ordered handles hold-back + drain
+                if (!conn->deliver_ordered(header, payload, header.payload_size, m_channels))
                 {
                     std::string addr_str = endpoint_address_string(sender);
                     m_on_client_data_received(header, payload, header.payload_size, addr_str, sender.port);
@@ -161,11 +135,6 @@ namespace entanglement
         }
 
         return count;
-    }
-
-    int server::update()
-    {
-        return update(nullptr);
     }
 
     int server::update(on_server_packet_lost loss_callback)
@@ -255,7 +224,26 @@ namespace entanglement
 
     void server::set_on_client_data_received(on_client_data_received callback)
     {
-        m_on_client_data_received = std::move(callback);
+        m_on_client_data_received = callback;
+        // Wire the same callback into every existing connection's ordered drain path
+        for (auto &[key, idx] : m_index)
+        {
+            auto &conn = (*m_pool)[idx];
+            if (callback)
+            {
+                auto cb = callback;
+                conn.set_on_ordered_packet_deliver(
+                    [cb, &conn](const packet_header &h, const uint8_t *p, uint16_t s)
+                    {
+                        std::string addr = endpoint_address_string(conn.endpoint());
+                        cb(h, p, s, addr, conn.endpoint().port);
+                    });
+            }
+            else
+            {
+                conn.set_on_ordered_packet_deliver(nullptr);
+            }
+        }
     }
 
     void server::set_on_client_connected(on_client_connected callback)
@@ -280,44 +268,53 @@ namespace entanglement
 
     // --- Sending ---
 
-    int server::send_to(packet_header &header, const void *payload, const std::string &address, uint16_t port)
+    int server::send_to(packet_header &header, const void *payload, const endpoint_key &key)
     {
-        endpoint_key key = endpoint_from_string(address, port);
-
         udp_connection *conn = find(key);
         if (conn && conn->state() == connection_state::CONNECTED)
         {
             bool reliable = m_channels.is_reliable(header.channel_id);
             conn->prepare_header(header, reliable);
         }
-
         return m_socket.send_packet(header, payload, key);
+    }
+
+    int server::send_to(packet_header &header, const void *payload, const std::string &address, uint16_t port)
+    {
+        return send_to(header, payload, endpoint_from_string(address, port));
+    }
+
+    int server::send_payload_to(const void *data, size_t size, uint8_t channel_id, const endpoint_key &key,
+                                uint8_t flags, uint32_t *out_message_id)
+    {
+        udp_connection *conn = find(key);
+        if (!conn || conn->state() != connection_state::CONNECTED)
+            return static_cast<int>(error_code::not_connected);
+        return conn->send_payload(m_socket, m_channels, data, size, flags, channel_id, key, out_message_id);
     }
 
     int server::send_payload_to(const void *data, size_t size, uint8_t channel_id, const std::string &address,
                                 uint16_t port, uint8_t flags, uint32_t *out_message_id)
     {
-        endpoint_key key = endpoint_from_string(address, port);
+        return send_payload_to(data, size, channel_id, endpoint_from_string(address, port), flags, out_message_id);
+    }
 
+    int server::send_fragment_to(uint32_t message_id, uint8_t index, uint8_t count, const void *data, size_t size,
+                                 uint8_t flags, uint8_t channel_id, const endpoint_key &key, uint32_t channel_sequence)
+    {
         udp_connection *conn = find(key);
         if (!conn || conn->state() != connection_state::CONNECTED)
             return static_cast<int>(error_code::not_connected);
-
-        return conn->send_payload(m_socket, m_channels, data, size, flags, channel_id, key, out_message_id);
+        return conn->send_fragment(m_socket, m_channels, message_id, index, count, data, size, flags, channel_id, key,
+                                   channel_sequence);
     }
 
     int server::send_fragment_to(uint32_t message_id, uint8_t index, uint8_t count, const void *data, size_t size,
                                  uint8_t flags, uint8_t channel_id, const std::string &address, uint16_t port,
                                  uint32_t channel_sequence)
     {
-        endpoint_key key = endpoint_from_string(address, port);
-
-        udp_connection *conn = find(key);
-        if (!conn || conn->state() != connection_state::CONNECTED)
-            return static_cast<int>(error_code::not_connected);
-
-        return conn->send_fragment(m_socket, m_channels, message_id, index, count, data, size, flags, channel_id, key,
-                                   channel_sequence);
+        return send_fragment_to(message_id, index, count, data, size, flags, channel_id,
+                                endpoint_from_string(address, port), channel_sequence);
     }
 
     // --- Connection management ---
@@ -363,11 +360,23 @@ namespace entanglement
         if (m_frag_alloc_cb)
             ra.set_on_allocate(m_frag_alloc_cb);
         if (m_app_on_message_complete)
-            setup_ordered_complete_wrapper(conn);
+            conn.install_ordered_complete_wrapper(&m_channels, m_app_on_message_complete);
         if (m_frag_failed_cb)
             ra.set_on_failed(m_frag_failed_cb);
         if (m_reassembly_timeout_us != REASSEMBLY_TIMEOUT_US)
             ra.set_reassembly_timeout(m_reassembly_timeout_us);
+
+        // Wire ordered packet delivery callback
+        if (m_on_client_data_received)
+        {
+            auto cb = m_on_client_data_received;
+            conn.set_on_ordered_packet_deliver(
+                [cb, &conn](const packet_header &h, const uint8_t *p, uint16_t s)
+                {
+                    std::string addr = endpoint_address_string(conn.endpoint());
+                    cb(h, p, s, addr, conn.endpoint().port);
+                });
+        }
 
         m_index[key] = static_cast<uint16_t>(slot);
         return &conn;
@@ -605,9 +614,8 @@ namespace entanglement
     void server::set_on_message_complete(on_message_complete cb)
     {
         m_app_on_message_complete = cb;
-        m_frag_complete_cb = cb; // store for template (used by setup_ordered_complete_wrapper)
         for (auto &[key, idx] : m_index)
-            setup_ordered_complete_wrapper((*m_pool)[idx]);
+            (*m_pool)[idx].install_ordered_complete_wrapper(&m_channels, cb);
     }
 
     void server::set_on_message_failed(on_message_failed cb)
@@ -624,85 +632,17 @@ namespace entanglement
             (*m_pool)[idx].reassembler().set_reassembly_timeout(timeout_us);
     }
 
-    bool server::is_fragment_throttled(const std::string &address, uint16_t port) const
+    bool server::is_fragment_throttled(const endpoint_key &key) const
     {
-        endpoint_key key = endpoint_from_string(address, port);
-
         auto it = m_index.find(key);
         if (it == m_index.end())
             return false;
         return (*m_pool)[it->second].is_fragment_backpressured();
     }
 
-    void server::setup_ordered_complete_wrapper(udp_connection &conn)
+    bool server::is_fragment_throttled(const std::string &address, uint16_t port) const
     {
-        udp_connection *conn_ptr = &conn;
-        conn.reassembler().set_on_complete(
-            [this, conn_ptr](const endpoint_key &sender, uint32_t msg_id, uint8_t ch_id, uint8_t *data,
-                             size_t total_size)
-            {
-                uint32_t chan_seq = conn_ptr->reassembler().last_completed_channel_sequence();
-                if (m_channels.is_ordered(ch_id) && chan_seq > 0)
-                {
-                    if (conn_ptr->is_ordered_next(ch_id, chan_seq))
-                    {
-                        if (m_app_on_message_complete)
-                            m_app_on_message_complete(sender, msg_id, ch_id, data, total_size);
-                        conn_ptr->advance_ordered_seq(ch_id);
-                        drain_ordered_conn(*conn_ptr, ch_id);
-                    }
-                    else if (chan_seq > conn_ptr->expected_ordered_seq(ch_id))
-                    {
-                        if (!conn_ptr->buffer_ordered_message(sender, msg_id, ch_id, data, total_size, chan_seq))
-                        {
-                            conn_ptr->skip_ordered_gap(ch_id);
-                            drain_ordered_conn(*conn_ptr, ch_id);
-                            conn_ptr->buffer_ordered_message(sender, msg_id, ch_id, data, total_size, chan_seq);
-                        }
-                    }
-                    else if (m_app_on_message_complete)
-                    {
-                        // Stale — deliver anyway to avoid leaking the buffer
-                        m_app_on_message_complete(sender, msg_id, ch_id, data, total_size);
-                    }
-                }
-                else
-                {
-                    if (m_app_on_message_complete)
-                        m_app_on_message_complete(sender, msg_id, ch_id, data, total_size);
-                }
-            });
-    }
-
-    void server::drain_ordered_conn(udp_connection &conn, uint8_t channel_id)
-    {
-        std::string addr; // lazy-init
-        uint16_t port = conn.endpoint().port;
-        while (true)
-        {
-            if (auto *pkt = conn.peek_next_ordered(channel_id))
-            {
-                if (m_on_client_data_received)
-                {
-                    if (addr.empty())
-                        addr = endpoint_address_string(conn.endpoint());
-                    m_on_client_data_received(pkt->header, pkt->payload, pkt->payload_size, addr, port);
-                }
-                conn.advance_ordered_seq(channel_id);
-                conn.release_ordered_packet(pkt);
-                continue;
-            }
-            if (auto *msg = conn.peek_next_ordered_message(channel_id))
-            {
-                if (m_app_on_message_complete)
-                    m_app_on_message_complete(msg->sender, msg->message_id, msg->channel_id, msg->data,
-                                              msg->total_size);
-                conn.advance_ordered_seq(channel_id);
-                conn.release_ordered_message(msg);
-                continue;
-            }
-            break;
-        }
+        return is_fragment_throttled(endpoint_from_string(address, port));
     }
 
 } // namespace entanglement

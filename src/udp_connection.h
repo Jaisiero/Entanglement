@@ -8,6 +8,7 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 
 namespace entanglement
 {
@@ -29,9 +30,9 @@ namespace entanglement
         uint16_t shard_id = 0;
         uint16_t payload_size = 0;
         uint32_t channel_sequence = 0; // Per-channel ordering sequence (for retransmission)
-        uint32_t message_id = 0;    // Non-zero if this packet is a fragment
-        uint8_t fragment_index = 0; // Which fragment within the message
-        uint8_t fragment_count = 0; // Total fragments in the message (0 if not a fragment)
+        uint32_t message_id = 0;       // Non-zero if this packet is a fragment
+        uint8_t fragment_index = 0;    // Which fragment within the message
+        uint8_t fragment_count = 0;    // Total fragments in the message (0 if not a fragment)
         std::chrono::steady_clock::time_point send_time{};
     };
 
@@ -45,9 +46,9 @@ namespace entanglement
         uint16_t shard_id = 0;
         uint16_t payload_size = 0;
         uint32_t channel_sequence = 0; // Per-channel ordering sequence (pass back on retransmit)
-        uint32_t message_id = 0;    // Non-zero if this was a fragment
-        uint8_t fragment_index = 0; // Which fragment within the message
-        uint8_t fragment_count = 0; // Total fragments in the message
+        uint32_t message_id = 0;       // Non-zero if this was a fragment
+        uint8_t fragment_index = 0;    // Which fragment within the message
+        uint8_t fragment_count = 0;    // Total fragments in the message
     };
 
     // --- Ordered delivery buffer entry (receive-side hold-back for RELIABLE_ORDERED) ---
@@ -207,10 +208,7 @@ namespace entanglement
         bool is_ordered_next(uint8_t ch_id, uint32_t ch_seq) const { return ch_seq == m_recv_channel_seq[ch_id]; }
 
         // Advance the expected sequence after delivering a packet
-        void advance_ordered_seq(uint8_t ch_id)
-        {
-            ++m_recv_channel_seq[ch_id];
-        }
+        void advance_ordered_seq(uint8_t ch_id) { ++m_recv_channel_seq[ch_id]; }
 
         // Buffer an out-of-order packet for later delivery. Returns true if buffered.
         bool buffer_ordered_packet(const packet_header &hdr, const uint8_t *data, uint16_t size);
@@ -229,14 +227,39 @@ namespace entanglement
         // --- Ordered delivery for fragmented messages (receive-side) ---
 
         // Buffer a completed fragmented message for later ordered delivery.
-        bool buffer_ordered_message(const endpoint_key &sender, uint32_t message_id, uint8_t channel_id,
-                                    uint8_t *data, size_t total_size, uint32_t channel_sequence);
+        bool buffer_ordered_message(const endpoint_key &sender, uint32_t message_id, uint8_t channel_id, uint8_t *data,
+                                    size_t total_size, uint32_t channel_sequence);
 
         // Retrieve the next buffered message matching the expected sequence.
         ordered_pending_message *peek_next_ordered_message(uint8_t ch_id);
 
         // Release (deactivate) a buffered message after delivery.
         void release_ordered_message(ordered_pending_message *msg) { msg->active = false; }
+
+        // --- Shared ordered-delivery helpers (used by both client and server) ---
+
+        // Callback for delivering an ordered simple (non-fragmented) packet.
+        using on_ordered_packet_deliver = std::function<void(const packet_header &, const uint8_t *, uint16_t)>;
+
+        // Set the callback invoked when a buffered ordered packet is delivered.
+        void set_on_ordered_packet_deliver(on_ordered_packet_deliver cb) { m_on_ordered_pkt_deliver = std::move(cb); }
+
+        // Set the callback invoked when a buffered ordered fragmented message is delivered.
+        void set_on_ordered_message_deliver(on_message_complete cb) { m_on_ordered_msg_deliver = std::move(cb); }
+
+        // Drain ordered delivery buffers (simple + fragmented) for a channel,
+        // invoking stored callbacks for each item delivered in sequence.
+        void drain_ordered(uint8_t channel_id);
+
+        // Process an incoming data packet through ordered delivery logic.
+        // If the channel is ordered: delivers immediately or buffers, and drains. Returns true.
+        // If the channel is not ordered: returns false (caller should deliver normally).
+        bool deliver_ordered(const packet_header &header, const uint8_t *payload, uint16_t size,
+                             const channel_manager &channels);
+
+        // Install the ordered-delivery wrapper on the reassembler's on_complete callback.
+        // The channels pointer must remain valid for the connection's lifetime.
+        void install_ordered_complete_wrapper(const channel_manager *channels, on_message_complete app_cb);
 
     private:
         bool m_active = false;
@@ -284,6 +307,8 @@ namespace entanglement
         uint32_t m_recv_channel_seq[MAX_CHANNELS]{}; // expected next per-channel seq (init 1 on first use)
         ordered_pending_packet m_ordered_buffer[ORDERED_BUFFER_SIZE]{};
         ordered_pending_message m_ordered_msg_buffer[ORDERED_MSG_BUFFER_SIZE]{};
+        on_ordered_packet_deliver m_on_ordered_pkt_deliver; // stored callback for drain/deliver
+        on_message_complete m_on_ordered_msg_deliver;       // stored callback for drain/deliver
 
         // Helper: mark a sent packet as acked.
         // take_rtt_sample: true for primary ACK (header.ack), false for bitmap entries

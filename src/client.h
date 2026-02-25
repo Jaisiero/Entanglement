@@ -125,8 +125,6 @@ namespace entanglement
         udp_socket m_socket;
         udp_connection m_connection;
         channel_manager m_channels;
-        std::string m_server_address;
-        uint16_t m_server_port;
         endpoint_key m_server_endpoint; // precomputed from address + port
         std::atomic<bool> m_connected{false};
         bool m_verbose = true;
@@ -134,7 +132,6 @@ namespace entanglement
         on_connected m_on_connected;
         on_disconnected m_on_disconnected;
         on_packet_lost m_on_packet_lost;
-        on_message_complete m_app_on_message_complete; // app callback (wrapped for ordered delivery)
 
         // Pending channel-open negotiation state
         int m_pending_channel_id = -1;    // channel id awaiting ACK, or -1
@@ -148,9 +145,6 @@ namespace entanglement
 
         // Dispatch incoming control packet
         void handle_control(const uint8_t *payload, size_t payload_size);
-
-        // Drain ordered delivery buffers (simple + fragmented) for a channel
-        void drain_ordered_channel(uint8_t channel_id);
     };
 
 } // namespace entanglement

@@ -8,9 +8,7 @@ namespace entanglement
 {
 
     client::client(const std::string &server_address, uint16_t server_port)
-        : m_server_address(server_address),
-          m_server_port(server_port),
-          m_server_endpoint(endpoint_from_string(server_address, server_port))
+        : m_server_endpoint(endpoint_from_string(server_address, server_port))
     {
     }
 
@@ -54,7 +52,8 @@ namespace entanglement
                 m_connected = true;
                 if (m_verbose)
                 {
-                    std::cout << "[client] Connected to " << m_server_address << ":" << m_server_port << " (port "
+                    std::string addr = endpoint_address_string(m_server_endpoint);
+                    std::cout << "[client] Connected to " << addr << ":" << m_server_endpoint.port << " (port "
                               << m_socket.local_port() << ")" << std::endl;
                 }
                 if (m_on_connected)
@@ -194,33 +193,8 @@ namespace entanglement
             // Data packets — only when connected
             if (m_connection.state() == connection_state::CONNECTED && m_on_data_received)
             {
-                // RELIABLE_ORDERED channels: hold-back queue ensures in-order delivery
-                if (m_channels.is_ordered(header.channel_id))
-                {
-                    if (m_connection.is_ordered_next(header.channel_id, header.channel_sequence))
-                    {
-                        // Expected packet — deliver immediately
-                        m_on_data_received(header, payload, header.payload_size);
-                        m_connection.advance_ordered_seq(header.channel_id);
-
-                        // Drain any consecutive buffered items (simple + fragmented)
-                        drain_ordered_channel(header.channel_id);
-                    }
-                    else if (header.channel_sequence > m_connection.expected_ordered_seq(header.channel_id))
-                    {
-                        // Future packet — buffer for later delivery
-                        if (!m_connection.buffer_ordered_packet(header, payload, header.payload_size))
-                        {
-                            // Buffer full — force-skip gap and retry
-                            m_connection.skip_ordered_gap(header.channel_id);
-                            drain_ordered_channel(header.channel_id);
-                            // Try buffering again (now there's space)
-                            m_connection.buffer_ordered_packet(header, payload, header.payload_size);
-                        }
-                    }
-                    // else: channel_sequence < expected → stale duplicate, ignore
-                }
-                else
+                // RELIABLE_ORDERED channels: deliver_ordered handles hold-back + drain
+                if (!m_connection.deliver_ordered(header, payload, header.payload_size, m_channels))
                 {
                     m_on_data_received(header, payload, header.payload_size);
                 }
@@ -291,7 +265,14 @@ namespace entanglement
 
     void client::set_on_data_received(on_data_received callback)
     {
-        m_on_data_received = std::move(callback);
+        m_on_data_received = callback;
+        // Wire the same callback into the ordered-delivery drain path
+        m_connection.set_on_ordered_packet_deliver(
+            [callback](const packet_header &h, const uint8_t *p, uint16_t s)
+            {
+                if (callback)
+                    callback(h, p, s);
+            });
     }
 
     void client::set_on_connected(on_connected callback)
@@ -316,44 +297,7 @@ namespace entanglement
 
     void client::set_on_message_complete(on_message_complete cb)
     {
-        m_app_on_message_complete = cb;
-        m_connection.reassembler().set_on_complete(
-            [this](const endpoint_key &sender, uint32_t msg_id, uint8_t ch_id, uint8_t *data, size_t total_size)
-            {
-                uint32_t chan_seq = m_connection.reassembler().last_completed_channel_sequence();
-                if (m_channels.is_ordered(ch_id) && chan_seq > 0)
-                {
-                    if (m_connection.is_ordered_next(ch_id, chan_seq))
-                    {
-                        // Expected message — deliver immediately
-                        if (m_app_on_message_complete)
-                            m_app_on_message_complete(sender, msg_id, ch_id, data, total_size);
-                        m_connection.advance_ordered_seq(ch_id);
-                        drain_ordered_channel(ch_id);
-                    }
-                    else if (chan_seq > m_connection.expected_ordered_seq(ch_id))
-                    {
-                        // Future message — buffer
-                        if (!m_connection.buffer_ordered_message(sender, msg_id, ch_id, data, total_size, chan_seq))
-                        {
-                            // Buffer full — force skip and drain, then retry
-                            m_connection.skip_ordered_gap(ch_id);
-                            drain_ordered_channel(ch_id);
-                            m_connection.buffer_ordered_message(sender, msg_id, ch_id, data, total_size, chan_seq);
-                        }
-                    }
-                    // else: stale duplicate — deliver anyway to avoid leaking the buffer
-                    else if (m_app_on_message_complete)
-                    {
-                        m_app_on_message_complete(sender, msg_id, ch_id, data, total_size);
-                    }
-                }
-                else
-                {
-                    if (m_app_on_message_complete)
-                        m_app_on_message_complete(sender, msg_id, ch_id, data, total_size);
-                }
-            });
+        m_connection.install_ordered_complete_wrapper(&m_channels, cb);
     }
 
     void client::set_on_message_failed(on_message_failed cb)
@@ -537,33 +481,6 @@ namespace entanglement
         m_pending_channel_id = -1;
         m_channels.unregister_channel(static_cast<uint8_t>(id));
         return static_cast<int>(error_code::channel_timeout);
-    }
-
-    void client::drain_ordered_channel(uint8_t channel_id)
-    {
-        while (true)
-        {
-            // Check simple packet buffer
-            if (auto *pkt = m_connection.peek_next_ordered(channel_id))
-            {
-                if (m_on_data_received)
-                    m_on_data_received(pkt->header, pkt->payload, pkt->payload_size);
-                m_connection.advance_ordered_seq(channel_id);
-                m_connection.release_ordered_packet(pkt);
-                continue;
-            }
-            // Check fragmented message buffer
-            if (auto *msg = m_connection.peek_next_ordered_message(channel_id))
-            {
-                if (m_app_on_message_complete)
-                    m_app_on_message_complete(msg->sender, msg->message_id, msg->channel_id, msg->data,
-                                              msg->total_size);
-                m_connection.advance_ordered_seq(channel_id);
-                m_connection.release_ordered_message(msg);
-                continue;
-            }
-            break;
-        }
     }
 
 } // namespace entanglement

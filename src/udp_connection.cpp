@@ -591,4 +591,102 @@ namespace entanglement
         return socket.send_packet_gather(header, segments, seg_sizes, 2, dest);
     }
 
+    // --- Shared ordered-delivery helpers ---
+
+    void udp_connection::drain_ordered(uint8_t channel_id)
+    {
+        while (true)
+        {
+            if (auto *pkt = peek_next_ordered(channel_id))
+            {
+                if (m_on_ordered_pkt_deliver)
+                    m_on_ordered_pkt_deliver(pkt->header, pkt->payload, pkt->payload_size);
+                advance_ordered_seq(channel_id);
+                release_ordered_packet(pkt);
+                continue;
+            }
+            if (auto *msg = peek_next_ordered_message(channel_id))
+            {
+                if (m_on_ordered_msg_deliver)
+                    m_on_ordered_msg_deliver(msg->sender, msg->message_id, msg->channel_id, msg->data, msg->total_size);
+                advance_ordered_seq(channel_id);
+                release_ordered_message(msg);
+                continue;
+            }
+            break;
+        }
+    }
+
+    bool udp_connection::deliver_ordered(const packet_header &header, const uint8_t *payload, uint16_t size,
+                                         const channel_manager &channels)
+    {
+        if (!channels.is_ordered(header.channel_id))
+            return false;
+
+        if (is_ordered_next(header.channel_id, header.channel_sequence))
+        {
+            // Expected packet — deliver immediately
+            if (m_on_ordered_pkt_deliver)
+                m_on_ordered_pkt_deliver(header, payload, size);
+            advance_ordered_seq(header.channel_id);
+            drain_ordered(header.channel_id);
+        }
+        else if (header.channel_sequence > expected_ordered_seq(header.channel_id))
+        {
+            // Future packet — buffer for later delivery
+            if (!buffer_ordered_packet(header, payload, size))
+            {
+                // Buffer full — force-skip gap and retry
+                skip_ordered_gap(header.channel_id);
+                drain_ordered(header.channel_id);
+                buffer_ordered_packet(header, payload, size);
+            }
+        }
+        // else: channel_sequence < expected → stale duplicate, ignore
+        return true;
+    }
+
+    void udp_connection::install_ordered_complete_wrapper(const channel_manager *channels, on_message_complete app_cb)
+    {
+        m_on_ordered_msg_deliver = app_cb; // store for drain_ordered
+        m_reassembler.set_on_complete(
+            [this, channels, app_cb](const endpoint_key &sender, uint32_t msg_id, uint8_t ch_id, uint8_t *data,
+                                     size_t total_size)
+            {
+                uint32_t chan_seq = m_reassembler.last_completed_channel_sequence();
+                if (channels->is_ordered(ch_id) && chan_seq > 0)
+                {
+                    if (is_ordered_next(ch_id, chan_seq))
+                    {
+                        // Expected message — deliver immediately
+                        if (app_cb)
+                            app_cb(sender, msg_id, ch_id, data, total_size);
+                        advance_ordered_seq(ch_id);
+                        drain_ordered(ch_id);
+                    }
+                    else if (chan_seq > expected_ordered_seq(ch_id))
+                    {
+                        // Future message — buffer
+                        if (!buffer_ordered_message(sender, msg_id, ch_id, data, total_size, chan_seq))
+                        {
+                            // Buffer full — force skip and drain, then retry
+                            skip_ordered_gap(ch_id);
+                            drain_ordered(ch_id);
+                            buffer_ordered_message(sender, msg_id, ch_id, data, total_size, chan_seq);
+                        }
+                    }
+                    // Stale — deliver anyway to avoid leaking the buffer
+                    else if (app_cb)
+                    {
+                        app_cb(sender, msg_id, ch_id, data, total_size);
+                    }
+                }
+                else
+                {
+                    if (app_cb)
+                        app_cb(sender, msg_id, ch_id, data, total_size);
+                }
+            });
+    }
+
 } // namespace entanglement
