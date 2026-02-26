@@ -133,7 +133,7 @@ struct test_server_ctx
 // TEST 1: Send data before connecting
 // ============================================================================
 // The client attempts to send data packets without having called connect().
-// We expect send_payload to return an error (socket not open).
+// We expect send to return an error (socket not open).
 // ============================================================================
 
 static bool test_send_before_connect()
@@ -142,8 +142,8 @@ static bool test_send_before_connect()
     c.set_verbose(false);
 
     // Socket not bound — send should fail
-    int result = c.send_payload("hello", 5, 0, channels::RELIABLE.id);
-    TEST_ASSERT(result <= 0, "send_payload should fail when not connected");
+    int result = c.send("hello", 5, channels::RELIABLE.id);
+    TEST_ASSERT(result <= 0, "send should fail when not connected");
 
     // Also try poll/update — should not crash
     int polled = c.poll();
@@ -262,7 +262,7 @@ static bool test_send_after_disconnect()
     TEST_ASSERT(succeeded(c.connect()), "connect should succeed");
     c.disconnect();
 
-    int result = c.send_payload("hello", 5);
+    int result = c.send("hello", 5);
     TEST_ASSERT(result <= 0, "send after disconnect should fail");
 
     return true;
@@ -696,10 +696,7 @@ static bool test_full_echo_cycle()
         [&](const packet_header &header, const uint8_t *payload, size_t payload_size, const endpoint_key &sender)
         {
             // Echo back
-            packet_header resp{};
-            resp.flags = header.flags;
-            resp.payload_size = static_cast<uint16_t>(payload_size);
-            srv.send_to(resp, payload, sender);
+            srv.send_to(payload, payload_size, header.channel_id, sender);
         });
 
     TEST_ASSERT(succeeded(srv.start()), "server should start");
@@ -731,7 +728,7 @@ static bool test_full_echo_cycle()
 
     // Send a message
     const char *msg = "PING";
-    c.send_payload(msg, 4);
+    c.send(msg, 4);
 
     // Wait for echo
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
@@ -1375,10 +1372,7 @@ static bool test_channel_echo_integration()
         [&](const packet_header &header, const uint8_t *payload, size_t payload_size, const endpoint_key &sender)
         {
             // Echo back on the same channel
-            packet_header resp{};
-            resp.channel_id = header.channel_id;
-            resp.payload_size = static_cast<uint16_t>(payload_size);
-            srv.send_to(resp, payload, sender);
+            srv.send_to(payload, payload_size, header.channel_id, sender);
         });
 
     TEST_ASSERT(succeeded(srv.start()), "server should start");
@@ -1411,7 +1405,7 @@ static bool test_channel_echo_integration()
 
     // Send on RELIABLE channel
     const char *msg = "ATTACK";
-    c.send_payload(msg, 6, 0, channels::RELIABLE.id);
+    c.send(msg, 6, channels::RELIABLE.id);
 
     // Wait for echo
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
@@ -1624,11 +1618,11 @@ static bool test_channel_negotiation_accepted()
             packet_header resp{};
             resp.channel_id = header.channel_id;
             resp.payload_size = static_cast<uint16_t>(payload_size);
-            srv.send_to(resp, payload, sender);
+            srv.send_to(payload, payload_size, header.channel_id, sender);
         });
 
     const char *msg = "NEGOTIATED";
-    c.send_payload(msg, 10, 0, static_cast<uint8_t>(ch_id));
+    c.send(msg, 10, static_cast<uint8_t>(ch_id));
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (responses.load() == 0 && std::chrono::steady_clock::now() < deadline)
@@ -2105,7 +2099,7 @@ static bool test_small_message_no_fragment()
     TEST_ASSERT(succeeded(c.connect()), "client should connect");
 
     const char *msg = "SMALL";
-    c.send_payload(msg, 5, 0, channels::RELIABLE.id);
+    c.send(msg, 5, channels::RELIABLE.id);
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (last_flags.load() == 0xFF && std::chrono::steady_clock::now() < deadline)
@@ -2177,8 +2171,8 @@ static bool test_fragmented_e2e()
     for (size_t i = 0; i < msg_size; ++i)
         original[i] = static_cast<uint8_t>((i * 37 + 13) & 0xFF);
 
-    int sent = c.send_payload(original.data(), msg_size, 0, channels::RELIABLE.id);
-    TEST_ASSERT(sent == static_cast<int>(msg_size), "send_payload should return message size");
+    int sent = c.send(original.data(), msg_size, channels::RELIABLE.id);
+    TEST_ASSERT(sent == static_cast<int>(msg_size), "send should return message size");
 
     // Wait for server to reassemble
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
@@ -2200,7 +2194,7 @@ static bool test_fragmented_e2e()
 }
 
 // ============================================================================
-// TEST 48: Fragmented echo E2E — full round trip with send_payload_to
+// TEST 48: Fragmented echo E2E — full round trip with send_to
 // ============================================================================
 
 static bool test_fragmented_echo_e2e()
@@ -2209,7 +2203,7 @@ static bool test_fragmented_echo_e2e()
     srv.channels().register_defaults();
     std::atomic<bool> stop_flag{false};
 
-    // Server: reassemble then echo back via send_payload_to
+    // Server: reassemble then echo back via send_to
     std::vector<uint8_t> srv_buffer;
     uint8_t srv_echo_channel = 0;
     std::string srv_echo_addr;
@@ -2226,7 +2220,7 @@ static bool test_fragmented_echo_e2e()
         [&](const endpoint_key &, uint32_t, uint8_t channel_id, uint8_t *data, size_t total)
         {
             // Echo the complete message back
-            srv.send_payload_to(data, total, channel_id, srv_echo_addr, srv_echo_port);
+            srv.send_to(data, total, channel_id, srv_echo_addr, srv_echo_port);
         });
 
     // Capture the sender address on connect (on_packet_received skips fragments)
@@ -2286,7 +2280,7 @@ static bool test_fragmented_echo_e2e()
     for (size_t i = 0; i < msg_size; ++i)
         original[i] = static_cast<uint8_t>((i * 37 + 13) & 0xFF);
 
-    c.send_payload(original.data(), msg_size, 0, channels::RELIABLE.id);
+    c.send(original.data(), msg_size, channels::RELIABLE.id);
 
     // Wait for echo AND sender ACK
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
@@ -2459,7 +2453,7 @@ static bool test_scatter_gather_e2e()
     for (size_t i = 0; i < msg_size; ++i)
         original[i] = static_cast<uint8_t>((i * 41 + 7) & 0xFF);
 
-    c.send_payload(original.data(), msg_size, 0, channels::RELIABLE.id);
+    c.send(original.data(), msg_size, channels::RELIABLE.id);
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
     while (!srv_complete && std::chrono::steady_clock::now() < deadline)
@@ -2543,7 +2537,7 @@ static bool test_set_on_message_failed_expired_e2e()
         hdr.flags = FLAG_FRAGMENT;
         hdr.channel_id = channels::RELIABLE.id;
         hdr.payload_size = static_cast<uint16_t>(FRAGMENT_HEADER_SIZE + 100);
-        c.send(hdr, frag_payload);
+        c.send_raw(hdr, frag_payload);
     }
 
     // Wait for server to receive the fragment
@@ -2940,8 +2934,8 @@ static bool test_per_connection_reassembler_isolation()
     std::vector<uint8_t> data1(msg_size, 0x11);
     std::vector<uint8_t> data2(msg_size, 0x22);
 
-    c1.send_payload(data1.data(), msg_size, 0, channels::RELIABLE.id);
-    c2.send_payload(data2.data(), msg_size, 0, channels::RELIABLE.id);
+    c1.send(data1.data(), msg_size, channels::RELIABLE.id);
+    c2.send(data2.data(), msg_size, channels::RELIABLE.id);
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
     while (complete_count.load() < 2 && std::chrono::steady_clock::now() < deadline)
@@ -3026,7 +3020,7 @@ static bool test_set_on_message_failed_evicted_e2e()
         hdr.flags = FLAG_FRAGMENT;
         hdr.channel_id = channels::RELIABLE.id;
         hdr.payload_size = static_cast<uint16_t>(FRAGMENT_HEADER_SIZE + 100);
-        c.send(hdr, frag_payload);
+        c.send_raw(hdr, frag_payload);
     }
 
     // Wait for server to process all fragments
@@ -3048,7 +3042,7 @@ static bool test_set_on_message_failed_evicted_e2e()
         hdr.flags = FLAG_FRAGMENT;
         hdr.channel_id = channels::RELIABLE.id;
         hdr.payload_size = static_cast<uint16_t>(FRAGMENT_HEADER_SIZE + 100);
-        c.send(hdr, frag_payload);
+        c.send_raw(hdr, frag_payload);
     }
 
     deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
@@ -3068,10 +3062,10 @@ static bool test_set_on_message_failed_evicted_e2e()
 }
 
 // ============================================================================
-// TEST 61: Backpressure — client.is_fragment_throttled() and send_payload -2
+// TEST 61: Backpressure — client.is_fragment_throttled() and send -2
 // ============================================================================
 // Manually set backpressure on the client's connection and verify
-// send_payload returns -2 for fragmented sends.
+// send returns -2 for fragmented sends.
 
 static bool test_client_backpressure_throttle()
 {
@@ -3093,12 +3087,12 @@ static bool test_client_backpressure_throttle()
     TEST_ASSERT(c.is_fragment_throttled(), "should be throttled after set");
 
     // Small payload (single packet) should NOT be affected
-    int r1 = c.send_payload("hello", 5, 0, channels::RELIABLE.id);
+    int r1 = c.send("hello", 5, channels::RELIABLE.id);
     TEST_ASSERT(r1 > 0, "single-packet send should work even under backpressure");
 
     // Fragmented payload should return a negative error_code
     std::vector<uint8_t> big(MAX_FRAGMENT_PAYLOAD * 3, 0xAA);
-    int r2 = c.send_payload(big.data(), big.size(), 0, channels::RELIABLE.id);
+    int r2 = c.send(big.data(), big.size(), channels::RELIABLE.id);
     TEST_ASSERT(r2 < 0, "fragmented send should return negative error_code when backpressured");
 
     // Release backpressure
@@ -3110,7 +3104,7 @@ static bool test_client_backpressure_throttle()
 }
 
 // ============================================================================
-// TEST 62: Backpressure — server.is_fragment_throttled() and send_payload_to error_code
+// TEST 62: Backpressure — server.is_fragment_throttled() and send_to error_code
 // ============================================================================
 
 static bool test_server_backpressure_throttle()
@@ -3157,7 +3151,7 @@ static bool test_server_backpressure_throttle()
 
     // Fragmented send should work
     std::vector<uint8_t> big(MAX_FRAGMENT_PAYLOAD * 3, 0xBB);
-    int r1 = srv.send_payload_to(big.data(), big.size(), channels::RELIABLE.id, client_addr, client_port);
+    int r1 = srv.send_to(big.data(), big.size(), channels::RELIABLE.id, client_addr, client_port);
     TEST_ASSERT(r1 > 0, "fragmented send should work when not throttled");
 
     // Unknown address — not throttled
@@ -3227,13 +3221,7 @@ static bool test_ordered_simple_delivery()
     // Server echoes every simple packet back on the same channel
     srv.set_on_client_data_received(
         [&](const packet_header &header, const uint8_t *payload, size_t payload_size, const endpoint_key &sender)
-        {
-            packet_header resp{};
-            resp.flags = header.flags;
-            resp.channel_id = header.channel_id;
-            resp.payload_size = static_cast<uint16_t>(payload_size);
-            srv.send_to(resp, payload, sender);
-        });
+        { srv.send_to(payload, payload_size, header.channel_id, sender); });
 
     TEST_ASSERT(succeeded(srv.start()), "server should start");
 
@@ -3279,10 +3267,7 @@ static bool test_ordered_simple_delivery()
         uint8_t payload[8] = {};
         std::memcpy(payload, &msg_id, sizeof(uint32_t));
 
-        packet_header hdr{};
-        hdr.channel_id = channels::ORDERED.id;
-        hdr.payload_size = sizeof(payload);
-        c.send(hdr, payload);
+        c.send(payload, sizeof(payload), channels::ORDERED.id);
 
         // Wait for echo before sending next (ordered gating)
         echo_received = false;
@@ -3344,7 +3329,7 @@ static bool test_ordered_fragmented_delivery()
     srv.set_on_message_complete(
         [&](const endpoint_key &, uint32_t, uint8_t ch_id, uint8_t *data, size_t total)
         {
-            srv.send_payload_to(data, total, ch_id, srv_echo_addr, srv_echo_port);
+            srv.send_to(data, total, ch_id, srv_echo_addr, srv_echo_port);
             delete[] data;
         });
 
@@ -3403,7 +3388,7 @@ static bool test_ordered_fragmented_delivery()
         uint32_t msg_id = static_cast<uint32_t>(i);
         std::memcpy(buf.data(), &msg_id, sizeof(uint32_t));
 
-        c.send_payload(buf.data(), buf.size(), 0, channels::ORDERED.id);
+        c.send(buf.data(), buf.size(), channels::ORDERED.id);
 
         // Wait for reassembled echo before sending next
         echo_received = false;
@@ -3460,13 +3445,7 @@ static bool test_ordered_mixed_delivery()
     // Echo simple packets
     srv.set_on_client_data_received(
         [&](const packet_header &header, const uint8_t *payload, size_t payload_size, const endpoint_key &sender)
-        {
-            packet_header resp{};
-            resp.flags = header.flags;
-            resp.channel_id = header.channel_id;
-            resp.payload_size = static_cast<uint16_t>(payload_size);
-            srv.send_to(resp, payload, sender);
-        });
+        { srv.send_to(payload, payload_size, header.channel_id, sender); });
 
     // Echo fragmented messages
     srv.set_on_allocate_message([&](const endpoint_key &, uint32_t, uint8_t, uint8_t, size_t max_size) -> uint8_t *
@@ -3475,7 +3454,7 @@ static bool test_ordered_mixed_delivery()
     srv.set_on_message_complete(
         [&](const endpoint_key &, uint32_t, uint8_t ch_id, uint8_t *data, size_t total)
         {
-            srv.send_payload_to(data, total, ch_id, srv_echo_addr, srv_echo_port);
+            srv.send_to(data, total, ch_id, srv_echo_addr, srv_echo_port);
             delete[] data;
         });
 
@@ -3549,16 +3528,13 @@ static bool test_ordered_mixed_delivery()
         {
             std::vector<uint8_t> buf(FRAG_SIZE, 0xCD);
             std::memcpy(buf.data(), &msg_id, sizeof(uint32_t));
-            c.send_payload(buf.data(), buf.size(), 0, channels::ORDERED.id);
+            c.send(buf.data(), buf.size(), channels::ORDERED.id);
         }
         else
         {
             uint8_t payload[8] = {};
             std::memcpy(payload, &msg_id, sizeof(uint32_t));
-            packet_header hdr{};
-            hdr.channel_id = channels::ORDERED.id;
-            hdr.payload_size = sizeof(payload);
-            c.send(hdr, payload);
+            c.send(payload, sizeof(payload), channels::ORDERED.id);
         }
 
         // Wait for echo before sending next
@@ -3623,12 +3599,7 @@ static bool test_server_start_stop_restart()
 
     srv.set_on_client_data_received(
         [&](const packet_header &header, const uint8_t *payload, size_t payload_size, const endpoint_key &sender)
-        {
-            packet_header resp{};
-            resp.flags = header.flags;
-            resp.payload_size = static_cast<uint16_t>(payload_size);
-            srv.send_to(resp, payload, sender);
-        });
+        { srv.send_to(payload, payload_size, header.channel_id, sender); });
 
     std::thread server_thread(
         [&]()
@@ -3646,7 +3617,7 @@ static bool test_server_start_stop_restart()
     c.set_on_data_received([&](const packet_header &, const uint8_t *, size_t) { echoes++; });
 
     TEST_ASSERT(succeeded(c.connect()), "client should connect to restarted server");
-    c.send_payload("RESTART", 7);
+    c.send("RESTART", 7);
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (echoes.load() == 0 && std::chrono::steady_clock::now() < deadline)
@@ -3817,7 +3788,7 @@ static bool test_reconnect_after_disconnect()
         client c("127.0.0.1", 9953);
         c.set_verbose(false);
         TEST_ASSERT(succeeded(c.connect()), "first connect should succeed");
-        c.send_payload("HI1", 3);
+        c.send("HI1", 3);
 
         auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         while (server_data_count.load() == 0 && std::chrono::steady_clock::now() < deadline)
@@ -3838,7 +3809,7 @@ static bool test_reconnect_after_disconnect()
         client c("127.0.0.1", 9953);
         c.set_verbose(false);
         TEST_ASSERT(succeeded(c.connect()), "reconnect should succeed");
-        c.send_payload("HI2", 3);
+        c.send("HI2", 3);
 
         auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         while (server_data_count.load() == count_after_first && std::chrono::steady_clock::now() < deadline)
@@ -3966,10 +3937,10 @@ static bool test_zero_length_payload()
     c.set_verbose(false);
     TEST_ASSERT(succeeded(c.connect()), "client should connect");
 
-    // Send zero-length payload via send() with empty body
+    // Send zero-length payload via send_raw() with empty body
     packet_header hdr{};
     hdr.payload_size = 0;
-    c.send(hdr, nullptr);
+    c.send_raw(hdr, nullptr);
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (data_received.load() == 0 && std::chrono::steady_clock::now() < deadline)
@@ -4042,7 +4013,7 @@ static bool test_exact_max_payload()
     for (size_t i = 0; i < MAX_PAYLOAD; ++i)
         buf[i] = static_cast<uint8_t>(i & 0xFF);
 
-    int sent = c.send_payload(buf.data(), buf.size(), 0, channels::RELIABLE.id);
+    int sent = c.send(buf.data(), buf.size(), channels::RELIABLE.id);
     TEST_ASSERT(sent > 0, "send should succeed");
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
@@ -4078,12 +4049,7 @@ static bool test_server_stop_with_clients()
 
     srv.set_on_client_data_received(
         [&](const packet_header &header, const uint8_t *payload, size_t payload_size, const endpoint_key &sender)
-        {
-            packet_header resp{};
-            resp.flags = header.flags;
-            resp.payload_size = static_cast<uint16_t>(payload_size);
-            srv.send_to(resp, payload, sender);
-        });
+        { srv.send_to(payload, payload_size, header.channel_id, sender, header.flags); });
 
     TEST_ASSERT(succeeded(srv.start()), "server should start");
 
@@ -4107,7 +4073,7 @@ static bool test_server_stop_with_clients()
         auto c = std::make_unique<client>("127.0.0.1", 9957);
         c->set_verbose(false);
         TEST_ASSERT(succeeded(c->connect()), ("client " + std::to_string(i) + " should connect").c_str());
-        c->send_payload("DATA", 4);
+        c->send("DATA", 4);
         clients.push_back(std::move(c));
     }
 

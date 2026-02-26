@@ -63,28 +63,27 @@ namespace entanglement
         void set_on_channel_requested(on_channel_requested callback);
         void set_on_packet_lost(on_server_packet_lost callback);
 
-        // Send a data packet to a connected client (by endpoint_key)
-        int send_to(packet_header &header, const void *payload, const endpoint_key &dest);
+        // Send a data packet with a pre-built header (low-level).
+        // Use send_to() instead for normal application data.
+        int send_raw_to(packet_header &header, const void *payload, const endpoint_key &dest);
+        int send_raw_to(packet_header &header, const void *payload, const std::string &address, uint16_t port);
 
-        // Send a data packet to a connected client (by address string + port)
-        int send_to(packet_header &header, const void *payload, const std::string &address, uint16_t port);
+        // Unified send: auto-handles simple and fragmented paths.
+        // Messages <= MAX_PAYLOAD_SIZE are sent as a single packet;
+        // larger messages are automatically fragmented.
+        // Returns bytes of user data sent, or a negative error_code on failure.
+        int send_to(const void *data, size_t size, uint8_t channel_id, const endpoint_key &dest, uint8_t flags = 0,
+                    uint32_t *out_message_id = nullptr);
+        int send_to(const void *data, size_t size, uint8_t channel_id, const std::string &address, uint16_t port,
+                    uint8_t flags = 0, uint32_t *out_message_id = nullptr);
 
-        // Send payload to a connected client (by endpoint_key), auto-fragmenting if needed.
-        int send_payload_to(const void *data, size_t size, uint8_t channel_id, const endpoint_key &dest,
-                            uint8_t flags = 0, uint32_t *out_message_id = nullptr);
-
-        // Send payload to a connected client (by address string + port), auto-fragmenting if needed.
-        int send_payload_to(const void *data, size_t size, uint8_t channel_id, const std::string &address,
-                            uint16_t port, uint8_t flags = 0, uint32_t *out_message_id = nullptr);
-
-        // Send a single fragment to a connected client (by endpoint_key).
-        int send_fragment_to(uint32_t message_id, uint8_t index, uint8_t count, const void *data, size_t size,
-                             uint8_t flags, uint8_t channel_id, const endpoint_key &dest,
+        // Retransmit a single fragment to a specific client.
+        // For manual loss recovery only — prefer enable_auto_retransmit() instead.
+        int send_fragment_to(uint32_t message_id, uint8_t fragment_index, uint8_t fragment_count, const void *data,
+                             size_t size, uint8_t flags, uint8_t channel_id, const endpoint_key &dest,
                              uint32_t channel_sequence = 0);
-
-        // Send a single fragment to a connected client (by address string + port).
-        int send_fragment_to(uint32_t message_id, uint8_t index, uint8_t count, const void *data, size_t size,
-                             uint8_t flags, uint8_t channel_id, const std::string &address, uint16_t port,
+        int send_fragment_to(uint32_t message_id, uint8_t fragment_index, uint8_t fragment_count, const void *data,
+                             size_t size, uint8_t flags, uint8_t channel_id, const std::string &address, uint16_t port,
                              uint32_t channel_sequence = 0);
 
         // Disconnect a specific client

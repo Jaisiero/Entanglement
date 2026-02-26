@@ -117,24 +117,25 @@ namespace entanglement
         }
     }
 
-    int client::send(packet_header &header, const void *payload)
+    int client::send_raw(packet_header &header, const void *payload)
     {
         bool reliable = m_channels.is_reliable(header.channel_id);
         m_connection.prepare_header(header, reliable);
         return m_socket.send_packet(header, payload, m_server_endpoint);
     }
 
-    int client::send_payload(const void *data, size_t size, uint8_t flags, uint8_t channel_id, uint32_t *out_message_id)
+    int client::send(const void *data, size_t size, uint8_t channel_id, uint8_t flags, uint32_t *out_message_id,
+                     uint64_t *out_sequence)
     {
         return m_connection.send_payload(m_socket, m_channels, data, size, flags, channel_id, m_server_endpoint,
-                                         out_message_id);
+                                         out_message_id, out_sequence);
     }
 
-    int client::send_fragment(uint32_t message_id, uint8_t index, uint8_t count, const void *data, size_t size,
-                              uint8_t flags, uint8_t channel_id, uint32_t channel_sequence)
+    int client::send_fragment(uint32_t message_id, uint8_t fragment_index, uint8_t fragment_count, const void *data,
+                              size_t size, uint8_t flags, uint8_t channel_id)
     {
-        return m_connection.send_fragment(m_socket, m_channels, message_id, index, count, data, size, flags, channel_id,
-                                          m_server_endpoint, channel_sequence);
+        return m_connection.send_fragment(m_socket, m_channels, message_id, fragment_index, fragment_count, data, size,
+                                          flags, channel_id, m_server_endpoint);
     }
 
     int client::poll(int max_packets)

@@ -205,7 +205,7 @@ static client_stats run_churn_client(int id, const churn_config &cfg, std::atomi
                     {
                         if (c.is_connected())
                         {
-                            c.send_payload(si.payload.data(), si.payload.size(), 0, si.channel_id);
+                            c.send(si.payload.data(), si.payload.size(), si.channel_id);
                             retransmissions++;
                         }
                         break;
@@ -221,10 +221,7 @@ static client_stats run_churn_client(int id, const churn_config &cfg, std::atomi
             m.round_id = static_cast<uint32_t>(round);
             m.channel_id = channels::ORDERED.id;
 
-            packet_header hdr{};
-            hdr.channel_id = channels::ORDERED.id;
-            hdr.payload_size = CHURN_MSG_SIZE;
-            int r = c.send(hdr, &m);
+            int r = c.send(&m, CHURN_MSG_SIZE, channels::ORDERED.id);
             if (r > 0)
                 simple_sent++;
 
@@ -243,7 +240,7 @@ static client_stats run_churn_client(int id, const churn_config &cfg, std::atomi
             m.channel_id = channels::RELIABLE.id;
             std::memcpy(buf.data(), &m, CHURN_MSG_SIZE);
 
-            int r = c.send_payload(buf.data(), buf.size(), 0, channels::RELIABLE.id);
+            int r = c.send(buf.data(), buf.size(), channels::RELIABLE.id);
             if (r > 0)
                 frag_sent++;
 
@@ -359,11 +356,7 @@ int main(int argc, char *argv[])
         [&](const packet_header &header, const uint8_t *payload, size_t payload_size, const endpoint_key &sender)
         {
             srv_stats.total_data_packets++;
-            packet_header resp{};
-            resp.flags = header.flags;
-            resp.channel_id = header.channel_id;
-            resp.payload_size = static_cast<uint16_t>(payload_size);
-            srv.send_to(resp, payload, sender);
+            srv.send_to(payload, payload_size, header.channel_id, sender, header.flags);
         });
 
     // Echo fragmented messages back
@@ -402,7 +395,7 @@ int main(int argc, char *argv[])
             auto it = echo_routes.find(key);
             if (it != echo_routes.end())
             {
-                srv.send_payload_to(data, total, ch_id, it->second.first, it->second.second);
+                srv.send_to(data, total, ch_id, it->second.first, it->second.second);
             }
             delete[] data;
         });

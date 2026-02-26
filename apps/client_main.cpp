@@ -407,12 +407,10 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
         payload.total_expected = 0;
         payload.channel_id = mi.channel_id;
 
-        packet_header hdr{};
-        hdr.channel_id = mi.channel_id;
-        hdr.payload_size = static_cast<uint16_t>(SOAK_MSG_SIZE);
-        cli.send(hdr, &payload);
+        uint64_t seq = 0;
+        cli.send(&payload, SOAK_MSG_SIZE, mi.channel_id, 0, nullptr, &seq);
 
-        seq_to_msg[hdr.sequence] = mi;
+        seq_to_msg[seq] = mi;
 
         // Reset ordered gating timer so the timeout recovery knows we just retried
         if (mi.channel_id == channels::ORDERED.id)
@@ -480,10 +478,7 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
             payload.total_expected = 0;
             payload.channel_id = channels::ORDERED.id;
 
-            packet_header hdr{};
-            hdr.channel_id = channels::ORDERED.id;
-            hdr.payload_size = static_cast<uint16_t>(SOAK_MSG_SIZE);
-            cli.send(hdr, &payload);
+            cli.send(&payload, SOAK_MSG_SIZE, channels::ORDERED.id);
 
             // Do NOT add to seq_to_msg — the timeout mechanism handles ordered
             // retries independently. Adding would let the loss handler also
@@ -504,8 +499,8 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
             // completed reassembly (but the echo was lost on the way back).
             // A fresh message_id guarantees a new reassembly entry and a new echo.
             uint32_t lib_message_id = 0;
-            int sent = cli.send_payload(ordered_frag_pending_payload.data(), ordered_frag_pending_payload.size(), 0,
-                                        channels::ORDERED.id, &lib_message_id);
+            int sent = cli.send(ordered_frag_pending_payload.data(), ordered_frag_pending_payload.size(),
+                                channels::ORDERED.id, 0, &lib_message_id);
             if (sent > 0)
             {
                 if (lib_message_id != 0)
@@ -571,12 +566,10 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
             payload.total_expected = 0;
             payload.channel_id = ch_id;
 
-            packet_header hdr{};
-            hdr.channel_id = ch_id;
-            hdr.payload_size = static_cast<uint16_t>(SOAK_MSG_SIZE);
-            cli.send(hdr, &payload);
+            uint64_t seq = 0;
+            cli.send(&payload, SOAK_MSG_SIZE, ch_id, 0, nullptr, &seq);
 
-            seq_to_msg[hdr.sequence] = {ch_id, msg_id};
+            seq_to_msg[seq] = {ch_id, msg_id};
             auto sit = simple_idx.find(ch_id);
             if (sit != simple_idx.end())
                 ++result.streams[sit->second].total_packets;
@@ -604,7 +597,7 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
             build_frag_payload(frag_buf, msg_id, 0, ch_id);
 
             uint32_t lib_message_id = 0;
-            int sent_bytes = cli.send_payload(frag_buf.data(), frag_buf.size(), 0, ch_id, &lib_message_id);
+            int sent_bytes = cli.send(frag_buf.data(), frag_buf.size(), ch_id, 0, &lib_message_id);
 
             if (sent_bytes > 0)
             {
@@ -742,11 +735,9 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
                 payload.total_expected = 0;
                 payload.channel_id = channels::RELIABLE.id;
 
-                packet_header hdr{};
-                hdr.channel_id = channels::RELIABLE.id;
-                hdr.payload_size = static_cast<uint16_t>(SOAK_MSG_SIZE);
-                cli.send(hdr, &payload);
-                seq_to_msg[hdr.sequence] = {channels::RELIABLE.id, mid};
+                uint64_t seq = 0;
+                cli.send(&payload, SOAK_MSG_SIZE, channels::RELIABLE.id, 0, nullptr, &seq);
+                seq_to_msg[seq] = {channels::RELIABLE.id, mid};
 
                 ++result.streams[S_REL].retransmissions;
                 ++result.streams[S_REL].total_packets;
@@ -763,8 +754,8 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
         if (ordered_frag_pending && !ordered_frag_pending_payload.empty())
         {
             uint32_t new_lib_msg_id = 0;
-            int sent = cli.send_payload(ordered_frag_pending_payload.data(), ordered_frag_pending_payload.size(), 0,
-                                        channels::ORDERED.id, &new_lib_msg_id);
+            int sent = cli.send(ordered_frag_pending_payload.data(), ordered_frag_pending_payload.size(),
+                                channels::ORDERED.id, 0, &new_lib_msg_id);
             if (sent > 0 && new_lib_msg_id != 0)
             {
                 frag_payloads[new_lib_msg_id] = ordered_frag_pending_payload;
@@ -785,10 +776,7 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
             payload.total_expected = 0;
             payload.channel_id = channels::ORDERED.id;
 
-            packet_header hdr{};
-            hdr.channel_id = channels::ORDERED.id;
-            hdr.payload_size = static_cast<uint16_t>(SOAK_MSG_SIZE);
-            cli.send(hdr, &payload);
+            cli.send(&payload, SOAK_MSG_SIZE, channels::ORDERED.id);
 
             ordered_simple_send_time = std::chrono::steady_clock::now();
             ++result.streams[S_ORD].retransmissions;

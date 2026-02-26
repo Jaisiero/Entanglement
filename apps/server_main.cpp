@@ -12,7 +12,7 @@
 // This ensures 100% end-to-end delivery under simulated packet loss.
 //
 // Simple messages   → set_on_client_data_received   → echo via send_to
-// Fragmented messages → set_on_message_complete → echo via send_payload_to
+// Fragmented messages → set_on_message_complete → echo via send_to
 // ============================================================================
 
 #include "channel_manager.h"
@@ -505,7 +505,7 @@ int main(int argc, char *argv[])
             reply.shard_id = hdr.shard_id;
             reply.channel_id = hdr.channel_id;
             reply.payload_size = static_cast<uint16_t>(size);
-            srv.send_to(reply, payload, sender);
+            srv.send_raw_to(reply, payload, sender);
 
             // Store payload for echo retransmission (reliable channels only)
             if (srv.channels().is_reliable(hdr.channel_id))
@@ -570,7 +570,7 @@ int main(int argc, char *argv[])
 
             // Echo entire reassembled payload back (auto-fragments)
             uint32_t echo_msg_id = 0;
-            srv.send_payload_to(data, total_size, ch_id, addr, p, 0, &echo_msg_id);
+            srv.send_to(data, total_size, ch_id, addr, p, 0, &echo_msg_id);
 
             // Store payload for echo retransmission (reliable channels only)
             if (srv.channels().is_reliable(ch_id) && echo_msg_id != 0)
@@ -650,7 +650,7 @@ int main(int argc, char *argv[])
         reply.channel_id = entry.channel_id;
         reply.channel_sequence = entry.channel_sequence;
         reply.payload_size = static_cast<uint16_t>(entry.payload.size());
-        srv.send_to(reply, entry.payload.data(), client_ep);
+        srv.send_raw_to(reply, entry.payload.data(), client_ep);
 
         // Update tracking: remove old sequence, store new one under new sequence
         simple_echo_entry new_entry;

@@ -271,7 +271,7 @@ namespace entanglement
 
     // --- Sending ---
 
-    int server::send_to(packet_header &header, const void *payload, const endpoint_key &key)
+    int server::send_raw_to(packet_header &header, const void *payload, const endpoint_key &key)
     {
         udp_connection *conn = find(key);
         if (conn && conn->state() == connection_state::CONNECTED)
@@ -282,41 +282,42 @@ namespace entanglement
         return m_socket.send_packet(header, payload, key);
     }
 
-    int server::send_to(packet_header &header, const void *payload, const std::string &address, uint16_t port)
+    int server::send_raw_to(packet_header &header, const void *payload, const std::string &address, uint16_t port)
     {
-        return send_to(header, payload, endpoint_from_string(address, port));
+        return send_raw_to(header, payload, endpoint_from_string(address, port));
     }
 
-    int server::send_payload_to(const void *data, size_t size, uint8_t channel_id, const endpoint_key &key,
-                                uint8_t flags, uint32_t *out_message_id)
+    int server::send_to(const void *data, size_t size, uint8_t channel_id, const endpoint_key &key, uint8_t flags,
+                        uint32_t *out_message_id)
     {
         udp_connection *conn = find(key);
-        if (!conn || conn->state() != connection_state::CONNECTED)
+        if (!conn || conn->state() == connection_state::DISCONNECTED)
             return static_cast<int>(error_code::not_connected);
         return conn->send_payload(m_socket, m_channels, data, size, flags, channel_id, key, out_message_id);
     }
 
-    int server::send_payload_to(const void *data, size_t size, uint8_t channel_id, const std::string &address,
-                                uint16_t port, uint8_t flags, uint32_t *out_message_id)
+    int server::send_to(const void *data, size_t size, uint8_t channel_id, const std::string &address, uint16_t port,
+                        uint8_t flags, uint32_t *out_message_id)
     {
-        return send_payload_to(data, size, channel_id, endpoint_from_string(address, port), flags, out_message_id);
+        return send_to(data, size, channel_id, endpoint_from_string(address, port), flags, out_message_id);
     }
 
-    int server::send_fragment_to(uint32_t message_id, uint8_t index, uint8_t count, const void *data, size_t size,
-                                 uint8_t flags, uint8_t channel_id, const endpoint_key &key, uint32_t channel_sequence)
-    {
-        udp_connection *conn = find(key);
-        if (!conn || conn->state() != connection_state::CONNECTED)
-            return static_cast<int>(error_code::not_connected);
-        return conn->send_fragment(m_socket, m_channels, message_id, index, count, data, size, flags, channel_id, key,
-                                   channel_sequence);
-    }
-
-    int server::send_fragment_to(uint32_t message_id, uint8_t index, uint8_t count, const void *data, size_t size,
-                                 uint8_t flags, uint8_t channel_id, const std::string &address, uint16_t port,
+    int server::send_fragment_to(uint32_t message_id, uint8_t fragment_index, uint8_t fragment_count, const void *data,
+                                 size_t size, uint8_t flags, uint8_t channel_id, const endpoint_key &key,
                                  uint32_t channel_sequence)
     {
-        return send_fragment_to(message_id, index, count, data, size, flags, channel_id,
+        udp_connection *conn = find(key);
+        if (!conn || conn->state() == connection_state::DISCONNECTED)
+            return static_cast<int>(error_code::not_connected);
+        return conn->send_fragment(m_socket, m_channels, message_id, fragment_index, fragment_count, data, size, flags,
+                                   channel_id, key, channel_sequence);
+    }
+
+    int server::send_fragment_to(uint32_t message_id, uint8_t fragment_index, uint8_t fragment_count, const void *data,
+                                 size_t size, uint8_t flags, uint8_t channel_id, const std::string &address,
+                                 uint16_t port, uint32_t channel_sequence)
+    {
+        return send_fragment_to(message_id, fragment_index, fragment_count, data, size, flags, channel_id,
                                 endpoint_from_string(address, port), channel_sequence);
     }
 

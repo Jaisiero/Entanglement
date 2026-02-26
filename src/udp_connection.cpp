@@ -548,11 +548,11 @@ namespace entanglement
         return nullptr;
     }
 
-    // --- Unified send helpers (shared by client and server) ---
+    // --- Unified send (shared by client and server) ---
 
     int udp_connection::send_payload(udp_socket &socket, const channel_manager &channels, const void *data, size_t size,
                                      uint8_t flags, uint8_t channel_id, const endpoint_key &dest,
-                                     uint32_t *out_message_id)
+                                     uint32_t *out_message_id, uint64_t *out_sequence)
     {
         // Single-packet path (no fragmentation overhead)
         if (size <= MAX_PAYLOAD_SIZE)
@@ -565,6 +565,9 @@ namespace entanglement
             header.payload_size = static_cast<uint16_t>(size);
             bool reliable = channels.is_reliable(channel_id);
             prepare_header(header, reliable);
+
+            if (out_sequence)
+                *out_sequence = header.sequence;
 
             // Store for auto-retransmit (reliable channels only)
             if (reliable && m_retransmit)

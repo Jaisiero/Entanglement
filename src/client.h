@@ -44,23 +44,24 @@ namespace entanglement
 
         bool is_connected() const { return m_connected.load(); }
 
-        // Send a data packet (header gets seq/ack filled automatically)
-        int send(packet_header &header, const void *payload = nullptr);
+        // Send a data packet with a pre-built header (low-level).
+        // The header gets seq/ack filled automatically.
+        // Use send() instead for normal application data.
+        int send_raw(packet_header &header, const void *payload = nullptr);
 
-        // Send raw payload with auto-filled header fields.
-        // Messages <= MAX_PAYLOAD_SIZE are sent as a single packet.
-        // Larger messages are automatically fragmented.
-        // If out_message_id is non-null, the library message_id is written there
-        // (only meaningful for fragmented sends; 0 for single-packet sends).
+        // Unified send: auto-handles simple and fragmented paths.
+        // Messages <= MAX_PAYLOAD_SIZE are sent as a single packet;
+        // larger messages are automatically fragmented.
+        // out_message_id: if non-null, receives the library message_id (non-zero for fragmented sends).
+        // out_sequence:   if non-null, receives the packet sequence (only for single-packet sends).
         // Returns bytes of user data sent, or a negative error_code on failure.
-        int send_payload(const void *data, size_t size, uint8_t flags = 0, uint8_t channel_id = 0,
-                         uint32_t *out_message_id = nullptr);
+        int send(const void *data, size_t size, uint8_t channel_id = 0, uint8_t flags = 0,
+                 uint32_t *out_message_id = nullptr, uint64_t *out_sequence = nullptr);
 
-        // Send a single fragment (for retransmission or custom fragmented sends).
-        // The fragment is tagged with FLAG_FRAGMENT and carries the given message_id/index/count.
-        // channel_sequence: if non-zero, preserved on the header (for fragment 0 of ordered retransmissions).
-        int send_fragment(uint32_t message_id, uint8_t index, uint8_t count, const void *data, size_t size,
-                          uint8_t flags, uint8_t channel_id, uint32_t channel_sequence = 0);
+        // Retransmit a single fragment of a previously started fragmented message.
+        // For manual loss recovery only — prefer enable_auto_retransmit() instead.
+        int send_fragment(uint32_t message_id, uint8_t fragment_index, uint8_t fragment_count, const void *data,
+                          size_t size, uint8_t flags, uint8_t channel_id);
 
         // Receive and dispatch incoming packets
         int poll(int max_packets = DEFAULT_MAX_POLL_PACKETS);

@@ -271,17 +271,17 @@ namespace entanglement
         void set_ordered_stall_timeout(int64_t timeout_us) { m_ordered_stall_timeout_us = timeout_us; }
         int64_t ordered_stall_timeout() const { return m_ordered_stall_timeout_us; }
 
-        // --- Unified send helpers (shared by client and server) ---
+        // --- Unified send (shared by client and server) ---
 
         // Send a user message (auto-fragments if needed).
         // Returns bytes of user data sent, or a negative error_code.
+        // out_message_id: if non-null, receives the library message_id (non-zero for fragmented sends).
+        // out_sequence:   if non-null, receives the packet sequence (only for single-packet sends).
         int send_payload(udp_socket &socket, const channel_manager &channels, const void *data, size_t size,
                          uint8_t flags, uint8_t channel_id, const endpoint_key &dest,
-                         uint32_t *out_message_id = nullptr);
+                         uint32_t *out_message_id = nullptr, uint64_t *out_sequence = nullptr);
 
-        // Send a single fragment (for retransmission or custom fragmented sends).
-        // Returns bytes sent, or negative on error.
-        // channel_sequence: if non-zero, preserved on the header (for fragment 0 of ordered messages).
+        // Send a single fragment (internal — used by send_payload and auto-retransmit).
         int send_fragment(udp_socket &socket, const channel_manager &channels, uint32_t message_id, uint8_t index,
                           uint8_t count, const void *data, size_t size, uint8_t flags, uint8_t channel_id,
                           const endpoint_key &dest, uint32_t channel_sequence = 0);
