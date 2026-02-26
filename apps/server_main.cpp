@@ -463,10 +463,12 @@ int main(int argc, char *argv[])
     // SIMPLE MESSAGES → on_client_data_received
     // =========================================================================
     srv.set_on_client_data_received(
-        [&](const packet_header &hdr, const uint8_t *payload, size_t size, const std::string &addr, uint16_t p)
+        [&](const packet_header &hdr, const uint8_t *payload, size_t size, const endpoint_key &sender)
         {
             ++g_total_simple_packets;
 
+            std::string addr = endpoint_address_string(sender);
+            uint16_t p = sender.port;
             std::string ck = make_client_key(addr, p);
             auto &cs = g_client_stats[ck];
             ++cs.total_simple_packets;
@@ -503,7 +505,7 @@ int main(int argc, char *argv[])
             reply.shard_id = hdr.shard_id;
             reply.channel_id = hdr.channel_id;
             reply.payload_size = static_cast<uint16_t>(size);
-            srv.send_to(reply, payload, addr, p);
+            srv.send_to(reply, payload, sender);
 
             // Store payload for echo retransmission (reliable channels only)
             if (srv.channels().is_reliable(hdr.channel_id))
@@ -603,8 +605,11 @@ int main(int argc, char *argv[])
     // =========================================================================
     // LOSS callback — retransmit lost echo packets
     // =========================================================================
-    auto on_echo_loss = [&](const lost_packet_info &info, const std::string &addr, uint16_t p)
+    auto on_echo_loss = [&](const lost_packet_info &info, const endpoint_key &client_ep)
     {
+        std::string addr = endpoint_address_string(client_ep);
+        uint16_t p = client_ep.port;
+
         if (info.message_id != 0)
         {
             // Fragment echo loss — retransmit the specific fragment
@@ -645,7 +650,7 @@ int main(int argc, char *argv[])
         reply.channel_id = entry.channel_id;
         reply.channel_sequence = entry.channel_sequence;
         reply.payload_size = static_cast<uint16_t>(entry.payload.size());
-        srv.send_to(reply, entry.payload.data(), addr, p);
+        srv.send_to(reply, entry.payload.data(), client_ep);
 
         // Update tracking: remove old sequence, store new one under new sequence
         simple_echo_entry new_entry;

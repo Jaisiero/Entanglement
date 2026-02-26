@@ -693,14 +693,13 @@ static bool test_full_echo_cycle()
     std::atomic<int> echo_count{0};
 
     srv.set_on_client_data_received(
-        [&](const packet_header &header, const uint8_t *payload, size_t payload_size, const std::string &addr,
-            uint16_t port)
+        [&](const packet_header &header, const uint8_t *payload, size_t payload_size, const endpoint_key &sender)
         {
             // Echo back
             packet_header resp{};
             resp.flags = header.flags;
             resp.payload_size = static_cast<uint16_t>(payload_size);
-            srv.send_to(resp, payload, addr, port);
+            srv.send_to(resp, payload, sender);
         });
 
     TEST_ASSERT(succeeded(srv.start()), "server should start");
@@ -1373,14 +1372,13 @@ static bool test_channel_echo_integration()
     std::atomic<bool> stop_flag{false};
 
     srv.set_on_client_data_received(
-        [&](const packet_header &header, const uint8_t *payload, size_t payload_size, const std::string &addr,
-            uint16_t port)
+        [&](const packet_header &header, const uint8_t *payload, size_t payload_size, const endpoint_key &sender)
         {
             // Echo back on the same channel
             packet_header resp{};
             resp.channel_id = header.channel_id;
             resp.payload_size = static_cast<uint16_t>(payload_size);
-            srv.send_to(resp, payload, addr, port);
+            srv.send_to(resp, payload, sender);
         });
 
     TEST_ASSERT(succeeded(srv.start()), "server should start");
@@ -1621,13 +1619,12 @@ static bool test_channel_negotiation_accepted()
         });
 
     srv.set_on_client_data_received(
-        [&](const packet_header &header, const uint8_t *payload, size_t payload_size, const std::string &addr,
-            uint16_t port)
+        [&](const packet_header &header, const uint8_t *payload, size_t payload_size, const endpoint_key &sender)
         {
             packet_header resp{};
             resp.channel_id = header.channel_id;
             resp.payload_size = static_cast<uint16_t>(payload_size);
-            srv.send_to(resp, payload, addr, port);
+            srv.send_to(resp, payload, sender);
         });
 
     const char *msg = "NEGOTIATED";
@@ -2086,8 +2083,8 @@ static bool test_small_message_no_fragment()
     std::atomic<bool> stop_flag{false};
     std::atomic<uint8_t> last_flags{0xFF};
 
-    srv.set_on_client_data_received([&](const packet_header &header, const uint8_t *, size_t, const std::string &,
-                                        uint16_t) { last_flags = header.flags; });
+    srv.set_on_client_data_received([&](const packet_header &header, const uint8_t *, size_t, const endpoint_key &)
+                                    { last_flags = header.flags; });
 
     TEST_ASSERT(succeeded(srv.start()), "server should start");
 
@@ -3229,14 +3226,13 @@ static bool test_ordered_simple_delivery()
 
     // Server echoes every simple packet back on the same channel
     srv.set_on_client_data_received(
-        [&](const packet_header &header, const uint8_t *payload, size_t payload_size, const std::string &addr,
-            uint16_t port)
+        [&](const packet_header &header, const uint8_t *payload, size_t payload_size, const endpoint_key &sender)
         {
             packet_header resp{};
             resp.flags = header.flags;
             resp.channel_id = header.channel_id;
             resp.payload_size = static_cast<uint16_t>(payload_size);
-            srv.send_to(resp, payload, addr, port);
+            srv.send_to(resp, payload, sender);
         });
 
     TEST_ASSERT(succeeded(srv.start()), "server should start");
@@ -3463,14 +3459,13 @@ static bool test_ordered_mixed_delivery()
 
     // Echo simple packets
     srv.set_on_client_data_received(
-        [&](const packet_header &header, const uint8_t *payload, size_t payload_size, const std::string &addr,
-            uint16_t port)
+        [&](const packet_header &header, const uint8_t *payload, size_t payload_size, const endpoint_key &sender)
         {
             packet_header resp{};
             resp.flags = header.flags;
             resp.channel_id = header.channel_id;
             resp.payload_size = static_cast<uint16_t>(payload_size);
-            srv.send_to(resp, payload, addr, port);
+            srv.send_to(resp, payload, sender);
         });
 
     // Echo fragmented messages
@@ -3627,13 +3622,12 @@ static bool test_server_start_stop_restart()
     std::atomic<int> echoes{0};
 
     srv.set_on_client_data_received(
-        [&](const packet_header &header, const uint8_t *payload, size_t payload_size, const std::string &addr,
-            uint16_t port)
+        [&](const packet_header &header, const uint8_t *payload, size_t payload_size, const endpoint_key &sender)
         {
             packet_header resp{};
             resp.flags = header.flags;
             resp.payload_size = static_cast<uint16_t>(payload_size);
-            srv.send_to(resp, payload, addr, port);
+            srv.send_to(resp, payload, sender);
         });
 
     std::thread server_thread(
@@ -3812,8 +3806,8 @@ static bool test_reconnect_after_disconnect()
     ctx.srv.set_verbose(false);
 
     std::atomic<int> server_data_count{0};
-    ctx.srv.set_on_client_data_received(
-        [&](const packet_header &, const uint8_t *, size_t, const std::string &, uint16_t) { server_data_count++; });
+    ctx.srv.set_on_client_data_received([&](const packet_header &, const uint8_t *, size_t, const endpoint_key &)
+                                        { server_data_count++; });
 
     TEST_ASSERT(ctx.start(), "server should start");
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -3853,8 +3847,7 @@ static bool test_reconnect_after_disconnect()
             c.update(nullptr);
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
-        TEST_ASSERT(server_data_count.load() > count_after_first,
-                     "server should receive data on second connection");
+        TEST_ASSERT(server_data_count.load() > count_after_first, "server should receive data on second connection");
         c.disconnect();
     }
 
@@ -3950,7 +3943,7 @@ static bool test_zero_length_payload()
     std::atomic<uint16_t> last_payload_size{9999};
 
     srv.set_on_client_data_received(
-        [&](const packet_header &header, const uint8_t *, size_t payload_size, const std::string &, uint16_t)
+        [&](const packet_header &header, const uint8_t *, size_t payload_size, const endpoint_key &)
         {
             last_payload_size = static_cast<uint16_t>(payload_size);
             data_received++;
@@ -4015,7 +4008,7 @@ static bool test_exact_max_payload()
     const size_t MAX_PAYLOAD = MAX_PACKET_SIZE - PACKET_HEADER_SIZE;
 
     srv.set_on_client_data_received(
-        [&](const packet_header &, const uint8_t *payload, size_t payload_size, const std::string &, uint16_t)
+        [&](const packet_header &, const uint8_t *payload, size_t payload_size, const endpoint_key &)
         {
             received_size = payload_size;
             // Check that every byte matches the pattern
@@ -4084,13 +4077,12 @@ static bool test_server_stop_with_clients()
     std::atomic<bool> stop_flag{false};
 
     srv.set_on_client_data_received(
-        [&](const packet_header &header, const uint8_t *payload, size_t payload_size, const std::string &addr,
-            uint16_t port)
+        [&](const packet_header &header, const uint8_t *payload, size_t payload_size, const endpoint_key &sender)
         {
             packet_header resp{};
             resp.flags = header.flags;
             resp.payload_size = static_cast<uint16_t>(payload_size);
-            srv.send_to(resp, payload, addr, port);
+            srv.send_to(resp, payload, sender);
         });
 
     TEST_ASSERT(succeeded(srv.start()), "server should start");

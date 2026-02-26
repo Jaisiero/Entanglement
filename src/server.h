@@ -15,9 +15,8 @@ namespace entanglement
 {
 
     // Callback: data packet from a connected client (non-fragmented)
-    using on_client_data_received =
-        std::function<void(const packet_header &header, const uint8_t *payload, size_t payload_size,
-                           const std::string &sender_address, uint16_t sender_port)>;
+    using on_client_data_received = std::function<void(const packet_header &header, const uint8_t *payload,
+                                                       size_t payload_size, const endpoint_key &sender)>;
 
     // Callback: a client completed the handshake
     using on_client_connected = std::function<void(const endpoint_key &key, const std::string &address, uint16_t port)>;
@@ -32,9 +31,8 @@ namespace entanglement
         std::function<bool(const endpoint_key &key, uint8_t channel_id, channel_mode mode, uint8_t priority)>;
 
     // Callback: a reliable packet sent to a client was detected as lost.
-    // The server reports the client address/port alongside the loss info so the app can retransmit.
-    using on_server_packet_lost =
-        std::function<void(const lost_packet_info &info, const std::string &address, uint16_t port)>;
+    // The server reports the client endpoint_key alongside the loss info so the app can retransmit.
+    using on_server_packet_lost = std::function<void(const lost_packet_info &info, const endpoint_key &client)>;
 
     class server
     {
@@ -98,6 +96,12 @@ namespace entanglement
         uint16_t port() const { return m_port; }
         size_t connection_count() const { return m_index.size(); }
 
+        // Enable automatic retransmission for all connections.
+        // Reliable packets are auto-retransmitted from an internal buffer
+        // instead of being reported through the loss callback.
+        void enable_auto_retransmit() { m_auto_retransmit = true; }
+        bool auto_retransmit_enabled() const { return m_auto_retransmit; }
+
         void set_verbose(bool verbose) { m_verbose = verbose; }
         bool verbose() const { return m_verbose; }
 
@@ -145,6 +149,15 @@ namespace entanglement
         // Connection pool + index
         std::unique_ptr<std::array<udp_connection, MAX_CONNECTIONS>> m_pool;
         std::unordered_map<endpoint_key, uint16_t, endpoint_key_hash> m_index;
+
+        // Free-slot stack for O(1) connection allocation/deallocation
+        uint16_t m_free_stack[MAX_CONNECTIONS]{};
+        int m_free_top = -1; // index of top element (-1 = empty, lazy-init on first use)
+        bool m_free_initialized = false;
+        void init_freelist();
+
+        // Auto-retransmit flag
+        bool m_auto_retransmit = false;
 
         udp_connection *find_or_create(const endpoint_key &key);
         udp_connection *find(const endpoint_key &key);

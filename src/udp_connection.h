@@ -8,7 +8,9 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <functional>
+#include <memory>
 
 namespace entanglement
 {
@@ -73,6 +75,75 @@ namespace entanglement
         uint32_t message_id = 0;
         uint8_t *data = nullptr; // app-allocated buffer (ownership held until delivery)
         size_t total_size = 0;
+    };
+
+    // --- Automatic retransmission buffer entry ---
+
+    struct retransmit_entry
+    {
+        bool active = false;
+        uint64_t sequence = 0; // latest tracked sequence (updated on re-send)
+        uint8_t flags = 0;
+        uint8_t channel_id = 0;
+        uint32_t channel_sequence = 0;
+        uint32_t message_id = 0; // 0 for simple packets
+        uint8_t fragment_index = 0;
+        uint8_t fragment_count = 0;
+        uint16_t data_size = 0;
+        int attempts = 0;
+        uint8_t data[MAX_ORDERED_PAYLOAD]{}; // user payload copy (MAX_ORDERED_PAYLOAD == MAX_PAYLOAD_SIZE)
+    };
+
+    struct retransmit_buffer
+    {
+        retransmit_entry entries[RETRANSMIT_BUFFER_SIZE]{};
+
+        retransmit_entry *store(uint64_t seq, const void *payload, uint16_t size, uint8_t flags, uint8_t ch_id,
+                                uint32_t ch_seq, uint32_t msg_id, uint8_t frag_idx, uint8_t frag_count)
+        {
+            // Find first free slot
+            for (auto &e : entries)
+            {
+                if (!e.active)
+                {
+                    e.active = true;
+                    e.sequence = seq;
+                    e.flags = flags;
+                    e.channel_id = ch_id;
+                    e.channel_sequence = ch_seq;
+                    e.message_id = msg_id;
+                    e.fragment_index = frag_idx;
+                    e.fragment_count = frag_count;
+                    e.data_size = size;
+                    e.attempts = 0;
+                    if (size > 0 && payload)
+                        std::memcpy(e.data, payload, size);
+                    return &e;
+                }
+            }
+            return nullptr; // full — this packet won't be auto-retransmitted
+        }
+
+        retransmit_entry *find(uint64_t seq)
+        {
+            for (auto &e : entries)
+                if (e.active && e.sequence == seq)
+                    return &e;
+            return nullptr;
+        }
+
+        void remove(uint64_t seq)
+        {
+            for (auto &e : entries)
+                if (e.active && e.sequence == seq)
+                    e.active = false;
+        }
+
+        void clear()
+        {
+            for (auto &e : entries)
+                e.active = false;
+        }
     };
 
     // --- Connection state ---
@@ -169,6 +240,37 @@ namespace entanglement
         congestion_info congestion() const { return m_cc.info(); }
         congestion_control &cc() { return m_cc; }
 
+        // --- Automatic retransmission ---
+
+        // Enable automatic retransmission for reliable channels.
+        // Allocates the retransmit buffer (~74 KB).  Call once after reset.
+        void enable_auto_retransmit();
+
+        // Returns true if auto-retransmit is currently enabled.
+        bool auto_retransmit_enabled() const { return m_retransmit != nullptr; }
+
+        // Try to auto-retransmit a lost packet from the internal buffer.
+        // If a stored copy exists and attempts < MAX, resends and returns true.
+        // Otherwise returns false (caller should handle manually).
+        bool try_auto_retransmit(const lost_packet_info &loss, udp_socket &socket, const channel_manager &channels,
+                                 const endpoint_key &dest);
+
+        // --- Ordered delivery diagnostics ---
+
+        // Number of times skip_ordered_gap had to advance expected sequence.
+        uint32_t ordered_gaps_skipped() const { return m_ordered_gaps_skipped; }
+
+        // Check for ordered-delivery stalls across all channels.
+        // If an ordered channel has buffered future messages but the expected
+        // sequence hasn't advanced for the configured stall timeout, automatically
+        // skip the gap and deliver the buffered messages.
+        void check_ordered_stalls(const channel_manager &channels);
+
+        // Override the ordered stall timeout (default: ORDERED_STALL_TIMEOUT_US).
+        // Lower values detect and recover stalls faster (useful during drain).
+        void set_ordered_stall_timeout(int64_t timeout_us) { m_ordered_stall_timeout_us = timeout_us; }
+        int64_t ordered_stall_timeout() const { return m_ordered_stall_timeout_us; }
+
         // --- Unified send helpers (shared by client and server) ---
 
         // Send a user message (auto-fragments if needed).
@@ -208,7 +310,11 @@ namespace entanglement
         bool is_ordered_next(uint8_t ch_id, uint32_t ch_seq) const { return ch_seq == m_recv_channel_seq[ch_id]; }
 
         // Advance the expected sequence after delivering a packet
-        void advance_ordered_seq(uint8_t ch_id) { ++m_recv_channel_seq[ch_id]; }
+        void advance_ordered_seq(uint8_t ch_id)
+        {
+            ++m_recv_channel_seq[ch_id];
+            m_ordered_last_advance[ch_id] = std::chrono::steady_clock::now();
+        }
 
         // Buffer an out-of-order packet for later delivery. Returns true if buffered.
         bool buffer_ordered_packet(const packet_header &hdr, const uint8_t *data, uint16_t size);
@@ -274,9 +380,9 @@ namespace entanglement
         uint64_t m_local_sequence = 1;
         std::array<sent_packet_entry, SEQUENCE_BUFFER_SIZE> m_send_buffer{};
 
-        // Receiving: highest remote sequence seen + bitmap of previous 32
+        // Receiving: highest remote sequence seen + bitmap of previous RECV_BITMAP_WIDTH
         uint64_t m_remote_sequence = 0;
-        uint32_t m_recv_bitmap = 0;
+        uint64_t m_recv_bitmap = 0;
 
         // RTT estimation (microseconds) — Jacobson/Karels (RFC 6298)
         bool m_rtt_initialized = false;
@@ -296,6 +402,9 @@ namespace entanglement
         // Congestion control algorithm instance
         congestion_control m_cc;
 
+        // Oldest un-acked sequence (optimization for collect_losses scan)
+        uint64_t m_oldest_unacked_seq = 1;
+
         // Fragment reassembly (receiver side) — per-connection pool
         fragment_reassembler m_reassembler;
 
@@ -309,6 +418,17 @@ namespace entanglement
         ordered_pending_message m_ordered_msg_buffer[ORDERED_MSG_BUFFER_SIZE]{};
         on_ordered_packet_deliver m_on_ordered_pkt_deliver; // stored callback for drain/deliver
         on_message_complete m_on_ordered_msg_deliver;       // stored callback for drain/deliver
+
+        // Ordered delivery diagnostics
+        uint32_t m_ordered_gaps_skipped = 0;
+
+        // Ordered stall timeout: per-channel timestamp of when the expected
+        // sequence last advanced.  Used to auto-skip gaps that block delivery.
+        std::chrono::steady_clock::time_point m_ordered_last_advance[MAX_CHANNELS]{};
+        int64_t m_ordered_stall_timeout_us = ORDERED_STALL_TIMEOUT_US;
+
+        // Automatic retransmission (only allocated when enabled)
+        std::unique_ptr<retransmit_buffer> m_retransmit;
 
         // Helper: mark a sent packet as acked.
         // take_rtt_sample: true for primary ACK (header.ack), false for bitmap entries

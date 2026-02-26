@@ -101,7 +101,7 @@ struct churn_msg
 static constexpr size_t CHURN_MSG_SIZE = sizeof(churn_msg);
 static constexpr size_t FRAG_PAYLOAD_SIZE = 2500; // triggers fragmentation
 static constexpr int MSGS_PER_ROUND = 10;         // simple messages per round per channel
-static constexpr int FRAG_PER_ROUND = 3;           // fragmented messages per round
+static constexpr int FRAG_PER_ROUND = 3;          // fragmented messages per round
 
 // ============================================================================
 // Client thread: connect → send → wait echoes → disconnect → repeat
@@ -157,9 +157,8 @@ static client_stats run_churn_client(int id, const churn_config &cfg, std::atomi
                 }
             });
 
-        c.set_on_allocate_message(
-            [](const endpoint_key &, uint32_t, uint8_t, uint8_t, size_t max_size) -> uint8_t *
-            { return new uint8_t[max_size]; });
+        c.set_on_allocate_message([](const endpoint_key &, uint32_t, uint8_t, uint8_t, size_t max_size) -> uint8_t *
+                                  { return new uint8_t[max_size]; });
 
         c.set_on_message_complete(
             [&](const endpoint_key &, uint32_t, uint8_t, uint8_t *data, size_t total_size)
@@ -168,9 +167,8 @@ static client_stats run_churn_client(int id, const churn_config &cfg, std::atomi
                 delete[] data;
             });
 
-        c.set_on_message_failed(
-            [](const endpoint_key &, uint32_t, uint8_t, uint8_t *buf, message_fail_reason, uint8_t, uint8_t)
-            { delete[] buf; });
+        c.set_on_message_failed([](const endpoint_key &, uint32_t, uint8_t, uint8_t *buf, message_fail_reason, uint8_t,
+                                   uint8_t) { delete[] buf; });
 
         error_code ec = c.connect();
         if (failed(ec))
@@ -353,26 +351,24 @@ int main(int argc, char *argv[])
                 ;
         });
 
-    srv.set_on_client_disconnected(
-        [&](const endpoint_key &, const std::string &, uint16_t) { srv_stats.total_disconnects++; });
+    srv.set_on_client_disconnected([&](const endpoint_key &, const std::string &, uint16_t)
+                                   { srv_stats.total_disconnects++; });
 
     // Echo simple packets back
     srv.set_on_client_data_received(
-        [&](const packet_header &header, const uint8_t *payload, size_t payload_size, const std::string &addr,
-            uint16_t port)
+        [&](const packet_header &header, const uint8_t *payload, size_t payload_size, const endpoint_key &sender)
         {
             srv_stats.total_data_packets++;
             packet_header resp{};
             resp.flags = header.flags;
             resp.channel_id = header.channel_id;
             resp.payload_size = static_cast<uint16_t>(payload_size);
-            srv.send_to(resp, payload, addr, port);
+            srv.send_to(resp, payload, sender);
         });
 
     // Echo fragmented messages back
-    srv.set_on_allocate_message(
-        [](const endpoint_key &, uint32_t, uint8_t, uint8_t, size_t max_size) -> uint8_t *
-        { return new uint8_t[max_size]; });
+    srv.set_on_allocate_message([](const endpoint_key &, uint32_t, uint8_t, uint8_t, size_t max_size) -> uint8_t *
+                                { return new uint8_t[max_size]; });
 
     // Store connected client info for echo routing
     std::mutex echo_mutex;
@@ -411,9 +407,8 @@ int main(int argc, char *argv[])
             delete[] data;
         });
 
-    srv.set_on_message_failed(
-        [](const endpoint_key &, uint32_t, uint8_t, uint8_t *buf, message_fail_reason, uint8_t, uint8_t)
-        { delete[] buf; });
+    srv.set_on_message_failed([](const endpoint_key &, uint32_t, uint8_t, uint8_t *buf, message_fail_reason, uint8_t,
+                                 uint8_t) { delete[] buf; });
 
 #ifdef ENTANGLEMENT_SIMULATE_LOSS
     if (cfg.drop_rate > 0.0)
@@ -449,8 +444,7 @@ int main(int argc, char *argv[])
 
     for (int i = 0; i < cfg.concurrent_clients; ++i)
     {
-        client_threads.emplace_back(
-            [&, i]() { results[i] = run_churn_client(i, cfg, global_stop); });
+        client_threads.emplace_back([&, i]() { results[i] = run_churn_client(i, cfg, global_stop); });
     }
 
     // Wait for all clients to finish
@@ -489,30 +483,17 @@ int main(int argc, char *argv[])
 
     std::cout << std::endl;
     std::cout << " Per-client breakdown:" << std::endl;
-    std::cout << " " << std::setw(4) << "ID"
-              << std::setw(8) << "Rounds"
-              << std::setw(10) << "ConnFail"
-              << std::setw(10) << "SimpSent"
-              << std::setw(10) << "SimpEcho"
-              << std::setw(10) << "FragSent"
-              << std::setw(10) << "FragEcho"
-              << std::setw(10) << "OrdViol"
-              << std::setw(10) << "Losses"
-              << std::endl;
+    std::cout << " " << std::setw(4) << "ID" << std::setw(8) << "Rounds" << std::setw(10) << "ConnFail" << std::setw(10)
+              << "SimpSent" << std::setw(10) << "SimpEcho" << std::setw(10) << "FragSent" << std::setw(10) << "FragEcho"
+              << std::setw(10) << "OrdViol" << std::setw(10) << "Losses" << std::endl;
 
     for (int i = 0; i < cfg.concurrent_clients; ++i)
     {
         auto &r = results[i];
-        std::cout << " " << std::setw(4) << r.id
-                  << std::setw(8) << r.rounds_completed
-                  << std::setw(10) << r.connect_failures
-                  << std::setw(10) << r.total_simple_sent
-                  << std::setw(10) << r.total_simple_echoes
-                  << std::setw(10) << r.total_frag_sent
-                  << std::setw(10) << r.total_frag_echoes
-                  << std::setw(10) << r.order_violations
-                  << std::setw(10) << r.total_losses
-                  << std::endl;
+        std::cout << " " << std::setw(4) << r.id << std::setw(8) << r.rounds_completed << std::setw(10)
+                  << r.connect_failures << std::setw(10) << r.total_simple_sent << std::setw(10)
+                  << r.total_simple_echoes << std::setw(10) << r.total_frag_sent << std::setw(10) << r.total_frag_echoes
+                  << std::setw(10) << r.order_violations << std::setw(10) << r.total_losses << std::endl;
 
         total_rounds += r.rounds_completed;
         total_connect_failures += r.connect_failures;
@@ -569,8 +550,8 @@ int main(int argc, char *argv[])
         if (total_simple_sent > 0 && total_simple_echoes < total_simple_sent / 2)
         {
             pass = false;
-            failures.push_back("Too few simple echoes under loss: " + std::to_string(total_simple_echoes) +
-                               " / " + std::to_string(total_simple_sent));
+            failures.push_back("Too few simple echoes under loss: " + std::to_string(total_simple_echoes) + " / " +
+                               std::to_string(total_simple_sent));
         }
     }
 

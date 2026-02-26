@@ -106,6 +106,11 @@ namespace entanglement
         // Fragment flow control: true if the server asked us to stop sending fragments
         bool is_fragment_throttled() const { return m_connection.is_fragment_backpressured(); }
 
+        // Enable automatic retransmission for reliable channels.
+        // Lost reliable packets are re-sent from an internal buffer automatically.
+        void enable_auto_retransmit() { m_connection.enable_auto_retransmit(); }
+        bool auto_retransmit_enabled() const { return m_connection.auto_retransmit_enabled(); }
+
         // Congestion control: application queries these to pace sends
         bool can_send() const { return m_connection.can_send(); }
         congestion_info congestion() const { return m_connection.congestion(); }

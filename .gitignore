@@ -49,3 +49,6 @@ build
 
 #clang
 .cache
+
+#log files
+*.log

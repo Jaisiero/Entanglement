@@ -239,17 +239,22 @@ namespace entanglement
         int count = m_connection.collect_losses(now, lost, MAX_LOSSES_PER_UPDATE);
 
         auto &cb = loss_callback ? loss_callback : m_on_packet_lost;
-        if (cb)
+        for (int i = 0; i < count; ++i)
         {
-            for (int i = 0; i < count; ++i)
-            {
+            // Try auto-retransmit first; only report to app if it can't be handled
+            if (m_connection.auto_retransmit_enabled() &&
+                m_connection.try_auto_retransmit(lost[i], m_socket, m_channels, m_server_endpoint))
+                continue;
+            if (cb)
                 cb(lost[i]);
-            }
         }
 
         // Expire stale reassembly entries
         auto &ra = m_connection.reassembler();
         ra.cleanup_stale(now, ra.reassembly_timeout());
+
+        // Check for ordered-delivery stalls (auto-skip gaps that block delivery)
+        m_connection.check_ordered_stalls(m_channels);
 
         // Send backpressure relief if usage dropped below low watermark
         if (m_connection.backpressure_sent() && ra.usage_percent() < BACKPRESSURE_LOW_WATERMARK)

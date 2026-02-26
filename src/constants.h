@@ -21,7 +21,8 @@ namespace entanglement
 
     // --- Sequence / ACK tracking ---
     constexpr size_t SEQUENCE_BUFFER_SIZE = 1024; // Circular send buffer entries
-    constexpr int ACK_BITMAP_WIDTH = 32;          // Selective ACK bitmap width (bits)
+    constexpr int ACK_BITMAP_WIDTH = 32;          // Selective ACK bitmap width on the wire (bits)
+    constexpr int RECV_BITMAP_WIDTH = 64;         // Internal receive tracking window (wider than wire)
 
     // --- Reliability ---
     constexpr int64_t INITIAL_RTO_US = 200'000; // 200 ms initial retransmission timeout
@@ -130,8 +131,24 @@ namespace entanglement
     constexpr int64_t REASSEMBLY_TIMEOUT_US = 15'000'000;            // 15 s — accommodate fragment retransmissions
 
     // --- Ordered delivery (receive-side hold-back for RELIABLE_ORDERED) ---
-    constexpr size_t ORDERED_BUFFER_SIZE = 16;                               // Per-connection buffered out-of-order packets
+    constexpr size_t ORDERED_BUFFER_SIZE = 32; // Per-connection buffered out-of-order packets
     constexpr size_t MAX_ORDERED_PAYLOAD = MAX_PACKET_SIZE - PACKET_HEADER_SIZE; // Max storable payload (~1166 bytes)
-    constexpr size_t ORDERED_MSG_BUFFER_SIZE = 8;                             // Per-connection buffered out-of-order fragmented messages
+    constexpr size_t ORDERED_MSG_BUFFER_SIZE = 16;          // Per-connection buffered out-of-order fragmented messages
+    constexpr int64_t ORDERED_STALL_TIMEOUT_US = 5'000'000; // 5s — auto-skip gap when ordered delivery is stuck
+
+    // --- Automatic retransmission (opt-in per connection) ---
+    constexpr size_t RETRANSMIT_BUFFER_SIZE = 64; // Max buffered payloads for auto-retransmit per connection
+    constexpr int MAX_RETRANSMIT_ATTEMPTS = 5;    // Max times a single packet is auto-retransmitted
+
+    // --- Sequence comparison helpers (wrap-safe, half-range modular arithmetic) ---
+    // Works correctly across uint32_t wrap-around as long as the gap < 2^31.
+    inline bool sequence_greater_than(uint32_t a, uint32_t b)
+    {
+        return static_cast<int32_t>(a - b) > 0;
+    }
+    inline bool sequence_less_than(uint32_t a, uint32_t b)
+    {
+        return static_cast<int32_t>(a - b) < 0;
+    }
 
 } // namespace entanglement

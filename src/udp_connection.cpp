@@ -48,6 +48,20 @@ namespace entanglement
         m_fragment_backpressured = false;
         m_backpressure_sent = false;
 
+        // Reset oldest un-acked tracking
+        m_oldest_unacked_seq = 1;
+
+        // Reset ordered delivery diagnostics
+        m_ordered_gaps_skipped = 0;
+
+        // Reset ordered stall timers
+        for (size_t i = 0; i < MAX_CHANNELS; ++i)
+            m_ordered_last_advance[i] = now;
+
+        // Clear automatic retransmission buffer (keep allocation)
+        if (m_retransmit)
+            m_retransmit->clear();
+
         // Reset ordered delivery state — expected sequence starts at 1
         // (sender's first channel_sequence = ++0 = 1)
         for (size_t i = 0; i < MAX_CHANNELS; ++i)
@@ -75,7 +89,7 @@ namespace entanglement
         uint64_t seq = next_sequence();
         header.sequence = seq;
         header.ack = m_remote_sequence;
-        header.ack_bitmap = m_recv_bitmap;
+        header.ack_bitmap = static_cast<uint32_t>(m_recv_bitmap); // truncate to 32-bit for wire
 
         // For fragment packets: keep whatever channel_sequence the caller set
         // (non-zero for fragment 0 of ordered messages, zero for all others).
@@ -154,13 +168,13 @@ namespace entanglement
             // New highest sequence: shift bitmap
             uint64_t shift = seq - m_remote_sequence;
 
-            if (shift <= ACK_BITMAP_WIDTH)
+            if (shift <= RECV_BITMAP_WIDTH)
             {
                 m_recv_bitmap <<= shift;
                 // The old m_remote_sequence becomes bit (shift-1)
                 if (m_remote_sequence > 0)
                 {
-                    m_recv_bitmap |= (1u << (shift - 1));
+                    m_recv_bitmap |= (1ull << (shift - 1));
                 }
             }
             else
@@ -229,6 +243,26 @@ namespace entanglement
             // Notify congestion controller and update pacing
             m_cc.on_packet_acked();
             m_cc.update_pacing(m_srtt);
+
+            // Free retransmit entry for this sequence
+            if (m_retransmit)
+                m_retransmit->remove(sequence);
+
+            // Advance oldest-unacked tracker
+            if (sequence == m_oldest_unacked_seq)
+            {
+                // Scan forward to find the next un-acked entry
+                uint64_t s = sequence + 1;
+                while (s < m_local_sequence)
+                {
+                    size_t si = s % SEQUENCE_BUFFER_SIZE;
+                    auto &se = m_send_buffer[si];
+                    if (se.active && se.sequence == s && !se.acked)
+                        break;
+                    ++s;
+                }
+                m_oldest_unacked_seq = s;
+            }
         }
     }
 
@@ -240,9 +274,9 @@ namespace entanglement
         }
 
         uint64_t diff = m_remote_sequence - sequence;
-        if (diff > 0 && diff <= ACK_BITMAP_WIDTH)
+        if (diff > 0 && diff <= RECV_BITMAP_WIDTH)
         {
-            return (m_recv_bitmap & (1u << (diff - 1))) != 0;
+            return (m_recv_bitmap & (1ull << (diff - 1))) != 0;
         }
 
         // Outside bitmap window — treat as received (too old to care)
@@ -252,9 +286,9 @@ namespace entanglement
     void udp_connection::record_received(uint64_t sequence)
     {
         uint64_t diff = m_remote_sequence - sequence;
-        if (diff > 0 && diff <= ACK_BITMAP_WIDTH)
+        if (diff > 0 && diff <= RECV_BITMAP_WIDTH)
         {
-            m_recv_bitmap |= (1u << (diff - 1));
+            m_recv_bitmap |= (1ull << (diff - 1));
         }
     }
 
@@ -264,8 +298,10 @@ namespace entanglement
     {
         int count = 0;
 
-        // Scan the active window of the send buffer
-        uint64_t oldest = (m_local_sequence > SEQUENCE_BUFFER_SIZE) ? m_local_sequence - SEQUENCE_BUFFER_SIZE : 1;
+        // Scan from oldest un-acked (optimization: skip already-resolved entries)
+        uint64_t oldest = (m_local_sequence > SEQUENCE_BUFFER_SIZE)
+                              ? (std::max)(m_oldest_unacked_seq, m_local_sequence - SEQUENCE_BUFFER_SIZE)
+                              : m_oldest_unacked_seq;
 
         for (uint64_t seq = oldest; seq < m_local_sequence; ++seq)
         {
@@ -446,28 +482,36 @@ namespace entanglement
     int udp_connection::skip_ordered_gap(uint8_t ch_id)
     {
         // Find the lowest buffered channel_sequence across both simple and message buffers
-        uint32_t lowest = UINT32_MAX;
+        uint32_t lowest = 0;
+        bool found = false;
         for (auto &slot : m_ordered_buffer)
         {
             if (slot.active && slot.header.channel_id == ch_id)
             {
-                if (slot.channel_sequence < lowest)
+                if (!found || sequence_less_than(slot.channel_sequence, lowest))
+                {
                     lowest = slot.channel_sequence;
+                    found = true;
+                }
             }
         }
         for (auto &slot : m_ordered_msg_buffer)
         {
             if (slot.active && slot.channel_id == ch_id)
             {
-                if (slot.channel_sequence < lowest)
+                if (!found || sequence_less_than(slot.channel_sequence, lowest))
+                {
                     lowest = slot.channel_sequence;
+                    found = true;
+                }
             }
         }
-        if (lowest == UINT32_MAX)
+        if (!found)
             return 0; // nothing buffered
 
         // Advance expected to the lowest buffered sequence
         m_recv_channel_seq[ch_id] = lowest;
+        ++m_ordered_gaps_skipped;
         return 1;
     }
 
@@ -521,6 +565,12 @@ namespace entanglement
             header.payload_size = static_cast<uint16_t>(size);
             bool reliable = channels.is_reliable(channel_id);
             prepare_header(header, reliable);
+
+            // Store for auto-retransmit (reliable channels only)
+            if (reliable && m_retransmit)
+                m_retransmit->store(header.sequence, data, static_cast<uint16_t>(size), flags, channel_id,
+                                    header.channel_sequence, 0, 0, 0);
+
             return socket.send_packet(header, data, dest);
         }
 
@@ -588,7 +638,58 @@ namespace entanglement
         // Scatter-gather: [packet_header] + [fragment_header] + [user data]
         const void *segments[2] = {&fhdr, data};
         size_t seg_sizes[2] = {FRAGMENT_HEADER_SIZE, size};
+
+        // Store for auto-retransmit (reliable channels only)
+        if (reliable && m_retransmit)
+            m_retransmit->store(header.sequence, data, static_cast<uint16_t>(size), flags, channel_id, channel_sequence,
+                                message_id, index, count);
+
         return socket.send_packet_gather(header, segments, seg_sizes, 2, dest);
+    }
+
+    // --- Ordered stall detection ---
+
+    void udp_connection::check_ordered_stalls(const channel_manager &channels)
+    {
+        auto now = std::chrono::steady_clock::now();
+        for (uint16_t ch = 0; ch < MAX_CHANNELS; ++ch)
+        {
+            uint8_t ch_id = static_cast<uint8_t>(ch);
+            if (!channels.is_ordered(ch_id))
+                continue;
+
+            // Check if there are any buffered entries for this channel
+            bool has_buffered = false;
+            for (auto &slot : m_ordered_buffer)
+            {
+                if (slot.active && slot.header.channel_id == ch_id)
+                {
+                    has_buffered = true;
+                    break;
+                }
+            }
+            if (!has_buffered)
+            {
+                for (auto &slot : m_ordered_msg_buffer)
+                {
+                    if (slot.active && slot.channel_id == ch_id)
+                    {
+                        has_buffered = true;
+                        break;
+                    }
+                }
+            }
+            if (!has_buffered)
+                continue; // no stall — nothing buffered
+
+            auto stall_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(now - m_ordered_last_advance[ch_id]).count();
+            if (stall_us >= m_ordered_stall_timeout_us)
+            {
+                skip_ordered_gap(ch_id);
+                drain_ordered(ch_id);
+            }
+        }
     }
 
     // --- Shared ordered-delivery helpers ---
@@ -631,7 +732,7 @@ namespace entanglement
             advance_ordered_seq(header.channel_id);
             drain_ordered(header.channel_id);
         }
-        else if (header.channel_sequence > expected_ordered_seq(header.channel_id))
+        else if (sequence_greater_than(header.channel_sequence, expected_ordered_seq(header.channel_id)))
         {
             // Future packet — buffer for later delivery
             if (!buffer_ordered_packet(header, payload, size))
@@ -664,7 +765,7 @@ namespace entanglement
                         advance_ordered_seq(ch_id);
                         drain_ordered(ch_id);
                     }
-                    else if (chan_seq > expected_ordered_seq(ch_id))
+                    else if (sequence_greater_than(chan_seq, expected_ordered_seq(ch_id)))
                     {
                         // Future message — buffer
                         if (!buffer_ordered_message(sender, msg_id, ch_id, data, total_size, chan_seq))
@@ -687,6 +788,85 @@ namespace entanglement
                         app_cb(sender, msg_id, ch_id, data, total_size);
                 }
             });
+    }
+
+    // --- Automatic retransmission ---
+
+    void udp_connection::enable_auto_retransmit()
+    {
+        if (!m_retransmit)
+            m_retransmit = std::make_unique<retransmit_buffer>();
+    }
+
+    bool udp_connection::try_auto_retransmit(const lost_packet_info &loss, udp_socket &socket,
+                                             const channel_manager &channels, const endpoint_key &dest)
+    {
+        if (!m_retransmit)
+            return false;
+
+        auto *entry = m_retransmit->find(loss.sequence);
+        if (!entry || entry->attempts >= MAX_RETRANSMIT_ATTEMPTS)
+            return false;
+
+        entry->attempts++;
+
+        if (loss.message_id != 0)
+        {
+            // Fragment retransmit: resend via send_fragment (gets new sequence, preserves message_id)
+            uint8_t base_flags = entry->flags & ~FLAG_FRAGMENT; // send_fragment adds FLAG_FRAGMENT
+            int result =
+                send_fragment(socket, channels, loss.message_id, loss.fragment_index, loss.fragment_count, entry->data,
+                              entry->data_size, base_flags, entry->channel_id, dest, entry->channel_sequence);
+            if (result > 0)
+            {
+                // send_fragment already stored a new retransmit entry (via prepare_header path).
+                // Deactivate the old entry (keyed by old sequence).
+                entry->active = false;
+                return true;
+            }
+        }
+        else
+        {
+            // Simple packet retransmit
+            packet_header header{};
+            header.flags = entry->flags;
+            header.channel_id = entry->channel_id;
+            header.channel_sequence = entry->channel_sequence; // preserve for ordered channels
+            header.payload_size = entry->data_size;
+            bool reliable = channels.is_reliable(entry->channel_id);
+            prepare_header(header, reliable);
+
+            // prepare_header + the retransmit store in send_payload won't fire here
+            // because we're calling send_packet directly. Store manually.
+            // (The new entry in the retransmit buffer is created by store below.)
+
+            int result = socket.send_packet(header, entry->data, dest);
+            if (result > 0)
+            {
+                // Move the retransmit entry to track the new sequence
+                int attempts = entry->attempts;
+                uint16_t data_size = entry->data_size;
+                uint8_t flags_copy = entry->flags;
+                uint8_t ch_id = entry->channel_id;
+                uint32_t ch_seq = entry->channel_sequence;
+
+                // Deactivate old entry
+                entry->active = false;
+
+                // Store under new sequence (preserving attempt count)
+                auto *new_entry = m_retransmit->store(header.sequence, nullptr, 0, flags_copy, ch_id, ch_seq, 0, 0, 0);
+                if (new_entry)
+                {
+                    // Copy payload from old entry (already in buffer, just update the new slot)
+                    std::memcpy(new_entry->data, entry->data, data_size);
+                    new_entry->data_size = data_size;
+                    new_entry->attempts = attempts;
+                }
+                return true;
+            }
+        }
+
+        return false;
     }
 
 } // namespace entanglement

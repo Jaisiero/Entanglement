@@ -127,8 +127,7 @@ namespace entanglement
                 // RELIABLE_ORDERED channels: deliver_ordered handles hold-back + drain
                 if (!conn->deliver_ordered(header, payload, header.payload_size, m_channels))
                 {
-                    std::string addr_str = endpoint_address_string(sender);
-                    m_on_client_data_received(header, payload, header.payload_size, addr_str, sender.port);
+                    m_on_client_data_received(header, payload, header.payload_size, sender);
                 }
             }
             ++count;
@@ -172,25 +171,33 @@ namespace entanglement
                 auto &cb = loss_callback ? loss_callback : m_on_packet_lost;
                 lost_packet_info lost[MAX_LOSSES_PER_UPDATE];
                 int loss_count = conn.collect_losses(now, lost, MAX_LOSSES_PER_UPDATE);
-                if (loss_count > 0)
+                for (int l = 0; l < loss_count; ++l)
                 {
-                    std::string addr_str = endpoint_address_string(key);
-                    for (int l = 0; l < loss_count; ++l)
-                    {
-                        cb(lost[l], addr_str, key.port);
-                    }
+                    // Try auto-retransmit first; only report to app if it can't be handled
+                    if (conn.auto_retransmit_enabled() && conn.try_auto_retransmit(lost[l], m_socket, m_channels, key))
+                        continue;
+                    cb(lost[l], key);
                 }
             }
             else
             {
                 // Even without a callback, collect losses to expire unreliable packets
                 lost_packet_info lost[MAX_LOSSES_PER_UPDATE];
-                conn.collect_losses(now, lost, MAX_LOSSES_PER_UPDATE);
+                int loss_count = conn.collect_losses(now, lost, MAX_LOSSES_PER_UPDATE);
+                // Auto-retransmit even without a manual loss callback
+                if (conn.auto_retransmit_enabled())
+                {
+                    for (int l = 0; l < loss_count; ++l)
+                        conn.try_auto_retransmit(lost[l], m_socket, m_channels, key);
+                }
             }
 
             // Per-connection reassembler cleanup
             auto &ra = conn.reassembler();
             ra.cleanup_stale(now, ra.reassembly_timeout());
+
+            // Check for ordered-delivery stalls (auto-skip gaps that block delivery)
+            conn.check_ordered_stalls(m_channels);
 
             // Send backpressure relief if usage dropped below low watermark
             if (conn.backpressure_sent() && ra.usage_percent() < BACKPRESSURE_LOW_WATERMARK)
@@ -232,12 +239,8 @@ namespace entanglement
             if (callback)
             {
                 auto cb = callback;
-                conn.set_on_ordered_packet_deliver(
-                    [cb, &conn](const packet_header &h, const uint8_t *p, uint16_t s)
-                    {
-                        std::string addr = endpoint_address_string(conn.endpoint());
-                        cb(h, p, s, addr, conn.endpoint().port);
-                    });
+                conn.set_on_ordered_packet_deliver([cb, &conn](const packet_header &h, const uint8_t *p, uint16_t s)
+                                                   { cb(h, p, s, conn.endpoint()); });
             }
             else
             {
@@ -324,8 +327,13 @@ namespace entanglement
         auto it = m_index.find(key);
         if (it != m_index.end())
         {
-            (*m_pool)[it->second].reset();
+            uint16_t slot = it->second;
+            (*m_pool)[slot].reset();
             m_index.erase(it);
+
+            // Return slot to freelist
+            if (m_free_initialized)
+                m_free_stack[++m_free_top] = slot;
         }
     }
 
@@ -370,13 +378,13 @@ namespace entanglement
         if (m_on_client_data_received)
         {
             auto cb = m_on_client_data_received;
-            conn.set_on_ordered_packet_deliver(
-                [cb, &conn](const packet_header &h, const uint8_t *p, uint16_t s)
-                {
-                    std::string addr = endpoint_address_string(conn.endpoint());
-                    cb(h, p, s, addr, conn.endpoint().port);
-                });
+            conn.set_on_ordered_packet_deliver([cb, &conn](const packet_header &h, const uint8_t *p, uint16_t s)
+                                               { cb(h, p, s, conn.endpoint()); });
         }
+
+        // Enable auto-retransmit if server-wide flag is set
+        if (m_auto_retransmit)
+            conn.enable_auto_retransmit();
 
         m_index[key] = static_cast<uint16_t>(slot);
         return &conn;
@@ -394,14 +402,22 @@ namespace entanglement
 
     int server::allocate_slot()
     {
+        if (!m_free_initialized)
+            init_freelist();
+
+        if (m_free_top < 0)
+            return static_cast<int>(error_code::pool_full);
+
+        return m_free_stack[m_free_top--];
+    }
+
+    void server::init_freelist()
+    {
+        // Push all slots in reverse so index 0 is allocated first
+        m_free_top = static_cast<int>(MAX_CONNECTIONS) - 1;
         for (size_t i = 0; i < MAX_CONNECTIONS; ++i)
-        {
-            if (!(*m_pool)[i].is_active())
-            {
-                return static_cast<int>(i);
-            }
-        }
-        return static_cast<int>(error_code::pool_full);
+            m_free_stack[i] = static_cast<uint16_t>(i);
+        m_free_initialized = true;
     }
 
     // --- Control packet handling ---
