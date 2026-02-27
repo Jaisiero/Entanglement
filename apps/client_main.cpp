@@ -45,6 +45,7 @@
 using namespace entanglement;
 
 static std::mutex g_cout_mutex;
+static bool g_verbose = false;
 
 // --- Soak message payload (must match server — first 9 bytes of every payload) ---
 #pragma pack(push, 1)
@@ -221,11 +222,13 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
 
     bool ordered_simple_pending = false;
     uint32_t ordered_simple_pending_msg_id = 0;
+    uint32_t ordered_simple_channel_seq = 0; // original channel_sequence — preserved on retransmit
     std::chrono::steady_clock::time_point ordered_simple_send_time{};
 
     bool ordered_frag_pending = false;
     uint32_t ordered_frag_pending_msg_id = 0;
     uint32_t ordered_frag_lib_msg_id = 0;
+    uint32_t ordered_frag_channel_seq = 0; // original channel_sequence — preserved on retransmit
     std::vector<uint8_t> ordered_frag_pending_payload;
     std::chrono::steady_clock::time_point ordered_frag_send_time{};
 
@@ -426,6 +429,7 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
     };
 
     // --- Connect ---
+    if (g_verbose)
     {
         std::lock_guard<std::mutex> lk(g_cout_mutex);
         std::cout << "[client " << id << "] Connecting to " << server_ip << ":" << port << "..." << std::endl;
@@ -433,12 +437,16 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
 
     if (failed(cli.connect()))
     {
-        std::lock_guard<std::mutex> lk(g_cout_mutex);
-        std::cerr << "[client " << id << "] FAILED to connect!" << std::endl;
+        if (g_verbose)
+        {
+            std::lock_guard<std::mutex> lk(g_cout_mutex);
+            std::cerr << "[client " << id << "] FAILED to connect!" << std::endl;
+        }
         return result;
     }
 
     result.connected = true;
+    if (g_verbose)
     {
         std::lock_guard<std::mutex> lk(g_cout_mutex);
         std::cout << "[client " << id << "] Connected (port " << cli.local_port() << ")" << std::endl;
@@ -478,7 +486,10 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
             payload.total_expected = 0;
             payload.channel_id = channels::ORDERED.id;
 
-            cli.send(&payload, SOAK_MSG_SIZE, channels::ORDERED.id);
+            // Retransmit on the ORDERED channel but PRESERVE the original
+            // channel_sequence so the receiver's hold-back buffer sees this as
+            // the same ordered slot — no gap, no stall timeout.
+            cli.send(&payload, SOAK_MSG_SIZE, channels::ORDERED.id, 0, nullptr, nullptr, ordered_simple_channel_seq);
 
             // Do NOT add to seq_to_msg — the timeout mechanism handles ordered
             // retries independently. Adding would let the loss handler also
@@ -498,14 +509,19 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
             // was_recently_completed() check if the previous attempt already
             // completed reassembly (but the echo was lost on the way back).
             // A fresh message_id guarantees a new reassembly entry and a new echo.
+            // Preserve the original channel_sequence so the receiver's ordered
+            // hold-back sees the same slot — no gap, no stall timeout.
             uint32_t lib_message_id = 0;
-            int sent = cli.send(ordered_frag_pending_payload.data(), ordered_frag_pending_payload.size(),
-                                channels::ORDERED.id, 0, &lib_message_id);
+            uint32_t new_ch_seq = 0;
+            int sent =
+                cli.send(ordered_frag_pending_payload.data(), ordered_frag_pending_payload.size(), channels::ORDERED.id,
+                         0, &lib_message_id, nullptr, ordered_frag_channel_seq, &new_ch_seq);
             if (sent > 0)
             {
                 if (lib_message_id != 0)
                     frag_payloads[lib_message_id] = ordered_frag_pending_payload;
                 ordered_frag_lib_msg_id = lib_message_id;
+                ordered_frag_channel_seq = new_ch_seq; // update in case it was first assigned
                 ++result.streams[F_ORD].retransmissions;
                 result.total_data_packets_sent += 3;
                 ++result.total_retransmissions;
@@ -567,7 +583,8 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
             payload.channel_id = ch_id;
 
             uint64_t seq = 0;
-            cli.send(&payload, SOAK_MSG_SIZE, ch_id, 0, nullptr, &seq);
+            uint32_t out_ch_seq = 0;
+            cli.send(&payload, SOAK_MSG_SIZE, ch_id, 0, nullptr, &seq, 0, &out_ch_seq);
 
             seq_to_msg[seq] = {ch_id, msg_id};
             auto sit = simple_idx.find(ch_id);
@@ -579,6 +596,7 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
             {
                 ordered_simple_pending = true;
                 ordered_simple_pending_msg_id = msg_id;
+                ordered_simple_channel_seq = out_ch_seq;
                 ordered_simple_send_time = std::chrono::steady_clock::now();
             }
 
@@ -597,7 +615,9 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
             build_frag_payload(frag_buf, msg_id, 0, ch_id);
 
             uint32_t lib_message_id = 0;
-            int sent_bytes = cli.send(frag_buf.data(), frag_buf.size(), ch_id, 0, &lib_message_id);
+            uint32_t out_ch_seq = 0;
+            int sent_bytes =
+                cli.send(frag_buf.data(), frag_buf.size(), ch_id, 0, &lib_message_id, nullptr, 0, &out_ch_seq);
 
             if (sent_bytes > 0)
             {
@@ -611,6 +631,7 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
                     ordered_frag_pending = true;
                     ordered_frag_pending_msg_id = msg_id;
                     ordered_frag_lib_msg_id = lib_message_id;
+                    ordered_frag_channel_seq = out_ch_seq;
                     ordered_frag_pending_payload = frag_buf;
                     ordered_frag_send_time = std::chrono::steady_clock::now();
                 }
@@ -631,7 +652,7 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
         next_send = (ci.pacing_interval_us > 0) ? now + std::chrono::microseconds(ci.pacing_interval_us) : now;
 
         // Progress report every 10s
-        if (now - last_progress >= PROGRESS_INTERVAL)
+        if (g_verbose && now - last_progress >= PROGRESS_INTERVAL)
         {
             auto elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(now - t_start).count();
             auto remain_s = std::chrono::duration_cast<std::chrono::seconds>(deadline - now).count();
@@ -650,6 +671,7 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
     auto t_send_done = std::chrono::steady_clock::now();
     result.send_phase_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_send_done - t_start).count();
 
+    if (g_verbose)
     {
         std::lock_guard<std::mutex> lk(g_cout_mutex);
         std::cout << "[client " << id << "] Send done: " << result.total_data_packets_sent << " pkts in "
@@ -688,7 +710,20 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
     {
         int sweep_frag = 0, sweep_simple = 0;
 
-        // 1) Unconfirmed frag reliable — retransmit ALL fragments from stored payloads
+        // 1) Unconfirmed frag reliable — retransmit as fresh messages.
+        //    Using cli.send() with a NEW library message_id so the server's
+        //    was_recently_completed() check doesn't reject the fragments.
+        //    (The old message_id may already be marked completed server-side
+        //    even though the echo back to us was lost.)
+        //    Collect candidates first to avoid mutating frag_payloads mid-iteration.
+        struct frag_resend_candidate
+        {
+            std::vector<uint8_t> payload;
+            uint8_t channel_id;
+            int stream_idx;
+        };
+        std::vector<frag_resend_candidate> frag_resend;
+
         for (auto &[lib_msg_id, payload] : frag_payloads)
         {
             if (payload.size() < SOAK_MSG_SIZE)
@@ -707,16 +742,20 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
             if (result.streams[fit->second].confirmed_ids.count(app_hdr.msg_id))
                 continue;
 
-            // Retransmit all fragments of this unconfirmed message
+            frag_resend.push_back({payload, app_hdr.channel_id, fit->second});
+        }
+
+        for (auto &candidate : frag_resend)
+        {
+            uint32_t new_lib_msg_id = 0;
+            int sent =
+                cli.send(candidate.payload.data(), candidate.payload.size(), candidate.channel_id, 0, &new_lib_msg_id);
+            if (sent > 0 && new_lib_msg_id != 0)
+                frag_payloads[new_lib_msg_id] = candidate.payload;
+
             uint8_t frag_count =
-                static_cast<uint8_t>((payload.size() + MAX_FRAGMENT_PAYLOAD - 1) / MAX_FRAGMENT_PAYLOAD);
-            for (uint8_t i = 0; i < frag_count; ++i)
-            {
-                size_t off = static_cast<size_t>(i) * MAX_FRAGMENT_PAYLOAD;
-                size_t chunk = (std::min)(MAX_FRAGMENT_PAYLOAD, payload.size() - off);
-                cli.send_fragment(lib_msg_id, i, frag_count, payload.data() + off, chunk, 0, app_hdr.channel_id);
-            }
-            ++result.streams[fit->second].retransmissions;
+                static_cast<uint8_t>((candidate.payload.size() + MAX_FRAGMENT_PAYLOAD - 1) / MAX_FRAGMENT_PAYLOAD);
+            ++result.streams[candidate.stream_idx].retransmissions;
             result.total_data_packets_sent += frag_count;
             ++result.total_retransmissions;
             ++sweep_frag;
@@ -751,15 +790,20 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
         //    A fresh ID creates a new echo cycle on the server, bypassing any
         //    stale reassembly state on the client side (e.g. clogged slots from
         //    previous echo attempts whose fragments were partially lost).
+        //    Preserve the original channel_sequence so the receiver's ordered
+        //    hold-back sees the same slot — no gap, no stall timeout.
         if (ordered_frag_pending && !ordered_frag_pending_payload.empty())
         {
             uint32_t new_lib_msg_id = 0;
-            int sent = cli.send(ordered_frag_pending_payload.data(), ordered_frag_pending_payload.size(),
-                                channels::ORDERED.id, 0, &new_lib_msg_id);
+            uint32_t new_ch_seq = 0;
+            int sent =
+                cli.send(ordered_frag_pending_payload.data(), ordered_frag_pending_payload.size(), channels::ORDERED.id,
+                         0, &new_lib_msg_id, nullptr, ordered_frag_channel_seq, &new_ch_seq);
             if (sent > 0 && new_lib_msg_id != 0)
             {
                 frag_payloads[new_lib_msg_id] = ordered_frag_pending_payload;
                 ordered_frag_lib_msg_id = new_lib_msg_id;
+                ordered_frag_channel_seq = new_ch_seq;
                 ordered_frag_send_time = std::chrono::steady_clock::now();
                 ++result.streams[F_ORD].retransmissions;
                 result.total_data_packets_sent += 3;
@@ -768,7 +812,7 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
             }
         }
 
-        // 4) Pending ordered-simple — retransmit
+        // 4) Pending ordered-simple — retransmit preserving original channel_sequence
         if (ordered_simple_pending)
         {
             soak_msg payload;
@@ -776,7 +820,7 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
             payload.total_expected = 0;
             payload.channel_id = channels::ORDERED.id;
 
-            cli.send(&payload, SOAK_MSG_SIZE, channels::ORDERED.id);
+            cli.send(&payload, SOAK_MSG_SIZE, channels::ORDERED.id, 0, nullptr, nullptr, ordered_simple_channel_seq);
 
             ordered_simple_send_time = std::chrono::steady_clock::now();
             ++result.streams[S_ORD].retransmissions;
@@ -787,6 +831,7 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
         }
 
         ++drain_sweeps;
+        if (g_verbose)
         {
             std::lock_guard<std::mutex> lk(g_cout_mutex);
             std::cout << "[client " << id << "] Drain sweep #" << drain_sweeps << ": frag=" << sweep_frag
@@ -859,6 +904,7 @@ static client_result run_client(int id, const char *server_ip, uint16_t port, in
 
     cli.disconnect();
 
+    if (g_verbose)
     {
         std::lock_guard<std::mutex> lk(g_cout_mutex);
         std::cout << "[client " << id << "] Finished: s_echo=" << result.total_simple_echoes
@@ -1000,10 +1046,15 @@ int main(int argc, char *argv[])
                     enable_unreliable = true;
             }
         }
+        else if (std::strcmp(argv[i], "-v") == 0 || std::strcmp(argv[i], "--verbose") == 0)
+        {
+            g_verbose = true;
+        }
         else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0)
         {
-            std::cout << "Usage: EntanglementClient [-s ip] [-p port] [-t minutes] [-c clients] [-d drop%] [-m modes]"
-                      << std::endl;
+            std::cout
+                << "Usage: EntanglementClient [-s ip] [-p port] [-t minutes] [-c clients] [-d drop%] [-m modes] [-v]"
+                << std::endl;
             std::cout << "  -s, --server   Server IP (default: 127.0.0.1)" << std::endl;
             std::cout << "  -p, --port     Server port (default: " << DEFAULT_PORT << ")" << std::endl;
             std::cout << "  -t, --time     Duration in minutes (default: 1)" << std::endl;
@@ -1011,40 +1062,46 @@ int main(int argc, char *argv[])
             std::cout << "  -d, --drop     Simulated drop rate in percent (default: 0)" << std::endl;
             std::cout << "  -m, --modes    Channel modes to test: r=reliable, o=ordered, u=unreliable" << std::endl;
             std::cout << "                 Comma-separated (default: r,o,u = all)" << std::endl;
+            std::cout << "  -v, --verbose  Print intermediate output during execution" << std::endl;
             return 0;
         }
         else
         {
             std::cerr << "Unknown argument: " << argv[i] << std::endl;
-            std::cerr << "Usage: EntanglementClient [-s ip] [-p port] [-t minutes] [-c clients] [-d drop%] [-m modes]"
-                      << std::endl;
+            std::cerr
+                << "Usage: EntanglementClient [-s ip] [-p port] [-t minutes] [-c clients] [-d drop%] [-m modes] [-v]"
+                << std::endl;
             return 1;
         }
     }
 
     int duration_seconds = duration_minutes * 60;
 
-    std::cout << "=============================================" << std::endl;
-    std::cout << " Entanglement Soak Test Client v4.0" << std::endl;
-    std::cout << " Server:    " << server_ip << ":" << server_port << std::endl;
-    std::cout << " Duration:  " << duration_minutes << " min (" << duration_seconds << "s)" << std::endl;
-    std::cout << " Clients:   " << num_clients << std::endl;
-    int num_modes = (int)enable_reliable + (int)enable_ordered + (int)enable_unreliable;
-    std::cout << " Modes:     ";
-    if (enable_reliable)
-        std::cout << "reliable ";
-    if (enable_ordered)
-        std::cout << "ordered ";
-    if (enable_unreliable)
-        std::cout << "unreliable ";
-    std::cout << "(" << num_modes << " modes, " << (num_modes * 2) << " streams)" << std::endl;
-    std::cout << " Simple payload:  " << SOAK_MSG_SIZE << " bytes" << std::endl;
-    std::cout << " Frag payload:    " << FRAG_PAYLOAD_SIZE << " bytes (~"
-              << ((FRAG_PAYLOAD_SIZE + MAX_FRAGMENT_PAYLOAD - 1) / MAX_FRAGMENT_PAYLOAD) << " fragments)" << std::endl;
+    if (g_verbose)
+    {
+        std::cout << "=============================================" << std::endl;
+        std::cout << " Entanglement Soak Test Client v4.0" << std::endl;
+        std::cout << " Server:    " << server_ip << ":" << server_port << std::endl;
+        std::cout << " Duration:  " << duration_minutes << " min (" << duration_seconds << "s)" << std::endl;
+        std::cout << " Clients:   " << num_clients << std::endl;
+        int num_modes = (int)enable_reliable + (int)enable_ordered + (int)enable_unreliable;
+        std::cout << " Modes:     ";
+        if (enable_reliable)
+            std::cout << "reliable ";
+        if (enable_ordered)
+            std::cout << "ordered ";
+        if (enable_unreliable)
+            std::cout << "unreliable ";
+        std::cout << "(" << num_modes << " modes, " << (num_modes * 2) << " streams)" << std::endl;
+        std::cout << " Simple payload:  " << SOAK_MSG_SIZE << " bytes" << std::endl;
+        std::cout << " Frag payload:    " << FRAG_PAYLOAD_SIZE << " bytes (~"
+                  << ((FRAG_PAYLOAD_SIZE + MAX_FRAGMENT_PAYLOAD - 1) / MAX_FRAGMENT_PAYLOAD) << " fragments)"
+                  << std::endl;
 #ifdef ENTANGLEMENT_SIMULATE_LOSS
-    std::cout << " Drop rate: " << (drop_rate * 100.0) << "%" << std::endl;
+        std::cout << " Drop rate: " << (drop_rate * 100.0) << "%" << std::endl;
 #endif
-    std::cout << "=============================================" << std::endl;
+        std::cout << "=============================================" << std::endl;
+    }
 
     // --- Launch client threads ---
     std::vector<std::thread> threads;
@@ -1184,40 +1241,36 @@ int main(int argc, char *argv[])
     bool all_pass = true;
 
     // Simple verdicts
-    if (enable_reliable || enable_ordered)
+    if (enable_reliable)
     {
-        int64_t simple_rel_sent = 0, simple_rel_echo = 0;
-        if (enable_reliable)
-        {
-            simple_rel_sent += agg_stream_sent[S_REL];
-            simple_rel_echo += agg_stream_echo[S_REL];
-        }
-        if (enable_ordered)
-        {
-            simple_rel_sent += agg_stream_sent[S_ORD];
-            simple_rel_echo += agg_stream_echo[S_ORD];
-        }
-        bool simple_rel_pass = (simple_rel_echo == simple_rel_sent);
+        bool simple_rel_pass = (agg_stream_echo[S_REL] == agg_stream_sent[S_REL]);
         if (!simple_rel_pass)
             all_pass = false;
 
         if (simple_rel_pass)
             std::cout << "  SIMPLE RELIABLE DELIVERED:                [PASS]" << std::endl;
         else
-            std::cout << "  SIMPLE RELIABLE DELIVERED:                [FAIL] (" << (simple_rel_sent - simple_rel_echo)
-                      << " missing)" << std::endl;
+            std::cout << "  SIMPLE RELIABLE DELIVERED:                [FAIL] ("
+                      << (agg_stream_sent[S_REL] - agg_stream_echo[S_REL]) << " missing)" << std::endl;
     }
 
     if (enable_ordered)
     {
-        bool simple_ord_pass = (agg_stream_violations[S_ORD] == 0);
-        if (!simple_ord_pass)
+        bool simple_ord_del_pass = (agg_stream_echo[S_ORD] == agg_stream_sent[S_ORD]);
+        bool simple_ord_ord_pass = (agg_stream_violations[S_ORD] == 0);
+        if (!simple_ord_del_pass || !simple_ord_ord_pass)
             all_pass = false;
 
-        if (simple_ord_pass)
-            std::cout << "  SIMPLE ORDERED DELIVERY + ORDER:          [PASS]" << std::endl;
+        if (simple_ord_del_pass)
+            std::cout << "  SIMPLE ORDERED DELIVERED:                 [PASS]" << std::endl;
         else
-            std::cout << "  SIMPLE ORDERED DELIVERY + ORDER:          [FAIL] (" << agg_stream_violations[S_ORD]
+            std::cout << "  SIMPLE ORDERED DELIVERED:                 [FAIL] ("
+                      << (agg_stream_sent[S_ORD] - agg_stream_echo[S_ORD]) << " missing)" << std::endl;
+
+        if (simple_ord_ord_pass)
+            std::cout << "  SIMPLE ORDERED ORDER:                     [PASS]" << std::endl;
+        else
+            std::cout << "  SIMPLE ORDERED ORDER:                     [FAIL] (" << agg_stream_violations[S_ORD]
                       << " violations)" << std::endl;
     }
 
@@ -1226,40 +1279,36 @@ int main(int argc, char *argv[])
                   << fmt_pct(agg_stream_echo[S_UNR], agg_stream_sent[S_UNR]) << std::endl;
 
     // Frag verdicts
-    if (enable_reliable || enable_ordered)
+    if (enable_reliable)
     {
-        int64_t frag_rel_sent = 0, frag_rel_echo = 0;
-        if (enable_reliable)
-        {
-            frag_rel_sent += agg_stream_sent[F_REL];
-            frag_rel_echo += agg_stream_echo[F_REL];
-        }
-        if (enable_ordered)
-        {
-            frag_rel_sent += agg_stream_sent[F_ORD];
-            frag_rel_echo += agg_stream_echo[F_ORD];
-        }
-        bool frag_rel_pass = (frag_rel_echo == frag_rel_sent);
+        bool frag_rel_pass = (agg_stream_echo[F_REL] == agg_stream_sent[F_REL]);
         if (!frag_rel_pass)
             all_pass = false;
 
         if (frag_rel_pass)
             std::cout << "  FRAG RELIABLE DELIVERED:                 [PASS]" << std::endl;
         else
-            std::cout << "  FRAG RELIABLE DELIVERED:                 [FAIL] (" << (frag_rel_sent - frag_rel_echo)
-                      << " missing)" << std::endl;
+            std::cout << "  FRAG RELIABLE DELIVERED:                 [FAIL] ("
+                      << (agg_stream_sent[F_REL] - agg_stream_echo[F_REL]) << " missing)" << std::endl;
     }
 
     if (enable_ordered)
     {
-        bool frag_ord_pass = (agg_stream_violations[F_ORD] == 0);
-        if (!frag_ord_pass)
+        bool frag_ord_del_pass = (agg_stream_echo[F_ORD] == agg_stream_sent[F_ORD]);
+        bool frag_ord_ord_pass = (agg_stream_violations[F_ORD] == 0);
+        if (!frag_ord_del_pass || !frag_ord_ord_pass)
             all_pass = false;
 
-        if (frag_ord_pass)
-            std::cout << "  FRAG ORDERED INTACT:                     [PASS]" << std::endl;
+        if (frag_ord_del_pass)
+            std::cout << "  FRAG ORDERED DELIVERED:                  [PASS]" << std::endl;
         else
-            std::cout << "  FRAG ORDERED INTACT:                     [FAIL] (" << agg_stream_violations[F_ORD]
+            std::cout << "  FRAG ORDERED DELIVERED:                  [FAIL] ("
+                      << (agg_stream_sent[F_ORD] - agg_stream_echo[F_ORD]) << " missing)" << std::endl;
+
+        if (frag_ord_ord_pass)
+            std::cout << "  FRAG ORDERED ORDER:                      [PASS]" << std::endl;
+        else
+            std::cout << "  FRAG ORDERED ORDER:                      [FAIL] (" << agg_stream_violations[F_ORD]
                       << " violations)" << std::endl;
     }
 

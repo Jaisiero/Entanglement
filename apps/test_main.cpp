@@ -99,7 +99,11 @@ struct test_server_ctx
     std::thread thread;
     std::atomic<bool> stop_flag{false};
 
-    test_server_ctx(uint16_t port) : srv(port) {}
+    test_server_ctx(uint16_t port, int worker_count = 0) : srv(port)
+    {
+        if (worker_count > 0)
+            srv.set_worker_count(worker_count);
+    }
 
     bool start()
     {

@@ -125,10 +125,10 @@ namespace entanglement
     }
 
     int client::send(const void *data, size_t size, uint8_t channel_id, uint8_t flags, uint32_t *out_message_id,
-                     uint64_t *out_sequence)
+                     uint64_t *out_sequence, uint32_t channel_sequence, uint32_t *out_channel_sequence)
     {
         return m_connection.send_payload(m_socket, m_channels, data, size, flags, channel_id, m_server_endpoint,
-                                         out_message_id, out_sequence);
+                                         out_message_id, out_sequence, channel_sequence, out_channel_sequence);
     }
 
     int client::send_fragment(uint32_t message_id, uint8_t fragment_index, uint8_t fragment_count, const void *data,

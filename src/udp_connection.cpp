@@ -552,7 +552,8 @@ namespace entanglement
 
     int udp_connection::send_payload(udp_socket &socket, const channel_manager &channels, const void *data, size_t size,
                                      uint8_t flags, uint8_t channel_id, const endpoint_key &dest,
-                                     uint32_t *out_message_id, uint64_t *out_sequence)
+                                     uint32_t *out_message_id, uint64_t *out_sequence, uint32_t channel_sequence,
+                                     uint32_t *out_channel_sequence)
     {
         // Single-packet path (no fragmentation overhead)
         if (size <= MAX_PAYLOAD_SIZE)
@@ -562,12 +563,15 @@ namespace entanglement
             packet_header header{};
             header.flags = flags;
             header.channel_id = channel_id;
+            header.channel_sequence = channel_sequence; // non-zero preserves value in prepare_header
             header.payload_size = static_cast<uint16_t>(size);
             bool reliable = channels.is_reliable(channel_id);
             prepare_header(header, reliable);
 
             if (out_sequence)
                 *out_sequence = header.sequence;
+            if (out_channel_sequence)
+                *out_channel_sequence = header.channel_sequence;
 
             // Store for auto-retransmit (reliable channels only)
             if (reliable && m_retransmit)
@@ -591,9 +595,15 @@ namespace entanglement
 
         // For RELIABLE_ORDERED channels, allocate a single channel_sequence for the
         // whole message — carried on fragment 0 so the receiver can enforce ordering.
+        // If the caller supplied a non-zero channel_sequence (retransmission), reuse it.
         uint32_t msg_channel_seq = 0;
         if (channels.is_ordered(channel_id))
-            msg_channel_seq = ++m_channel_sequences[channel_id];
+        {
+            msg_channel_seq = (channel_sequence != 0) ? channel_sequence : ++m_channel_sequences[channel_id];
+        }
+
+        if (out_channel_sequence)
+            *out_channel_sequence = msg_channel_seq;
 
         for (uint8_t i = 0; i < fragment_count; ++i)
         {
@@ -746,7 +756,17 @@ namespace entanglement
                 buffer_ordered_packet(header, payload, size);
             }
         }
-        // else: channel_sequence < expected → stale duplicate, ignore
+        else
+        {
+            // Stale packet (channel_sequence < expected) — deliver anyway.
+            // This can happen when a gap-skip advanced the expected sequence
+            // past a lost packet, and the retransmission arrives later with
+            // the original (now-stale) channel_sequence.  Dropping it would
+            // permanently lose the payload; delivering out-of-order is safe
+            // because the gap-skip already broke strict ordering.
+            if (m_on_ordered_pkt_deliver)
+                m_on_ordered_pkt_deliver(header, payload, size);
+        }
         return true;
     }
 

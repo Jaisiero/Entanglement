@@ -51,4 +51,5 @@ build
 .cache
 
 #log files
+log/
 *.log

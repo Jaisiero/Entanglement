@@ -52,11 +52,14 @@ namespace entanglement
         // Unified send: auto-handles simple and fragmented paths.
         // Messages <= MAX_PAYLOAD_SIZE are sent as a single packet;
         // larger messages are automatically fragmented.
-        // out_message_id: if non-null, receives the library message_id (non-zero for fragmented sends).
-        // out_sequence:   if non-null, receives the packet sequence (only for single-packet sends).
+        // out_message_id:       if non-null, receives the library message_id (non-zero for fragmented sends).
+        // out_sequence:         if non-null, receives the packet sequence (only for single-packet sends).
+        // channel_sequence:     if non-zero, reuses this channel_sequence (for ordered retransmissions).
+        // out_channel_sequence: if non-null, receives the channel_sequence that was assigned/used.
         // Returns bytes of user data sent, or a negative error_code on failure.
         int send(const void *data, size_t size, uint8_t channel_id = 0, uint8_t flags = 0,
-                 uint32_t *out_message_id = nullptr, uint64_t *out_sequence = nullptr);
+                 uint32_t *out_message_id = nullptr, uint64_t *out_sequence = nullptr, uint32_t channel_sequence = 0,
+                 uint32_t *out_channel_sequence = nullptr);
 
         // Retransmit a single fragment of a previously started fragmented message.
         // For manual loss recovery only — prefer enable_auto_retransmit() instead.

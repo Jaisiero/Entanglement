@@ -275,11 +275,16 @@ namespace entanglement
 
         // Send a user message (auto-fragments if needed).
         // Returns bytes of user data sent, or a negative error_code.
-        // out_message_id: if non-null, receives the library message_id (non-zero for fragmented sends).
-        // out_sequence:   if non-null, receives the packet sequence (only for single-packet sends).
+        // out_message_id:       if non-null, receives the library message_id (non-zero for fragmented sends).
+        // out_sequence:         if non-null, receives the packet sequence (only for single-packet sends).
+        // channel_sequence:     if non-zero, the packet reuses this channel_sequence instead of
+        //                       auto-assigning a new one. Used for ordered retransmissions so the
+        //                       receiver sees the same slot in its hold-back buffer.
+        // out_channel_sequence: if non-null, receives the channel_sequence that was assigned/used.
         int send_payload(udp_socket &socket, const channel_manager &channels, const void *data, size_t size,
                          uint8_t flags, uint8_t channel_id, const endpoint_key &dest,
-                         uint32_t *out_message_id = nullptr, uint64_t *out_sequence = nullptr);
+                         uint32_t *out_message_id = nullptr, uint64_t *out_sequence = nullptr,
+                         uint32_t channel_sequence = 0, uint32_t *out_channel_sequence = nullptr);
 
         // Send a single fragment (internal — used by send_payload and auto-retransmit).
         int send_fragment(udp_socket &socket, const channel_manager &channels, uint32_t message_id, uint8_t index,

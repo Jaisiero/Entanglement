@@ -58,6 +58,7 @@ struct churn_config
     int max_rounds = 0; // 0 = unlimited (time-based)
     double drop_rate = 0.0;
     uint16_t port = 9990;
+    int workers = 0; // 0 = single-threaded, >0 = multi-threaded
 };
 
 // --- Per-client result ---
@@ -308,6 +309,20 @@ static churn_config parse_args(int argc, char *argv[])
             cfg.drop_rate = std::atof(argv[++i]);
         else if (arg == "-p" && i + 1 < argc)
             cfg.port = static_cast<uint16_t>(std::atoi(argv[++i]));
+        else if (arg == "-w" && i + 1 < argc)
+        {
+            cfg.workers = std::atoi(argv[++i]);
+            if (cfg.workers < 0)
+                cfg.workers = 0;
+        }
+    }
+
+    // Cap worker count at logical CPU count
+    if (cfg.workers > 0)
+    {
+        int hw = static_cast<int>(std::thread::hardware_concurrency());
+        if (hw > 0)
+            cfg.workers = (std::min)(cfg.workers, hw);
     }
     return cfg;
 }
@@ -329,12 +344,17 @@ int main(int argc, char *argv[])
     std::cout << " Max rounds:  " << (cfg.max_rounds > 0 ? std::to_string(cfg.max_rounds) : "unlimited") << std::endl;
     std::cout << " Drop rate:   " << cfg.drop_rate << "%" << std::endl;
     std::cout << " Port:        " << cfg.port << std::endl;
+    std::cout << " Workers:     " << (cfg.workers > 0 ? std::to_string(cfg.workers) + " threads" : "single-threaded")
+              << std::endl;
     std::cout << "========================================" << std::endl;
 
     // --- Start server ---
     server srv(cfg.port);
     srv.set_verbose(false);
     srv.channels().register_defaults();
+
+    if (cfg.workers > 0)
+        srv.set_worker_count(cfg.workers);
 
     server_stats srv_stats;
 

@@ -1,38 +1,11 @@
 #pragma once
 
-#include "channel_manager.h"
-#include "fragmentation.h"
-#include "udp_connection.h"
-#include "udp_socket.h"
-#include <array>
-#include <atomic>
-#include <functional>
-#include <memory>
-#include <string>
-#include <unordered_map>
+#include "server_worker.h"
+#include <thread>
+#include <vector>
 
 namespace entanglement
 {
-
-    // Callback: data packet from a connected client (non-fragmented)
-    using on_client_data_received = std::function<void(const packet_header &header, const uint8_t *payload,
-                                                       size_t payload_size, const endpoint_key &sender)>;
-
-    // Callback: a client completed the handshake
-    using on_client_connected = std::function<void(const endpoint_key &key, const std::string &address, uint16_t port)>;
-
-    // Callback: a client disconnected (explicit or timeout)
-    using on_client_disconnected =
-        std::function<void(const endpoint_key &key, const std::string &address, uint16_t port)>;
-
-    // Callback: a client requests opening a dynamic channel.
-    // Return true to accept, false to reject.  If no callback is set the server accepts all.
-    using on_channel_requested =
-        std::function<bool(const endpoint_key &key, uint8_t channel_id, channel_mode mode, uint8_t priority)>;
-
-    // Callback: a reliable packet sent to a client was detected as lost.
-    // The server reports the client endpoint_key alongside the loss info so the app can retransmit.
-    using on_server_packet_lost = std::function<void(const lost_packet_info &info, const endpoint_key &client)>;
 
     class server
     {
@@ -93,7 +66,26 @@ namespace entanglement
         void disconnect_all();
 
         uint16_t port() const { return m_port; }
-        size_t connection_count() const { return m_index.size(); }
+
+        size_t connection_count() const
+        {
+            size_t total = 0;
+            for (auto &w : m_workers)
+                total += w->connection_count();
+            return total;
+        }
+
+        // Number of inbound datagrams silently dropped because a worker's
+        // receive queue was full.  Non-zero means workers can't keep up
+        // (e.g. application callbacks are too slow or queue is too small).
+        uint64_t recv_queue_drops() const { return m_recv_queue_drops.load(std::memory_order_relaxed); }
+
+        // --- Threading ---
+        // Set the number of worker threads (call BEFORE start).
+        // 0 (default) = single-threaded legacy mode driven by poll()/update().
+        // >=1 = receiver thread + N worker threads; poll()/update() become no-ops.
+        void set_worker_count(int count) { m_worker_count = count; }
+        int worker_count() const { return m_worker_count; }
 
         // Enable automatic retransmission for all connections.
         // Reliable packets are auto-retransmitted from an internal buffer
@@ -134,9 +126,9 @@ namespace entanglement
         channel_manager m_channels;
         int64_t m_reassembly_timeout_us = REASSEMBLY_TIMEOUT_US;
 
-        // Stored callback templates (applied to each new connection's reassembler)
+        // Stored callback templates (applied to each worker/connection)
         on_allocate_message m_frag_alloc_cb;
-        on_message_complete m_app_on_message_complete; // app callback (wrapped for ordered delivery)
+        on_message_complete m_app_on_message_complete;
         on_message_failed m_frag_failed_cb;
 
         on_client_data_received m_on_client_data_received;
@@ -145,35 +137,37 @@ namespace entanglement
         on_channel_requested m_on_channel_requested;
         on_server_packet_lost m_on_packet_lost;
 
-        // Connection pool + index
-        std::unique_ptr<std::array<udp_connection, MAX_CONNECTIONS>> m_pool;
-        std::unordered_map<endpoint_key, uint16_t, endpoint_key_hash> m_index;
-
-        // Free-slot stack for O(1) connection allocation/deallocation
-        uint16_t m_free_stack[MAX_CONNECTIONS]{};
-        int m_free_top = -1; // index of top element (-1 = empty, lazy-init on first use)
-        bool m_free_initialized = false;
-        void init_freelist();
-
-        // Auto-retransmit flag
         bool m_auto_retransmit = false;
 
-        udp_connection *find_or_create(const endpoint_key &key);
-        udp_connection *find(const endpoint_key &key);
-        int allocate_slot();
+        // Diagnostics: datagrams dropped by receiver thread due to full queues
+        std::atomic<uint64_t> m_recv_queue_drops{0};
 
-        // Control packet handling
-        void handle_control(const endpoint_key &key, const packet_header &header, const uint8_t *payload,
-                            size_t payload_size);
+        // --- Worker infrastructure ---
+        int m_worker_count = 0; // 0 = legacy single-threaded
+        bool m_threaded = false;
+        std::vector<std::unique_ptr<server_worker>> m_workers;
 
-        // Send a control packet through an established connection
-        void send_control_to(udp_connection *conn, uint8_t control_type, const endpoint_key &dest);
+        // Threading (multi-threaded mode only)
+        std::thread m_receiver_thread;
+        std::vector<std::thread> m_worker_threads;
 
-        // Send a multi-byte control payload through an established connection
-        void send_control_payload_to(udp_connection *conn, const void *payload, size_t size, const endpoint_key &dest);
+        // Create and initialise workers (called from start())
+        void create_workers();
 
-        // Send a control packet without a connection (e.g. CONNECTION_DENIED)
-        void send_raw_control(uint8_t control_type, const endpoint_key &dest);
+        // Propagate stored callbacks to all workers
+        void propagate_callbacks();
+
+        // Determine which worker owns a given endpoint
+        size_t worker_index(const endpoint_key &key) const
+        {
+            return (m_workers.size() <= 1) ? 0 : (endpoint_key_hash{}(key) % m_workers.size());
+        }
+
+        // Receiver thread loop (multi-threaded mode)
+        void receiver_loop();
+
+        // Worker thread loop (multi-threaded mode)
+        void worker_loop(size_t worker_idx);
     };
 
 } // namespace entanglement

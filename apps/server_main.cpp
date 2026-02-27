@@ -29,6 +29,7 @@
 #include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <set>
 #include <string>
 #include <thread>
@@ -138,14 +139,21 @@ struct client_recv_stats
 
 // --- Global state ---
 static std::atomic<bool> g_running{true};
+static bool g_verbose = false;
+static std::mutex g_state_mutex; // protects all global maps in multi-threaded mode
 static std::unordered_map<std::string, client_recv_stats> g_client_stats;
 static std::unordered_map<endpoint_key, std::pair<std::string, uint16_t>, endpoint_key_hash> g_endpoint_addr;
-static int g_total_simple_packets = 0;
-static int g_total_frag_messages = 0;
-static int g_total_simple_echoes = 0;
-static int g_total_frag_echoes = 0;
-static int g_total_echo_retransmissions = 0;
-static bool g_had_clients = false;
+static std::atomic<int> g_total_simple_packets{0};
+static std::atomic<int> g_total_frag_messages{0};
+static std::atomic<int> g_total_simple_echoes{0};
+static std::atomic<int> g_total_frag_echoes{0};
+static std::atomic<int> g_total_echo_retransmissions{0};
+static std::atomic<bool> g_had_clients{false};
+
+// Diagnostics: echo send failures
+static std::atomic<int> g_frag_echo_bp_retries{0};    // send_to retries due to backpressure
+static std::atomic<int> g_frag_echo_send_failures{0}; // send_to permanently failed (echo_msg_id==0)
+static std::atomic<int> g_simple_echo_send_failures{0};
 
 // --- Echo retransmission state ---
 // Composite key: encode client port into high bits to avoid collisions
@@ -322,11 +330,11 @@ static void print_aggregate_stats()
     std::cout << "\n=============================================" << std::endl;
     std::cout << " ENTANGLEMENT SOAK TEST — SERVER SUMMARY" << std::endl;
     std::cout << "=============================================" << std::endl;
-    std::cout << "Simple packets received:     " << g_total_simple_packets << std::endl;
-    std::cout << "Fragmented messages received: " << g_total_frag_messages << std::endl;
-    std::cout << "Simple echoes sent:          " << g_total_simple_echoes << std::endl;
-    std::cout << "Fragmented echoes sent:      " << g_total_frag_echoes << std::endl;
-    std::cout << "Echo retransmissions:        " << g_total_echo_retransmissions << std::endl;
+    std::cout << "Simple packets received:     " << g_total_simple_packets.load() << std::endl;
+    std::cout << "Fragmented messages received: " << g_total_frag_messages.load() << std::endl;
+    std::cout << "Simple echoes sent:          " << g_total_simple_echoes.load() << std::endl;
+    std::cout << "Fragmented echoes sent:      " << g_total_frag_echoes.load() << std::endl;
+    std::cout << "Echo retransmissions:        " << g_total_echo_retransmissions.load() << std::endl;
 
     bool all_simple_reliable_ok = true;
     bool all_simple_ordered_ok = true;
@@ -382,6 +390,7 @@ int main(int argc, char *argv[])
 
     uint16_t port = DEFAULT_PORT;
     double drop_rate = 0.0;
+    int worker_count = 0;
 
     for (int i = 1; i < argc; ++i)
     {
@@ -397,19 +406,39 @@ int main(int argc, char *argv[])
             if (drop_rate > 1.0)
                 drop_rate = 1.0;
         }
+        else if ((std::strcmp(argv[i], "-w") == 0 || std::strcmp(argv[i], "--workers") == 0) && i + 1 < argc)
+        {
+            worker_count = std::atoi(argv[++i]);
+            if (worker_count < 0)
+                worker_count = 0;
+        }
+        else if (std::strcmp(argv[i], "-v") == 0 || std::strcmp(argv[i], "--verbose") == 0)
+        {
+            g_verbose = true;
+        }
         else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0)
         {
-            std::cout << "Usage: EntanglementServer [-p port] [-d drop%]" << std::endl;
-            std::cout << "  -p, --port  Listen port (default: " << DEFAULT_PORT << ")" << std::endl;
-            std::cout << "  -d, --drop  Simulated drop rate in percent (default: 0)" << std::endl;
+            std::cout << "Usage: EntanglementServer [-p port] [-d drop%] [-w workers] [-v]" << std::endl;
+            std::cout << "  -p, --port     Listen port (default: " << DEFAULT_PORT << ")" << std::endl;
+            std::cout << "  -d, --drop     Simulated drop rate in percent (default: 0)" << std::endl;
+            std::cout << "  -w, --workers  Worker threads (0 = single-threaded, default: 0)" << std::endl;
+            std::cout << "  -v, --verbose  Print intermediate output during execution" << std::endl;
             return 0;
         }
         else
         {
             std::cerr << "Unknown argument: " << argv[i] << std::endl;
-            std::cerr << "Usage: EntanglementServer [-p port] [-d drop%]" << std::endl;
+            std::cerr << "Usage: EntanglementServer [-p port] [-d drop%] [-w workers] [-v]" << std::endl;
             return 1;
         }
+    }
+
+    // Cap worker count at logical CPU count
+    if (worker_count > 0)
+    {
+        int hw = static_cast<int>(std::thread::hardware_concurrency());
+        if (hw > 0)
+            worker_count = (std::min)(worker_count, hw);
     }
 
     std::signal(SIGINT, signal_handler);
@@ -428,6 +457,9 @@ int main(int argc, char *argv[])
     server srv(port);
     srv.channels().register_defaults();
 
+    if (worker_count > 0)
+        srv.set_worker_count(worker_count);
+
 #ifdef ENTANGLEMENT_SIMULATE_LOSS
     if (drop_rate > 0.0)
         srv.set_simulated_drop_rate(drop_rate);
@@ -439,23 +471,29 @@ int main(int argc, char *argv[])
     srv.set_on_client_connected(
         [&](const endpoint_key &ek, const std::string &addr, uint16_t p)
         {
+            std::lock_guard<std::mutex> lk(g_state_mutex);
             g_endpoint_addr[ek] = {addr, p};
             std::string ck = make_client_key(addr, p);
             auto &cs = g_client_stats[ck];
             cs.address = addr;
             cs.port = p;
             g_had_clients = true;
-            std::cout << "[server] Client connected: " << addr << ":" << p << std::endl;
+            if (g_verbose)
+                std::cout << "[server] Client connected: " << addr << ":" << p << std::endl;
         });
 
     // --- Client disconnected ---
     srv.set_on_client_disconnected(
         [&](const endpoint_key &ek, const std::string &addr, uint16_t p)
         {
-            std::cout << "[server] Client disconnected: " << addr << ":" << p << std::endl;
-            auto it = g_client_stats.find(make_client_key(addr, p));
-            if (it != g_client_stats.end())
-                print_client_stats(it->second);
+            std::lock_guard<std::mutex> lk(g_state_mutex);
+            if (g_verbose)
+            {
+                std::cout << "[server] Client disconnected: " << addr << ":" << p << std::endl;
+                auto it = g_client_stats.find(make_client_key(addr, p));
+                if (it != g_client_stats.end())
+                    print_client_stats(it->second);
+            }
             g_endpoint_addr.erase(ek);
         });
 
@@ -467,57 +505,67 @@ int main(int argc, char *argv[])
         {
             ++g_total_simple_packets;
 
-            std::string addr = endpoint_address_string(sender);
-            uint16_t p = sender.port;
-            std::string ck = make_client_key(addr, p);
-            auto &cs = g_client_stats[ck];
-            ++cs.total_simple_packets;
-            cs.touch();
-
-            if (size >= SOAK_MSG_SIZE)
-            {
-                soak_msg msg;
-                std::memcpy(&msg, payload, SOAK_MSG_SIZE);
-
-                uint8_t ch_id = hdr.channel_id;
-                auto &st = cs.simple_streams[ch_id];
-                if (st.label.empty())
-                    init_stream(st, ch_id, false, srv);
-                if (st.total_expected == 0)
-                    st.total_expected = msg.total_expected;
-                st.record(msg.msg_id);
-
-                // Verbose: first 5, every 5000
-                if (st.unique_received <= 5 || st.unique_received % 5000 == 0)
-                {
-                    std::cout << "[simple] " << addr << ":" << p << " " << st.label << " msg=" << msg.msg_id
-                              << " (unique=" << st.unique_received << ")" << std::endl;
-                }
-            }
-            else
-            {
-                ++cs.total_invalid_format;
-            }
-
-            // Echo back
+            // Echo back FIRST — the send is a direct call on the owning worker
+            // thread, so it doesn't need g_state_mutex.  Moving it outside the
+            // lock dramatically reduces contention in multi-threaded mode and
+            // prevents the receiver-thread's per-worker queue from overflowing.
             packet_header reply{};
             reply.flags = hdr.flags;
             reply.shard_id = hdr.shard_id;
             reply.channel_id = hdr.channel_id;
             reply.payload_size = static_cast<uint16_t>(size);
-            srv.send_raw_to(reply, payload, sender);
+            int echo_result = srv.send_raw_to(reply, payload, sender);
+            if (echo_result <= 0)
+                ++g_simple_echo_send_failures;
 
-            // Store payload for echo retransmission (reliable channels only)
-            if (srv.channels().is_reliable(hdr.channel_id))
+            // Now lock for stats + echo tracking
+            uint16_t p = sender.port;
             {
-                simple_echo_entry entry;
-                entry.payload.assign(payload, payload + size);
-                entry.channel_id = hdr.channel_id;
-                entry.channel_sequence = reply.channel_sequence; // preserve for retransmit
-                g_simple_echo_payloads[make_echo_key(p, reply.sequence)] = std::move(entry);
-            }
+                std::lock_guard<std::mutex> lk(g_state_mutex);
 
-            ++cs.total_simple_echoes;
+                std::string addr = endpoint_address_string(sender);
+                std::string ck = make_client_key(addr, p);
+                auto &cs = g_client_stats[ck];
+                ++cs.total_simple_packets;
+                cs.touch();
+
+                if (size >= SOAK_MSG_SIZE)
+                {
+                    soak_msg msg;
+                    std::memcpy(&msg, payload, SOAK_MSG_SIZE);
+
+                    uint8_t ch_id = hdr.channel_id;
+                    auto &st = cs.simple_streams[ch_id];
+                    if (st.label.empty())
+                        init_stream(st, ch_id, false, srv);
+                    if (st.total_expected == 0)
+                        st.total_expected = msg.total_expected;
+                    st.record(msg.msg_id);
+
+                    // Verbose: first 5, every 5000
+                    if (g_verbose && (st.unique_received <= 5 || st.unique_received % 5000 == 0))
+                    {
+                        std::cout << "[simple] " << addr << ":" << p << " " << st.label << " msg=" << msg.msg_id
+                                  << " (unique=" << st.unique_received << ")" << std::endl;
+                    }
+                }
+                else
+                {
+                    ++cs.total_invalid_format;
+                }
+
+                // Store payload for echo retransmission (reliable channels only)
+                if (srv.channels().is_reliable(hdr.channel_id))
+                {
+                    simple_echo_entry entry;
+                    entry.payload.assign(payload, payload + size);
+                    entry.channel_id = hdr.channel_id;
+                    entry.channel_sequence = reply.channel_sequence; // preserve for retransmit
+                    g_simple_echo_payloads[make_echo_key(p, reply.sequence)] = std::move(entry);
+                }
+
+                ++cs.total_simple_echoes;
+            }
             ++g_total_simple_echoes;
         });
 
@@ -536,52 +584,64 @@ int main(int argc, char *argv[])
         {
             ++g_total_frag_messages;
 
-            std::string addr;
-            uint16_t p = 0;
-            if (!resolve_endpoint(sender, addr, p))
-            {
-                delete[] data;
-                return;
-            }
-
-            std::string ck = make_client_key(addr, p);
-            auto &cs = g_client_stats[ck];
-            ++cs.total_frag_messages;
-            cs.touch();
-
-            if (total_size >= SOAK_MSG_SIZE)
-            {
-                soak_msg msg;
-                std::memcpy(&msg, data, SOAK_MSG_SIZE);
-
-                auto &st = cs.frag_streams[ch_id];
-                if (st.label.empty())
-                    init_stream(st, ch_id, true, srv);
-                if (st.total_expected == 0)
-                    st.total_expected = msg.total_expected;
-                st.record(msg.msg_id);
-
-                if (st.unique_received <= 5 || st.unique_received % 5000 == 0)
-                {
-                    std::cout << "[frag]   " << addr << ":" << p << " " << st.label << " msg=" << msg.msg_id
-                              << " size=" << total_size << " (unique=" << st.unique_received << ")" << std::endl;
-                }
-            }
-
-            // Echo entire reassembled payload back (auto-fragments)
+            // Echo entire reassembled payload FIRST (no lock needed —
+            // direct call on owning worker thread via endpoint_key overload).
+            // Retry if backpressured — the client's reassembler may be
+            // temporarily full; a short sleep lets it drain.
             uint32_t echo_msg_id = 0;
-            srv.send_to(data, total_size, ch_id, addr, p, 0, &echo_msg_id);
-
-            // Store payload for echo retransmission (reliable channels only)
-            if (srv.channels().is_reliable(ch_id) && echo_msg_id != 0)
+            for (int attempt = 0; attempt < 50; ++attempt)
             {
-                frag_echo_entry entry;
-                entry.payload.assign(data, data + total_size);
-                entry.channel_id = ch_id;
-                g_frag_echo_payloads[make_echo_key(p, echo_msg_id)] = std::move(entry);
+                echo_msg_id = 0;
+                srv.send_to(data, total_size, ch_id, sender, 0, &echo_msg_id);
+                if (echo_msg_id != 0)
+                    break;
+                ++g_frag_echo_bp_retries;
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
+            if (echo_msg_id == 0)
+                ++g_frag_echo_send_failures;
 
-            ++cs.total_frag_echoes;
+            // Now lock for stats + echo tracking
+            uint16_t p = sender.port;
+            {
+                std::lock_guard<std::mutex> lk(g_state_mutex);
+
+                std::string addr = endpoint_address_string(sender);
+                std::string ck = make_client_key(addr, p);
+                auto &cs = g_client_stats[ck];
+                ++cs.total_frag_messages;
+                cs.touch();
+
+                if (total_size >= SOAK_MSG_SIZE)
+                {
+                    soak_msg msg;
+                    std::memcpy(&msg, data, SOAK_MSG_SIZE);
+
+                    auto &st = cs.frag_streams[ch_id];
+                    if (st.label.empty())
+                        init_stream(st, ch_id, true, srv);
+                    if (st.total_expected == 0)
+                        st.total_expected = msg.total_expected;
+                    st.record(msg.msg_id);
+
+                    if (g_verbose && (st.unique_received <= 5 || st.unique_received % 5000 == 0))
+                    {
+                        std::cout << "[frag]   " << addr << ":" << p << " " << st.label << " msg=" << msg.msg_id
+                                  << " size=" << total_size << " (unique=" << st.unique_received << ")" << std::endl;
+                    }
+                }
+
+                // Store payload for echo retransmission (reliable channels only)
+                if (srv.channels().is_reliable(ch_id) && echo_msg_id != 0)
+                {
+                    frag_echo_entry entry;
+                    entry.payload.assign(data, data + total_size);
+                    entry.channel_id = ch_id;
+                    g_frag_echo_payloads[make_echo_key(p, echo_msg_id)] = std::move(entry);
+                }
+
+                ++cs.total_frag_echoes;
+            }
             ++g_total_frag_echoes;
 
             delete[] data;
@@ -592,6 +652,7 @@ int main(int argc, char *argv[])
         [&](const endpoint_key &sender, uint32_t /*msg_id*/, uint8_t /*ch_id*/, uint8_t *buf,
             message_fail_reason /*reason*/, uint8_t /*received*/, uint8_t /*total*/)
         {
+            std::lock_guard<std::mutex> lk(g_state_mutex);
             std::string addr;
             uint16_t p = 0;
             if (resolve_endpoint(sender, addr, p))
@@ -607,62 +668,97 @@ int main(int argc, char *argv[])
     // =========================================================================
     auto on_echo_loss = [&](const lost_packet_info &info, const endpoint_key &client_ep)
     {
-        std::string addr = endpoint_address_string(client_ep);
         uint16_t p = client_ep.port;
 
         if (info.message_id != 0)
         {
-            // Fragment echo loss — retransmit the specific fragment
-            uint64_t ekey = make_echo_key(p, info.message_id);
-            auto it = g_frag_echo_payloads.find(ekey);
-            if (it == g_frag_echo_payloads.end())
-                return;
+            // Fragment echo loss — copy payload chunk under lock, send outside
+            std::vector<uint8_t> chunk_copy;
+            {
+                std::lock_guard<std::mutex> lk(g_state_mutex);
 
-            // Check retry limit
-            uint64_t frag_key = make_echo_key(p, (static_cast<uint64_t>(info.message_id) << 8) | info.fragment_index);
-            int &retries = g_frag_echo_retries[frag_key];
-            if (retries >= MAX_ECHO_FRAG_RETRIES)
-                return;
-            ++retries;
+                uint64_t ekey = make_echo_key(p, info.message_id);
+                auto it = g_frag_echo_payloads.find(ekey);
+                if (it == g_frag_echo_payloads.end())
+                    return;
 
-            const auto &entry = it->second;
-            size_t offset = static_cast<size_t>(info.fragment_index) * MAX_FRAGMENT_PAYLOAD;
-            if (offset >= entry.payload.size())
-                return;
-            size_t chunk = (std::min)(MAX_FRAGMENT_PAYLOAD, entry.payload.size() - offset);
+                // Check retry limit
+                uint64_t frag_key =
+                    make_echo_key(p, (static_cast<uint64_t>(info.message_id) << 8) | info.fragment_index);
+                int &retries = g_frag_echo_retries[frag_key];
+                if (retries >= MAX_ECHO_FRAG_RETRIES)
+                    return;
+                ++retries;
 
-            srv.send_fragment_to(info.message_id, info.fragment_index, info.fragment_count,
-                                 entry.payload.data() + offset, chunk, 0, info.channel_id, addr, p,
-                                 info.channel_sequence);
+                const auto &entry = it->second;
+                size_t offset = static_cast<size_t>(info.fragment_index) * MAX_FRAGMENT_PAYLOAD;
+                if (offset >= entry.payload.size())
+                    return;
+                size_t chunk = (std::min)(MAX_FRAGMENT_PAYLOAD, entry.payload.size() - offset);
+                chunk_copy.assign(entry.payload.data() + offset, entry.payload.data() + offset + chunk);
+            }
+
+            srv.send_fragment_to(info.message_id, info.fragment_index, info.fragment_count, chunk_copy.data(),
+                                 chunk_copy.size(), 0, info.channel_id, client_ep, info.channel_sequence);
             ++g_total_echo_retransmissions;
             return;
         }
 
-        // Simple echo loss — retransmit
-        uint64_t ekey = make_echo_key(p, info.sequence);
-        auto it = g_simple_echo_payloads.find(ekey);
-        if (it == g_simple_echo_payloads.end())
-            return;
+        // Simple echo loss — copy payload under lock, send outside, update tracking
+        std::vector<uint8_t> payload_copy;
+        uint8_t channel_id;
+        uint32_t channel_sequence;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mutex);
 
-        const auto &entry = it->second;
+            uint64_t ekey = make_echo_key(p, info.sequence);
+            auto it = g_simple_echo_payloads.find(ekey);
+            if (it == g_simple_echo_payloads.end())
+                return;
+
+            const auto &entry = it->second;
+            payload_copy = entry.payload;
+            channel_id = entry.channel_id;
+            channel_sequence = entry.channel_sequence;
+            g_simple_echo_payloads.erase(it);
+        }
 
         packet_header reply{};
-        reply.channel_id = entry.channel_id;
-        reply.channel_sequence = entry.channel_sequence;
-        reply.payload_size = static_cast<uint16_t>(entry.payload.size());
-        srv.send_raw_to(reply, entry.payload.data(), client_ep);
+        reply.channel_id = channel_id;
+        reply.channel_sequence = channel_sequence;
+        reply.payload_size = static_cast<uint16_t>(payload_copy.size());
+        int send_result = srv.send_raw_to(reply, payload_copy.data(), client_ep);
+        if (send_result <= 0)
+        {
+            // Send failed — re-store under OLD key so next loss can retry
+            ++g_simple_echo_send_failures;
+            std::lock_guard<std::mutex> lk(g_state_mutex);
+            simple_echo_entry restored;
+            restored.payload = std::move(payload_copy);
+            restored.channel_id = channel_id;
+            restored.channel_sequence = channel_sequence;
+            g_simple_echo_payloads[make_echo_key(p, info.sequence)] = std::move(restored);
+            return;
+        }
 
-        // Update tracking: remove old sequence, store new one under new sequence
-        simple_echo_entry new_entry;
-        new_entry.payload = entry.payload;
-        new_entry.channel_id = entry.channel_id;
-        new_entry.channel_sequence = entry.channel_sequence;
-        g_simple_echo_payloads.erase(it);
-        g_simple_echo_payloads[make_echo_key(p, reply.sequence)] = std::move(new_entry);
+        // Store updated echo entry under new sequence
+        {
+            std::lock_guard<std::mutex> lk(g_state_mutex);
+            simple_echo_entry new_entry;
+            new_entry.payload = std::move(payload_copy);
+            new_entry.channel_id = channel_id;
+            new_entry.channel_sequence = channel_sequence;
+            g_simple_echo_payloads[make_echo_key(p, reply.sequence)] = std::move(new_entry);
+        }
         ++g_total_echo_retransmissions;
     };
 
     // =========================================================================
+
+    // Register the loss callback for both single-threaded and multi-threaded mode.
+    // In MT mode, srv.update() is a no-op so set_on_packet_lost ensures the callback
+    // is propagated to each worker thread.
+    srv.set_on_packet_lost(on_echo_loss);
 
     if (failed(srv.start()))
     {
@@ -670,7 +766,8 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    std::cout << "[server] Waiting for clients... (Ctrl+C to stop)" << std::endl;
+    if (g_verbose)
+        std::cout << "[server] Waiting for clients... (Ctrl+C to stop)" << std::endl;
 
     auto idle_start = std::chrono::steady_clock::now();
     constexpr auto IDLE_TIMEOUT = std::chrono::seconds(5);
@@ -678,7 +775,7 @@ int main(int argc, char *argv[])
     while (g_running.load())
     {
         srv.poll();
-        srv.update(on_echo_loss);
+        srv.update();
 
         auto now = std::chrono::steady_clock::now();
 
@@ -689,9 +786,10 @@ int main(int argc, char *argv[])
         {
             if (now - idle_start > IDLE_TIMEOUT)
             {
-                std::cout << "\n[server] All clients disconnected. Auto-stopping after "
-                          << std::chrono::duration_cast<std::chrono::seconds>(IDLE_TIMEOUT).count() << "s idle."
-                          << std::endl;
+                if (g_verbose)
+                    std::cout << "\n[server] All clients disconnected. Auto-stopping after "
+                              << std::chrono::duration_cast<std::chrono::seconds>(IDLE_TIMEOUT).count() << "s idle."
+                              << std::endl;
                 break;
             }
         }
@@ -701,6 +799,21 @@ int main(int argc, char *argv[])
 
     srv.stop();
     print_aggregate_stats();
+
+    // Diagnostics: receiver queue overflow
+    uint64_t drops = srv.recv_queue_drops();
+    if (drops > 0)
+        std::cout << "  [DIAG] Recv queue drops:      " << drops << std::endl;
+
+    int frag_retries = g_frag_echo_bp_retries.load();
+    int frag_failures = g_frag_echo_send_failures.load();
+    int simple_failures = g_simple_echo_send_failures.load();
+    if (frag_retries > 0 || frag_failures > 0 || simple_failures > 0)
+    {
+        std::cout << "  [DIAG] Frag echo retries:     " << frag_retries << std::endl;
+        std::cout << "  [DIAG] Frag echo send fails:  " << frag_failures << std::endl;
+        std::cout << "  [DIAG] Simple echo send fails: " << simple_failures << std::endl;
+    }
 
     platform_shutdown();
     return 0;
