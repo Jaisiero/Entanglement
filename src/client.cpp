@@ -261,7 +261,7 @@ namespace entanglement
         ra.cleanup_stale(now, ra.reassembly_timeout());
 
         // Check for ordered-delivery stalls (auto-skip gaps that block delivery)
-        m_connection.check_ordered_stalls(m_channels);
+        m_connection.check_ordered_stalls(m_channels, now);
 
         // Send backpressure relief if usage dropped below low watermark
         if (m_connection.backpressure_sent() && ra.usage_percent() < BACKPRESSURE_LOW_WATERMARK)

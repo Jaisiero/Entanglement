@@ -173,7 +173,9 @@ namespace entanglement
         // Fill header with current ack state before sending.
         // Registers the packet in the send buffer for ACK tracking / loss detection.
         // 'reliable' should be derived from channel_config (not a per-packet flag).
-        void prepare_header(packet_header &header, bool reliable = false);
+        // 'send_time' — if not epoch, used instead of calling steady_clock::now().
+        void prepare_header(packet_header &header, bool reliable = false,
+                            std::chrono::steady_clock::time_point send_time = {});
 
         // --- Receiving side ---
 
@@ -274,7 +276,7 @@ namespace entanglement
         // If an ordered channel has buffered future messages but the expected
         // sequence hasn't advanced for the configured stall timeout, automatically
         // skip the gap and deliver the buffered messages.
-        void check_ordered_stalls(const channel_manager &channels);
+        void check_ordered_stalls(const channel_manager &channels, std::chrono::steady_clock::time_point now);
 
         // Override the ordered stall timeout (default: ORDERED_STALL_TIMEOUT_US).
         // Lower values detect and recover stalls faster (useful during drain).

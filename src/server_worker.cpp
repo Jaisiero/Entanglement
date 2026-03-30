@@ -48,6 +48,10 @@ namespace entanglement
 
     int server_worker::poll_local(int max_packets)
     {
+        // Cache timestamp for this batch — used by send paths to avoid
+        // per-packet steady_clock::now() calls.
+        m_cached_now = std::chrono::steady_clock::now();
+
         // 1. Process cross-thread send commands first
         flush_send_queue();
 
@@ -121,6 +125,13 @@ namespace entanglement
     int server_worker::update(on_server_packet_lost loss_callback)
     {
         auto now = std::chrono::steady_clock::now();
+        m_cached_now = now;
+        uint32_t tick = m_tick_counter++;
+
+        // Stagger period for expensive per-connection operations.
+        // At 120 Hz server tick rate, period=4 means each connection runs
+        // cleanup/stall/backpressure every ~33 ms — well within timeout margins.
+        constexpr uint32_t STAGGER_PERIOD = 4;
 
         endpoint_key timed_out[MAX_TIMEOUTS_PER_UPDATE];
         int timeout_count = 0;
@@ -168,12 +179,16 @@ namespace entanglement
                 }
             }
 
+            // --- Staggered expensive operations (run every STAGGER_PERIOD ticks) ---
+            if ((idx % STAGGER_PERIOD) != (tick % STAGGER_PERIOD))
+                continue;
+
             // Reassembly cleanup
             auto &ra = conn.reassembler();
             ra.cleanup_stale(now, ra.reassembly_timeout());
 
             // Ordered-delivery stall check
-            conn.check_ordered_stalls(*m_channels);
+            conn.check_ordered_stalls(*m_channels, now);
 
             // Back-pressure relief
             if (conn.backpressure_sent() && ra.usage_percent() < BACKPRESSURE_LOW_WATERMARK)
@@ -210,7 +225,7 @@ namespace entanglement
         if (conn && conn->state() == connection_state::CONNECTED)
         {
             bool reliable = m_channels->is_reliable(header.channel_id);
-            conn->prepare_header(header, reliable);
+            conn->prepare_header(header, reliable, m_cached_now);
         }
         return m_socket->send_packet(header, payload, dest);
     }
@@ -579,7 +594,7 @@ namespace entanglement
         header.flags = FLAG_CONTROL;
         header.channel_id = channels::CONTROL.id;
         header.payload_size = static_cast<uint16_t>(size);
-        conn->prepare_header(header, true);
+        conn->prepare_header(header, true, m_cached_now);
         m_socket->send_packet(header, payload, dest);
     }
 

@@ -194,6 +194,13 @@ namespace entanglement
 
         std::thread::id m_thread_id{};
 
+        // Tick counter for staggering expensive per-connection operations
+        uint32_t m_tick_counter = 0;
+
+        // Cached timestamp — set once per poll_local/update batch, used in send paths
+        // to avoid redundant steady_clock::now() calls.
+        std::chrono::steady_clock::time_point m_cached_now{};
+
         // --- Internal helpers ---
         void handle_control(const endpoint_key &key, const packet_header &header, const uint8_t *payload,
                             size_t payload_size);

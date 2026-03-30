@@ -144,24 +144,30 @@ namespace entanglement
 
         while (m_running.load(std::memory_order_relaxed))
         {
-            int result = m_socket.recv_packet(header, payload, MAX_PAYLOAD_SIZE, sender);
-            if (result <= 0)
+            // Drain up to a batch of packets before checking m_running / yielding.
+            // Reduces per-packet overhead of atomic loads and yield syscalls.
+            int batch = 0;
+            while (batch < DEFAULT_MAX_POLL_PACKETS)
             {
+                int result = m_socket.recv_packet(header, payload, MAX_PAYLOAD_SIZE, sender);
+                if (result <= 0)
+                    break;
+
+                size_t w = worker_index(sender);
+                queued_datagram dgram;
+                dgram.header = header;
+                dgram.sender = sender;
+                std::memcpy(dgram.payload, payload, header.payload_size);
+
+                if (!m_workers[w]->enqueue(std::move(dgram)))
+                {
+                    m_recv_queue_drops.fetch_add(1, std::memory_order_relaxed);
+                }
+                ++batch;
+            }
+
+            if (batch == 0)
                 std::this_thread::yield();
-                continue;
-            }
-
-            size_t w = worker_index(sender);
-            queued_datagram dgram;
-            dgram.header = header;
-            dgram.sender = sender;
-            std::memcpy(dgram.payload, payload, header.payload_size);
-
-            if (!m_workers[w]->enqueue(std::move(dgram)))
-            {
-                // Queue full — drop packet (UDP, sender retransmits if reliable)
-                m_recv_queue_drops.fetch_add(1, std::memory_order_relaxed);
-            }
         }
     }
 

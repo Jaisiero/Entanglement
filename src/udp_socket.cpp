@@ -67,6 +67,10 @@ namespace entanglement
         int rcvbuf = SOCKET_RECV_BUFFER_SIZE;
         setsockopt(m_socket, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char *>(&rcvbuf), sizeof(rcvbuf));
 
+        // Increase send buffer to match (prevents burst drops on send side)
+        int sndbuf = SOCKET_RECV_BUFFER_SIZE;
+        setsockopt(m_socket, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char *>(&sndbuf), sizeof(sndbuf));
+
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_port = htons(port);

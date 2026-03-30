@@ -186,14 +186,7 @@ namespace entanglement
         void clear();
 
         // Number of messages currently being reassembled
-        size_t pending_count() const
-        {
-            size_t n = 0;
-            for (const auto &e : m_entries)
-                if (e.active)
-                    ++n;
-            return n;
-        }
+        size_t pending_count() const { return m_active_count; }
 
         // Capacity queries (for backpressure logic)
         static constexpr size_t capacity() { return MAX_INCOMING_FRAGMENTED_MESSAGES; }
@@ -205,6 +198,7 @@ namespace entanglement
 
     private:
         reassembly_entry m_entries[MAX_INCOMING_FRAGMENTED_MESSAGES]{};
+        size_t m_active_count = 0;
         on_allocate_message m_on_allocate;
         on_message_complete m_on_complete;
         on_message_failed m_on_failed;

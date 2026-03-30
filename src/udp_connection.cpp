@@ -81,7 +81,8 @@ namespace entanglement
         return m_local_sequence++;
     }
 
-    void udp_connection::prepare_header(packet_header &header, bool reliable)
+    void udp_connection::prepare_header(packet_header &header, bool reliable,
+                                        std::chrono::steady_clock::time_point send_time)
     {
         header.magic = PROTOCOL_MAGIC;
         header.version = PROTOCOL_VERSION;
@@ -112,7 +113,8 @@ namespace entanglement
         entry.channel_sequence = header.channel_sequence;
         entry.message_id = 0;
         entry.fragment_index = 0;
-        entry.send_time = std::chrono::steady_clock::now();
+        entry.send_time =
+            (send_time != std::chrono::steady_clock::time_point{}) ? send_time : std::chrono::steady_clock::now();
         m_last_send_time = entry.send_time;
 
         // Track in congestion window
@@ -297,6 +299,10 @@ namespace entanglement
     int udp_connection::collect_losses(std::chrono::steady_clock::time_point now, lost_packet_info *out, int max_count)
     {
         int count = 0;
+
+        // Fast path: nothing in flight → nothing to scan
+        if (m_oldest_unacked_seq >= m_local_sequence)
+            return 0;
 
         // Scan from oldest un-acked (optimization: skip already-resolved entries)
         uint64_t oldest = (m_local_sequence > SEQUENCE_BUFFER_SIZE)
@@ -690,14 +696,18 @@ namespace entanglement
 
     // --- Ordered stall detection ---
 
-    void udp_connection::check_ordered_stalls(const channel_manager &channels)
+    void udp_connection::check_ordered_stalls(const channel_manager &channels,
+                                              std::chrono::steady_clock::time_point now)
     {
-        auto now = std::chrono::steady_clock::now();
-        for (uint16_t ch = 0; ch < MAX_CHANNELS; ++ch)
+        // Fast path: skip entirely if no ordered channels exist
+        size_t ord_count = channels.ordered_channel_count();
+        if (ord_count == 0)
+            return;
+        const uint8_t *ord_ids = channels.ordered_channel_ids();
+
+        for (size_t i = 0; i < ord_count; ++i)
         {
-            uint8_t ch_id = static_cast<uint8_t>(ch);
-            if (!channels.is_ordered(ch_id))
-                continue;
+            uint8_t ch_id = ord_ids[i];
 
             // Check if there are any buffered entries for this channel
             bool has_buffered = false;
