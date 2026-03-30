@@ -182,7 +182,8 @@ namespace entanglement
         // Process an incoming packet header: update remote sequence, ack bitmap,
         // and process piggybacked ACKs from the remote side.
         // Returns false if the packet is a duplicate (already received).
-        bool process_incoming(const packet_header &header);
+        // 'recv_time' — if not epoch, used instead of calling steady_clock::now().
+        bool process_incoming(const packet_header &header, std::chrono::steady_clock::time_point recv_time = {});
 
         // --- Queries ---
 
@@ -191,6 +192,11 @@ namespace entanglement
 
         endpoint_key endpoint() const { return m_endpoint; }
         void set_endpoint(const endpoint_key &ep) { m_endpoint = ep; }
+
+        // Cache a timestamp for use by internal methods (process_incoming,
+        // advance_ordered_seq, ack_packet RTT sample) to avoid repeated
+        // calls to steady_clock::now() within the same processing batch.
+        void set_cached_now(std::chrono::steady_clock::time_point t) { m_cached_now = t; }
 
         connection_state state() const { return m_state; }
         void set_state(connection_state s) { m_state = s; }
@@ -330,7 +336,7 @@ namespace entanglement
         void advance_ordered_seq(uint8_t ch_id)
         {
             ++m_recv_channel_seq[ch_id];
-            m_ordered_last_advance[ch_id] = std::chrono::steady_clock::now();
+            m_ordered_last_advance[ch_id] = m_cached_now;
         }
 
         // Buffer an out-of-order packet for later delivery. Returns true if buffered.
@@ -388,6 +394,10 @@ namespace entanglement
         bool m_active = false;
         connection_state m_state = connection_state::DISCONNECTED;
         endpoint_key m_endpoint{};
+
+        // Cached timestamp — set by the worker/client before processing a batch
+        // to avoid repeated steady_clock::now() calls on the hot path.
+        std::chrono::steady_clock::time_point m_cached_now{};
 
         // Timestamps for heartbeat / timeout
         std::chrono::steady_clock::time_point m_last_recv_time{};

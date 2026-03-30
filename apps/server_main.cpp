@@ -391,6 +391,7 @@ int main(int argc, char *argv[])
     uint16_t port = DEFAULT_PORT;
     double drop_rate = 0.0;
     int worker_count = 0;
+    int socket_count = 1;
     bool keep_alive = false; // -k: don't auto-stop when clients disconnect
 
     for (int i = 1; i < argc; ++i)
@@ -413,6 +414,12 @@ int main(int argc, char *argv[])
             if (worker_count < 0)
                 worker_count = 0;
         }
+        else if ((std::strcmp(argv[i], "-s") == 0 || std::strcmp(argv[i], "--sockets") == 0) && i + 1 < argc)
+        {
+            socket_count = std::atoi(argv[++i]);
+            if (socket_count < 1)
+                socket_count = 1;
+        }
         else if (std::strcmp(argv[i], "-k") == 0 || std::strcmp(argv[i], "--keep-alive") == 0)
         {
             keep_alive = true;
@@ -423,10 +430,12 @@ int main(int argc, char *argv[])
         }
         else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0)
         {
-            std::cout << "Usage: EntanglementServer [-p port] [-d drop%] [-w workers] [-k] [-v]" << std::endl;
+            std::cout << "Usage: EntanglementServer [-p port] [-d drop%] [-w workers] [-s sockets] [-k] [-v]"
+                      << std::endl;
             std::cout << "  -p, --port       Listen port (default: " << DEFAULT_PORT << ")" << std::endl;
             std::cout << "  -d, --drop       Simulated drop rate in percent (default: 0)" << std::endl;
             std::cout << "  -w, --workers    Worker threads (0 = single-threaded, default: 0)" << std::endl;
+            std::cout << "  -s, --sockets    Receive sockets (SO_REUSEPORT, Linux only, default: 1)" << std::endl;
             std::cout << "  -k, --keep-alive Don't auto-stop when all clients disconnect" << std::endl;
             std::cout << "  -v, --verbose    Print intermediate output during execution" << std::endl;
             return 0;
@@ -434,7 +443,8 @@ int main(int argc, char *argv[])
         else
         {
             std::cerr << "Unknown argument: " << argv[i] << std::endl;
-            std::cerr << "Usage: EntanglementServer [-p port] [-d drop%] [-w workers] [-k] [-v]" << std::endl;
+            std::cerr << "Usage: EntanglementServer [-p port] [-d drop%] [-w workers] [-s sockets] [-k] [-v]"
+                      << std::endl;
             return 1;
         }
     }
@@ -455,6 +465,10 @@ int main(int argc, char *argv[])
     std::cout << " Header size: " << sizeof(packet_header) << " bytes" << std::endl;
     std::cout << " Soak payload (simple): " << SOAK_MSG_SIZE << " bytes" << std::endl;
     std::cout << " Max fragment payload:  " << MAX_FRAGMENT_PAYLOAD << " bytes" << std::endl;
+    if (worker_count > 0)
+        std::cout << " Workers: " << worker_count << " (async I/O)" << std::endl;
+    if (socket_count > 1)
+        std::cout << " Sockets: " << socket_count << " (SO_REUSEPORT)" << std::endl;
 #ifdef ENTANGLEMENT_SIMULATE_LOSS
     std::cout << " Drop rate: " << (drop_rate * 100.0) << "%" << std::endl;
 #endif
@@ -465,6 +479,14 @@ int main(int argc, char *argv[])
 
     if (worker_count > 0)
         srv.set_worker_count(worker_count);
+
+    // Multi-socket: SO_REUSEPORT for parallel receiver threads (Linux only)
+    if (socket_count > 1)
+        srv.set_socket_count(socket_count);
+
+    // Enable platform-optimized async I/O for high-throughput batch receive
+    if (worker_count > 0)
+        srv.set_use_async_io(true);
 
 #ifdef ENTANGLEMENT_SIMULATE_LOSS
     if (drop_rate > 0.0)

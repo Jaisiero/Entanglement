@@ -84,12 +84,15 @@ namespace entanglement
         server_worker &operator=(const server_worker &) = delete;
 
         // --- Initialisation (called once before start) ---
+        // recv_queue_count: number of SPSC recv queues (one per receiver thread).
+        // Default 1 for single-socket mode. Set > 1 for SO_REUSEPORT multi-socket.
         void init(size_t pool_capacity, udp_socket *socket, channel_manager *channels,
-                  const std::atomic<bool> *running_flag);
+                  const std::atomic<bool> *running_flag, int recv_queue_count = 1);
 
         // --- Receive queue (receiver thread → this worker) ---
-        bool enqueue(queued_datagram &&dgram);
-        bool enqueue(const queued_datagram &dgram);
+        // queue_id selects which SPSC queue to push to (one per receiver thread).
+        bool enqueue(queued_datagram &&dgram, int queue_id = 0);
+        bool enqueue(const queued_datagram &dgram, int queue_id = 0);
 
         // --- Send command queue (any thread → this worker) ---
         bool enqueue_send(send_command &&cmd);
@@ -170,7 +173,8 @@ namespace entanglement
         int allocate_slot();
 
         // SPSC queues (heap-allocated to keep worker movable-by-pointer)
-        std::unique_ptr<spsc_queue<queued_datagram, WORKER_RECV_QUEUE_SIZE>> m_recv_queue;
+        // One recv queue per receiver thread (size 1 in single-socket mode).
+        std::vector<std::unique_ptr<spsc_queue<queued_datagram, WORKER_RECV_QUEUE_SIZE>>> m_recv_queues;
         std::unique_ptr<spsc_queue<send_command, WORKER_SEND_QUEUE_SIZE>> m_send_queue;
 
         // Flush pending send commands from the cross-thread queue

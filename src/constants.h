@@ -13,8 +13,8 @@ namespace entanglement
     // --- Network limits ---
     constexpr size_t MAX_PACKET_SIZE = 1200; // Safe MTU minus IP/UDP headers
     constexpr uint16_t DEFAULT_PORT = 9876;
-    constexpr size_t MAX_CONNECTIONS = 1024;
-    constexpr int SOCKET_RECV_BUFFER_SIZE = 1024 * 1024; // 1 MB SO_RCVBUF
+    constexpr size_t MAX_CONNECTIONS = 4096;
+    constexpr int SOCKET_RECV_BUFFER_SIZE = 4 * 1024 * 1024; // 4 MB SO_RCVBUF
 
     // --- Poll defaults ---
     constexpr int DEFAULT_MAX_POLL_PACKETS = 256;

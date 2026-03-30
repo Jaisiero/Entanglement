@@ -96,8 +96,29 @@ namespace entanglement
         void set_verbose(bool verbose) { m_verbose = verbose; }
         bool verbose() const { return m_verbose; }
 
+        // Enable platform-optimized async I/O for the receiver thread.
+        // Windows: IOCP (overlapped WSARecvFrom + GetQueuedCompletionStatusEx)
+        // Linux:   epoll + recvmmsg (batch kernel receive)
+        // Call BEFORE start(). Only effective in multi-threaded mode (worker_count >= 1).
+        void set_use_async_io(bool enabled) { m_use_async_io = enabled; }
+        bool use_async_io() const { return m_use_async_io; }
+
+        // Set the number of receive sockets (SO_REUSEPORT, Linux only).
+        // When > 1, N sockets are bound to the same port and the kernel
+        // distributes incoming datagrams by 5-tuple hash.  Each socket
+        // gets its own receiver thread, parallelizing the receive path.
+        // On Windows this setting is ignored (always 1 socket).
+        // Call BEFORE start().
+        void set_socket_count(int count) { m_socket_count = count; }
+        int socket_count() const { return m_socket_count; }
+
 #ifdef ENTANGLEMENT_SIMULATE_LOSS
-        void set_simulated_drop_rate(double rate) { m_socket.set_drop_rate(rate); }
+        void set_simulated_drop_rate(double rate)
+        {
+            m_socket.set_drop_rate(rate);
+            for (auto &s : m_extra_recv_sockets)
+                s.set_drop_rate(rate);
+        }
         double simulated_drop_rate() const { return m_socket.drop_rate(); }
 #endif
 
@@ -139,6 +160,10 @@ namespace entanglement
 
         bool m_auto_retransmit = false;
 
+        bool m_use_async_io = false;
+
+        int m_socket_count = 1; // Number of receive sockets (SO_REUSEPORT on Linux)
+
         // Diagnostics: datagrams dropped by receiver thread due to full queues
         std::atomic<uint64_t> m_recv_queue_drops{0};
 
@@ -147,8 +172,13 @@ namespace entanglement
         bool m_threaded = false;
         std::vector<std::unique_ptr<server_worker>> m_workers;
 
+        // Extra receive sockets for SO_REUSEPORT multi-socket mode (Linux only).
+        // m_socket is always the primary (index 0). These are indices 1..N-1.
+        std::vector<udp_socket> m_extra_recv_sockets;
+
         // Threading (multi-threaded mode only)
-        std::thread m_receiver_thread;
+        std::thread m_receiver_thread;                     // Primary receiver (socket index 0)
+        std::vector<std::thread> m_extra_receiver_threads; // Extra receivers (socket indices 1..N-1)
         std::vector<std::thread> m_worker_threads;
 
         // Create and initialise workers (called from start())
@@ -165,6 +195,17 @@ namespace entanglement
 
         // Receiver thread loop (multi-threaded mode)
         void receiver_loop();
+
+#if defined(ENTANGLEMENT_PLATFORM_WINDOWS) || defined(ENTANGLEMENT_PLATFORM_LINUX)
+        // Platform-optimized async receiver loop (IOCP on Windows, epoll on Linux)
+        // receiver_id identifies which recv queue to push to in each worker.
+        void receiver_loop_async(int receiver_id = 0);
+
+#ifdef ENTANGLEMENT_PLATFORM_LINUX
+        // Async receiver loop for an extra SO_REUSEPORT socket.
+        void receiver_loop_async_extra(int extra_index, int receiver_id);
+#endif
+#endif
 
         // Worker thread loop (multi-threaded mode)
         void worker_loop(size_t worker_idx);

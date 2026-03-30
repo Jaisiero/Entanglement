@@ -9,7 +9,7 @@ namespace entanglement
     server_worker::server_worker() = default;
 
     void server_worker::init(size_t pool_capacity, udp_socket *socket, channel_manager *channels,
-                             const std::atomic<bool> *running_flag)
+                             const std::atomic<bool> *running_flag, int recv_queue_count)
     {
         m_socket = socket;
         m_channels = channels;
@@ -21,7 +21,14 @@ namespace entanglement
         m_free_top = -1;
         m_free_initialized = false;
 
-        m_recv_queue = std::make_unique<spsc_queue<queued_datagram, WORKER_RECV_QUEUE_SIZE>>();
+        // Create one SPSC recv queue per receiver thread
+        if (recv_queue_count < 1)
+            recv_queue_count = 1;
+        m_recv_queues.clear();
+        m_recv_queues.reserve(static_cast<size_t>(recv_queue_count));
+        for (int i = 0; i < recv_queue_count; ++i)
+            m_recv_queues.push_back(std::make_unique<spsc_queue<queued_datagram, WORKER_RECV_QUEUE_SIZE>>());
+
         m_send_queue = std::make_unique<spsc_queue<send_command, WORKER_SEND_QUEUE_SIZE>>();
     }
 
@@ -29,13 +36,13 @@ namespace entanglement
     // Queue interface
     // -----------------------------------------------------------------------
 
-    bool server_worker::enqueue(queued_datagram &&dgram)
+    bool server_worker::enqueue(queued_datagram &&dgram, int queue_id)
     {
-        return m_recv_queue->try_push(std::move(dgram));
+        return m_recv_queues[static_cast<size_t>(queue_id)]->try_push(std::move(dgram));
     }
-    bool server_worker::enqueue(const queued_datagram &dgram)
+    bool server_worker::enqueue(const queued_datagram &dgram, int queue_id)
     {
-        return m_recv_queue->try_push(dgram);
+        return m_recv_queues[static_cast<size_t>(queue_id)]->try_push(dgram);
     }
     bool server_worker::enqueue_send(send_command &&cmd)
     {
@@ -55,13 +62,37 @@ namespace entanglement
         // 1. Process cross-thread send commands first
         flush_send_queue();
 
-        // 2. Dequeue and process received datagrams
+        // 2. Dequeue and process received datagrams (drain all recv queues round-robin)
         int count = 0;
         queued_datagram dgram;
-        while (count < max_packets && m_recv_queue->try_pop(dgram))
+        if (m_recv_queues.size() == 1)
         {
-            process_datagram(dgram.header, dgram.payload, dgram.sender);
-            ++count;
+            // Fast path: single recv queue (common case)
+            while (count < max_packets && m_recv_queues[0]->try_pop(dgram))
+            {
+                process_datagram(dgram.header, dgram.payload, dgram.sender);
+                ++count;
+            }
+        }
+        else
+        {
+            // Multi-queue: drain all queues round-robin
+            bool any = true;
+            while (count < max_packets && any)
+            {
+                any = false;
+                for (auto &q : m_recv_queues)
+                {
+                    if (count >= max_packets)
+                        break;
+                    if (q->try_pop(dgram))
+                    {
+                        process_datagram(dgram.header, dgram.payload, dgram.sender);
+                        ++count;
+                        any = true;
+                    }
+                }
+            }
         }
         return count;
     }
@@ -81,7 +112,8 @@ namespace entanglement
         if (!conn || conn->state() != connection_state::CONNECTED)
             return;
 
-        bool is_new = conn->process_incoming(header);
+        conn->set_cached_now(m_cached_now);
+        bool is_new = conn->process_incoming(header, m_cached_now);
         if (!is_new)
             return;
 
@@ -139,6 +171,7 @@ namespace entanglement
         for (auto &[key, idx] : m_index)
         {
             auto &conn = m_pool[idx];
+            conn.set_cached_now(now);
 
             if (conn.has_timed_out(now))
             {
@@ -448,7 +481,7 @@ namespace entanglement
             {
                 if (conn)
                 {
-                    conn->process_incoming(header);
+                    conn->process_incoming(header, m_cached_now);
                     send_control_to(conn, CONTROL_CONNECTION_ACCEPTED, key);
                     return;
                 }
@@ -467,7 +500,8 @@ namespace entanglement
                 }
 
                 conn->set_state(connection_state::CONNECTED);
-                conn->process_incoming(header);
+                conn->set_cached_now(m_cached_now);
+                conn->process_incoming(header, m_cached_now);
                 send_control_to(conn, CONTROL_CONNECTION_ACCEPTED, key);
 
                 if (m_verbose || m_on_client_connected)
@@ -488,7 +522,7 @@ namespace entanglement
             {
                 if (conn)
                 {
-                    conn->process_incoming(header);
+                    conn->process_incoming(header, m_cached_now);
                     if (m_verbose || m_on_client_disconnected)
                     {
                         std::string address = endpoint_address_string(key);
@@ -505,7 +539,7 @@ namespace entanglement
             case CONTROL_HEARTBEAT:
             {
                 if (conn)
-                    conn->process_incoming(header);
+                    conn->process_incoming(header, m_cached_now);
                 break;
             }
 
@@ -513,7 +547,7 @@ namespace entanglement
             {
                 if (conn && payload_size >= 2)
                 {
-                    conn->process_incoming(header);
+                    conn->process_incoming(header, m_cached_now);
                     uint8_t available = payload[1];
                     conn->set_fragment_backpressured(available == 0);
                 }
@@ -525,7 +559,7 @@ namespace entanglement
                 if (!conn || conn->state() != connection_state::CONNECTED)
                     break;
 
-                conn->process_incoming(header);
+                conn->process_incoming(header, m_cached_now);
 
                 if (payload_size < 4)
                     break;

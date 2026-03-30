@@ -4,6 +4,7 @@
 #include "packet_header.h"
 #include "platform.h"
 #include <functional>
+#include <memory>
 #include <string>
 
 #ifdef ENTANGLEMENT_SIMULATE_LOSS
@@ -16,6 +17,34 @@ namespace entanglement
     constexpr size_t MAX_PAYLOAD_SIZE = MAX_PACKET_SIZE - sizeof(packet_header);
     static_assert(MAX_PAYLOAD_SIZE == MAX_PACKET_SIZE - PACKET_HEADER_SIZE,
                   "PACKET_HEADER_SIZE constant must match sizeof(packet_header)");
+
+    // --- Async batch-receive constants (shared across platforms) ---
+    constexpr int ASYNC_RECV_POOL_SIZE = 128; // Pre-allocated recv operations / recvmmsg slots
+    constexpr int ASYNC_MAX_COMPLETIONS = 64; // Max completions per batch dequeue
+
+    // Legacy aliases
+    constexpr int IOCP_RECV_POOL_SIZE = ASYNC_RECV_POOL_SIZE;
+    constexpr int IOCP_MAX_COMPLETIONS = ASYNC_MAX_COMPLETIONS;
+
+#ifdef ENTANGLEMENT_PLATFORM_WINDOWS
+    // --- IOCP receive operation (one per pre-posted WSARecvFrom) ---
+    struct iocp_recv_op
+    {
+        OVERLAPPED overlapped{}; // Must be first for CONTAINING_RECORD
+        WSABUF wsa_buf{};
+        uint8_t buffer[MAX_PACKET_SIZE]{};
+        sockaddr_in from_addr{};
+        INT from_len = sizeof(sockaddr_in);
+    };
+#endif
+
+    // --- Parsed packet from IOCP completion ---
+    struct recv_completion
+    {
+        packet_header header{};
+        uint8_t payload[MAX_PAYLOAD_SIZE]{};
+        endpoint_key sender{};
+    };
 
     class udp_socket
     {
@@ -32,7 +61,8 @@ namespace entanglement
         udp_socket &operator=(udp_socket &&other) noexcept;
 
         // Create and bind to a local port (0 = any available port)
-        error_code bind(uint16_t port, const std::string &address = "0.0.0.0");
+        // reuse_port: on Linux, set SO_REUSEPORT to allow multiple sockets on the same port.
+        error_code bind(uint16_t port, const std::string &address = "0.0.0.0", bool reuse_port = false);
 
         // Send raw data to a remote endpoint
         int send_to(const void *data, size_t size, const endpoint_key &dest);
@@ -64,6 +94,44 @@ namespace entanglement
         bool is_valid() const { return m_socket != INVALID_SOCK; }
         void close();
 
+#ifdef ENTANGLEMENT_PLATFORM_WINDOWS
+        // --- IOCP batch receive ---
+
+        // Initialise IOCP: create completion port, allocate recv pool, post initial recvs.
+        // Call AFTER bind() and BEFORE entering the receiver loop.
+        // The socket is automatically put into overlapped mode (non-blocking is not required).
+        error_code init_iocp(int pool_size = ASYNC_RECV_POOL_SIZE);
+
+        // Dequeue up to max_count completed recv operations.
+        // Returns number of completions (0 if none ready within timeout_ms).
+        // Each completion is parsed into header + payload + sender.
+        // Completed operations are automatically re-posted.
+        int recv_batch_iocp(recv_completion *out, int max_count, DWORD timeout_ms = 0);
+
+        // Shut down IOCP: cancel pending I/O, close completion port.
+        void shutdown_iocp();
+
+        bool iocp_enabled() const { return m_iocp_enabled; }
+#endif
+
+#ifdef ENTANGLEMENT_PLATFORM_LINUX
+        // --- epoll + recvmmsg batch receive ---
+
+        // Initialise epoll: create epoll fd, register socket, allocate recvmmsg pool.
+        // Call AFTER bind() and BEFORE entering the receiver loop.
+        error_code init_epoll(int pool_size = ASYNC_RECV_POOL_SIZE);
+
+        // Receive up to max_count datagrams using recvmmsg (batch kernel receive).
+        // Uses epoll_wait for efficient timeout, then drains all available data.
+        // Returns number of valid parsed completions (0 if none ready within timeout_ms).
+        int recv_batch_epoll(recv_completion *out, int max_count, int timeout_ms = 0);
+
+        // Shut down epoll: close epoll fd, free buffers.
+        void shutdown_epoll();
+
+        bool epoll_enabled() const { return m_epoll_enabled; }
+#endif
+
 #ifdef ENTANGLEMENT_SIMULATE_LOSS
         // Set the probability [0.0, 1.0] that an inbound packet is silently dropped.
         void set_drop_rate(double rate);
@@ -73,6 +141,36 @@ namespace entanglement
 
     private:
         socket_t m_socket = INVALID_SOCK;
+
+#ifdef ENTANGLEMENT_PLATFORM_WINDOWS
+        // IOCP state
+        HANDLE m_iocp = nullptr;
+        std::unique_ptr<iocp_recv_op[]> m_recv_pool;
+        int m_recv_pool_size = 0;
+        bool m_iocp_enabled = false;
+
+        // Post a single overlapped WSARecvFrom
+        bool post_recv(iocp_recv_op &op);
+#endif
+
+#ifdef ENTANGLEMENT_PLATFORM_LINUX
+        // epoll + recvmmsg state
+        int m_epoll_fd = -1;
+        int m_epoll_pool_size = 0;
+        bool m_epoll_enabled = false;
+
+        // Pre-allocated arrays for recvmmsg batch receive.
+        // m_recv_slots holds per-datagram buffers + sender addresses.
+        // m_mmsg_hdrs is the contiguous mmsghdr array passed to recvmmsg.
+        struct recvmmsg_slot
+        {
+            uint8_t buffer[MAX_PACKET_SIZE]{};
+            sockaddr_in from_addr{};
+            struct iovec iov{};
+        };
+        std::unique_ptr<recvmmsg_slot[]> m_recv_slots;
+        std::unique_ptr<struct mmsghdr[]> m_mmsg_hdrs;
+#endif
 
 #ifdef ENTANGLEMENT_SIMULATE_LOSS
         double m_drop_rate = 0.0;

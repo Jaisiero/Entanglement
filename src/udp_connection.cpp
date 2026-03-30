@@ -20,6 +20,7 @@ namespace entanglement
 
         // Reset timestamps
         auto now = std::chrono::steady_clock::now();
+        m_cached_now = now;
         m_last_recv_time = now;
         m_last_send_time = now;
 
@@ -123,7 +124,7 @@ namespace entanglement
 
     // --- Receiving side ---
 
-    bool udp_connection::process_incoming(const packet_header &header)
+    bool udp_connection::process_incoming(const packet_header &header, std::chrono::steady_clock::time_point recv_time)
     {
         // 1. Process piggybacked ACKs from the remote side
         //    The remote is telling us which of OUR packets it received
@@ -148,8 +149,9 @@ namespace entanglement
             }
         }
 
-        // Update receive timestamp
-        m_last_recv_time = std::chrono::steady_clock::now();
+        // Update receive timestamp — use cached time if available
+        m_last_recv_time =
+            (recv_time != std::chrono::steady_clock::time_point{}) ? recv_time : std::chrono::steady_clock::now();
 
         // 2. Track this incoming sequence for our outgoing ACKs
         uint64_t seq = header.sequence;
@@ -234,7 +236,8 @@ namespace entanglement
             // would poison the smoothed RTT estimator.
             if (take_rtt_sample)
             {
-                auto now = std::chrono::steady_clock::now();
+                auto now = (m_cached_now != std::chrono::steady_clock::time_point{}) ? m_cached_now
+                                                                                     : std::chrono::steady_clock::now();
                 auto sample = std::chrono::duration_cast<std::chrono::microseconds>(now - entry.send_time).count();
                 if (sample > 0)
                 {
@@ -309,6 +312,11 @@ namespace entanglement
                               ? (std::max)(m_oldest_unacked_seq, m_local_sequence - SEQUENCE_BUFFER_SIZE)
                               : m_oldest_unacked_seq;
 
+        // Track the new frontier: first sequence that is still active and un-acked.
+        // This prevents the scan range from growing when timed-out entries are
+        // deactivated but m_oldest_unacked_seq was never advanced past them.
+        uint64_t new_oldest = m_local_sequence;
+
         for (uint64_t seq = oldest; seq < m_local_sequence; ++seq)
         {
             size_t idx = seq % SEQUENCE_BUFFER_SIZE;
@@ -319,7 +327,12 @@ namespace entanglement
 
             auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - entry.send_time);
             if (elapsed.count() < m_rto)
+            {
+                // Still in flight — this is the earliest un-resolved entry
+                if (seq < new_oldest)
+                    new_oldest = seq;
                 continue;
+            }
 
             if (!entry.reliable)
             {
@@ -335,7 +348,12 @@ namespace entanglement
             // We keep scanning beyond max_count so unreliable expirations above
             // are still processed; reliable losses beyond the limit are deferred.
             if (count >= max_count)
+            {
+                // Can't report this loss yet — it stays active for next scan
+                if (seq < new_oldest)
+                    new_oldest = seq;
                 continue;
+            }
 
             // Report loss metadata to application
             out[count].sequence = seq;
@@ -374,6 +392,9 @@ namespace entanglement
             m_cc.on_packet_lost();
             m_cc.update_pacing(m_srtt);
         }
+
+        // Advance oldest-unacked past all entries resolved in this scan
+        m_oldest_unacked_seq = new_oldest;
 
         return count;
     }
