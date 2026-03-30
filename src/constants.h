@@ -14,10 +14,10 @@ namespace entanglement
     constexpr size_t MAX_PACKET_SIZE = 1200; // Safe MTU minus IP/UDP headers
     constexpr uint16_t DEFAULT_PORT = 9876;
     constexpr size_t MAX_CONNECTIONS = 1024;
-    constexpr int SOCKET_RECV_BUFFER_SIZE = 256 * 1024; // 256 KB SO_RCVBUF
+    constexpr int SOCKET_RECV_BUFFER_SIZE = 1024 * 1024; // 1 MB SO_RCVBUF
 
     // --- Poll defaults ---
-    constexpr int DEFAULT_MAX_POLL_PACKETS = 64;
+    constexpr int DEFAULT_MAX_POLL_PACKETS = 256;
 
     // --- Sequence / ACK tracking ---
     constexpr size_t SEQUENCE_BUFFER_SIZE = 1024; // Circular send buffer entries
@@ -37,10 +37,14 @@ namespace entanglement
     constexpr int64_t CLOCK_GRANULARITY_US = 1000;  // 1 ms minimum granularity (G)
 
     // --- Congestion control ---
-    constexpr uint32_t INITIAL_CWND = 4;      // conservative initial window (packets)
-    constexpr uint32_t MIN_CWND = 4;          // floor — never starve the connection
-    constexpr uint32_t INITIAL_SSTHRESH = 64; // switch slow-start → congestion avoidance
+    constexpr uint32_t INITIAL_CWND = 10;     // initial window (packets) — 10 per RFC 6928
+    constexpr uint32_t MIN_CWND = 8;          // floor — never starve the connection
+    constexpr uint32_t INITIAL_SSTHRESH = 32; // switch slow-start → congestion avoidance
     constexpr uint32_t MAX_CWND = 256;        // cap for gaming (low-latency priority)
+    constexpr double CC_BETA = 0.7;           // multiplicative decrease factor (CUBIC-style)
+
+    // --- ACK timing ---
+    constexpr int64_t ACK_FLUSH_INTERVAL_US = 5'000; // 5 ms — send ACK-only packet if pending
 
     // --- Connection management ---
     constexpr int64_t HEARTBEAT_INTERVAL_US = 1'000'000;  // 1 s — send keepalive if idle

@@ -56,8 +56,11 @@ namespace entanglement
 
         // --- Queries (read by application via client/connection) ---
 
-        // True when the window still has room for more packets
-        bool can_send() const { return m_in_flight < m_cwnd; }
+        // True when the window still has room for more packets.
+        // Also guard against overflowing the fixed-size send buffer:
+        // even if cwnd allows more, we cannot exceed SEQUENCE_BUFFER_SIZE
+        // in flight or the circular buffer will silently overwrite entries.
+        bool can_send() const { return m_in_flight < m_cwnd && m_in_flight < SEQUENCE_BUFFER_SIZE - 1; }
 
         // Full snapshot for the application
         congestion_info info() const;

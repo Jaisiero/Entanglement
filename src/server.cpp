@@ -147,7 +147,7 @@ namespace entanglement
             int result = m_socket.recv_packet(header, payload, MAX_PAYLOAD_SIZE, sender);
             if (result <= 0)
             {
-                std::this_thread::sleep_for(std::chrono::microseconds(50));
+                std::this_thread::yield();
                 continue;
             }
 
@@ -176,7 +176,7 @@ namespace entanglement
             worker.update();
 
             if (processed == 0)
-                std::this_thread::sleep_for(std::chrono::microseconds(100));
+                std::this_thread::yield();
         }
     }
 

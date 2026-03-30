@@ -212,6 +212,16 @@ namespace entanglement
         bool has_timed_out(std::chrono::steady_clock::time_point now) const;
         bool needs_heartbeat(std::chrono::steady_clock::time_point now) const;
 
+        // Returns true if we have received data but haven't sent any packet
+        // back within ACK_FLUSH_INTERVAL_US.  The caller should then call
+        // send_ack_flush() so the remote gets timely ACK feedback.
+        bool needs_ack_flush(std::chrono::steady_clock::time_point now) const;
+
+        // Send a minimal ACK-only packet (sequence = 0) to the remote.
+        // This piggybacks our latest ack + bitmap without allocating a sequence
+        // or affecting the congestion controller.
+        void send_ack_flush(udp_socket &socket, const endpoint_key &dest);
+
         // RTT queries (milliseconds)
         double srtt_ms() const { return m_srtt / 1000.0; }
         double rttvar_ms() const { return m_rttvar / 1000.0; }

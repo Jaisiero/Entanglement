@@ -391,6 +391,7 @@ int main(int argc, char *argv[])
     uint16_t port = DEFAULT_PORT;
     double drop_rate = 0.0;
     int worker_count = 0;
+    bool keep_alive = false; // -k: don't auto-stop when clients disconnect
 
     for (int i = 1; i < argc; ++i)
     {
@@ -412,23 +413,28 @@ int main(int argc, char *argv[])
             if (worker_count < 0)
                 worker_count = 0;
         }
+        else if (std::strcmp(argv[i], "-k") == 0 || std::strcmp(argv[i], "--keep-alive") == 0)
+        {
+            keep_alive = true;
+        }
         else if (std::strcmp(argv[i], "-v") == 0 || std::strcmp(argv[i], "--verbose") == 0)
         {
             g_verbose = true;
         }
         else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0)
         {
-            std::cout << "Usage: EntanglementServer [-p port] [-d drop%] [-w workers] [-v]" << std::endl;
-            std::cout << "  -p, --port     Listen port (default: " << DEFAULT_PORT << ")" << std::endl;
-            std::cout << "  -d, --drop     Simulated drop rate in percent (default: 0)" << std::endl;
-            std::cout << "  -w, --workers  Worker threads (0 = single-threaded, default: 0)" << std::endl;
-            std::cout << "  -v, --verbose  Print intermediate output during execution" << std::endl;
+            std::cout << "Usage: EntanglementServer [-p port] [-d drop%] [-w workers] [-k] [-v]" << std::endl;
+            std::cout << "  -p, --port       Listen port (default: " << DEFAULT_PORT << ")" << std::endl;
+            std::cout << "  -d, --drop       Simulated drop rate in percent (default: 0)" << std::endl;
+            std::cout << "  -w, --workers    Worker threads (0 = single-threaded, default: 0)" << std::endl;
+            std::cout << "  -k, --keep-alive Don't auto-stop when all clients disconnect" << std::endl;
+            std::cout << "  -v, --verbose    Print intermediate output during execution" << std::endl;
             return 0;
         }
         else
         {
             std::cerr << "Unknown argument: " << argv[i] << std::endl;
-            std::cerr << "Usage: EntanglementServer [-p port] [-d drop%] [-w workers] [-v]" << std::endl;
+            std::cerr << "Usage: EntanglementServer [-p port] [-d drop%] [-w workers] [-k] [-v]" << std::endl;
             return 1;
         }
     }
@@ -589,14 +595,15 @@ int main(int argc, char *argv[])
             // Retry if backpressured — the client's reassembler may be
             // temporarily full; a short sleep lets it drain.
             uint32_t echo_msg_id = 0;
-            for (int attempt = 0; attempt < 50; ++attempt)
+            // Try up to 3 times, no blocking sleep — keeping the main loop responsive
+            // is more important than guaranteed echo delivery (client drain handles retries).
+            for (int attempt = 0; attempt < 3; ++attempt)
             {
                 echo_msg_id = 0;
                 srv.send_to(data, total_size, ch_id, sender, 0, &echo_msg_id);
                 if (echo_msg_id != 0)
                     break;
                 ++g_frag_echo_bp_retries;
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
             if (echo_msg_id == 0)
                 ++g_frag_echo_send_failures;
@@ -774,7 +781,7 @@ int main(int argc, char *argv[])
 
     while (g_running.load())
     {
-        srv.poll();
+        int polled = srv.poll();
         srv.update();
 
         auto now = std::chrono::steady_clock::now();
@@ -782,7 +789,7 @@ int main(int argc, char *argv[])
         if (srv.connection_count() > 0)
             idle_start = now;
 
-        if (g_had_clients && srv.connection_count() == 0)
+        if (!keep_alive && g_had_clients && srv.connection_count() == 0)
         {
             if (now - idle_start > IDLE_TIMEOUT)
             {
@@ -794,7 +801,9 @@ int main(int argc, char *argv[])
             }
         }
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        // Yield when idle to save CPU; when busy, loop immediately for low latency.
+        if (polled == 0)
+            std::this_thread::yield();
     }
 
     srv.stop();

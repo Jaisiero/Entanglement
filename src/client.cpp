@@ -235,6 +235,12 @@ namespace entanglement
             send_control(CONTROL_HEARTBEAT);
         }
 
+        // Flush pending ACKs so the server's RTT isn't inflated
+        if (m_connection.needs_ack_flush(now))
+        {
+            m_connection.send_ack_flush(m_socket, m_server_endpoint);
+        }
+
         // Collect losses
         lost_packet_info lost[MAX_LOSSES_PER_UPDATE];
         int count = m_connection.collect_losses(now, lost, MAX_LOSSES_PER_UPDATE);

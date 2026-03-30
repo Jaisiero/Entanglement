@@ -139,6 +139,10 @@ namespace entanglement
             if (conn.needs_heartbeat(now))
                 send_control_to(&conn, CONTROL_HEARTBEAT, key);
 
+            // Flush pending ACKs promptly so the remote's RTT isn't inflated
+            if (conn.needs_ack_flush(now))
+                conn.send_ack_flush(*m_socket, key);
+
             // Loss detection
             if (loss_callback || m_on_packet_lost)
             {

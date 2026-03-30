@@ -390,6 +390,34 @@ namespace entanglement
         return elapsed > HEARTBEAT_INTERVAL_US;
     }
 
+    bool udp_connection::needs_ack_flush(std::chrono::steady_clock::time_point now) const
+    {
+        if (m_state != connection_state::CONNECTED)
+            return false;
+        // Only flush if we received data AFTER our last send (pending acks)
+        if (m_last_recv_time <= m_last_send_time)
+            return false;
+        auto since_send = std::chrono::duration_cast<std::chrono::microseconds>(now - m_last_send_time).count();
+        return since_send > ACK_FLUSH_INTERVAL_US;
+    }
+
+    void udp_connection::send_ack_flush(udp_socket &socket, const endpoint_key &dest)
+    {
+        packet_header header{};
+        header.magic = PROTOCOL_MAGIC;
+        header.version = PROTOCOL_VERSION;
+        header.sequence = 0; // ack-only — no congestion tracking
+        header.ack = m_remote_sequence;
+        header.ack_bitmap = static_cast<uint32_t>(m_recv_bitmap);
+        header.flags = 0;
+        header.payload_size = 0;
+        header.channel_id = 0;
+        header.shard_id = 0;
+        header.channel_sequence = 0;
+        socket.send_packet(header, nullptr, dest);
+        m_last_send_time = std::chrono::steady_clock::now();
+    }
+
     // --- Fragmentation (sender side) ---
 
     error_code udp_connection::register_pending_message(uint32_t message_id, uint8_t fragment_count)

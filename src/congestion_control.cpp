@@ -69,9 +69,9 @@ namespace entanglement
         if (since_last < guard)
             return; // Already reduced cwnd for this loss event
 
-        // Multiplicative decrease
+        // Multiplicative decrease (beta = 0.7, CUBIC-style — gentler than classic 0.5)
         m_last_cwnd_reduction = now;
-        m_ssthresh = std::max(m_cwnd / 2, MIN_CWND);
+        m_ssthresh = std::max(static_cast<uint32_t>(m_cwnd * CC_BETA), MIN_CWND);
         m_cwnd = m_ssthresh;
         m_cwnd_accumulator = 0.0;
     }
