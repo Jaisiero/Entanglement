@@ -281,12 +281,7 @@ namespace entanglement
                     break;
 
                 size_t w = worker_index(sender);
-                queued_datagram dgram;
-                dgram.header = header;
-                dgram.sender = sender;
-                std::memcpy(dgram.payload, payload, header.payload_size);
-
-                if (!m_workers[w]->enqueue(std::move(dgram)))
+                if (!m_workers[w]->enqueue_packet(header, payload, header.payload_size, sender))
                 {
                     m_recv_queue_drops.fetch_add(1, std::memory_order_relaxed);
                 }
@@ -315,18 +310,18 @@ namespace entanglement
             for (int i = 0; i < count; ++i)
             {
                 auto &c = completions[i];
-
                 size_t w = worker_index(c.sender);
-                queued_datagram dgram;
-                dgram.header = c.header;
-                dgram.sender = c.sender;
-                std::memcpy(dgram.payload, c.payload, c.header.payload_size);
-
-                if (!m_workers[w]->enqueue(std::move(dgram), receiver_id))
+                if (!m_workers[w]->enqueue_packet(c.header, c.payload_ptr, c.payload_size, c.sender, receiver_id))
                 {
                     m_recv_queue_drops.fetch_add(1, std::memory_order_relaxed);
                 }
             }
+
+#ifdef ENTANGLEMENT_PLATFORM_WINDOWS
+            // Re-post IOCP buffers after all payloads have been copied to pool slots
+            if (count > 0)
+                m_socket.repost_iocp_batch();
+#endif
 
             if (count == 0)
                 std::this_thread::yield();
@@ -347,14 +342,8 @@ namespace entanglement
             for (int i = 0; i < count; ++i)
             {
                 auto &c = completions[i];
-
                 size_t w = worker_index(c.sender);
-                queued_datagram dgram;
-                dgram.header = c.header;
-                dgram.sender = c.sender;
-                std::memcpy(dgram.payload, c.payload, c.header.payload_size);
-
-                if (!m_workers[w]->enqueue(std::move(dgram), receiver_id))
+                if (!m_workers[w]->enqueue_packet(c.header, c.payload_ptr, c.payload_size, c.sender, receiver_id))
                 {
                     m_recv_queue_drops.fetch_add(1, std::memory_order_relaxed);
                 }

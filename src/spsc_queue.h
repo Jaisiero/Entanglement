@@ -76,6 +76,48 @@ namespace entanglement
 
         bool empty() const { return m_read.load(std::memory_order_acquire) == m_write.load(std::memory_order_acquire); }
 
+        // --- Zero-copy direct-access API ---
+        // Allows the producer to write directly into the ring buffer slot
+        // and the consumer to read in-place, avoiding any copy of T.
+        // Usage:
+        //   Producer: T* slot = write_slot(); if (slot) { fill *slot; commit_write(); }
+        //   Consumer: T* slot = read_slot();  if (slot) { use *slot;  commit_read();  }
+
+        // Producer: get pointer to the next writable slot. Returns nullptr if full.
+        T *write_slot()
+        {
+            const size_t w = m_write.load(std::memory_order_relaxed);
+            const size_t next = (w + 1) & (Capacity - 1);
+            if (next == m_read.load(std::memory_order_acquire))
+                return nullptr; // full
+            return &m_buffer[w];
+        }
+
+        // Producer: publish the slot filled by write_slot(). Must be called exactly once
+        // after each successful write_slot() call.
+        void commit_write()
+        {
+            const size_t w = m_write.load(std::memory_order_relaxed);
+            m_write.store((w + 1) & (Capacity - 1), std::memory_order_release);
+        }
+
+        // Consumer: get pointer to the next readable slot. Returns nullptr if empty.
+        T *read_slot()
+        {
+            const size_t r = m_read.load(std::memory_order_relaxed);
+            if (r == m_write.load(std::memory_order_acquire))
+                return nullptr; // empty
+            return &m_buffer[r];
+        }
+
+        // Consumer: release the slot returned by read_slot(). Must be called exactly once
+        // after each successful read_slot() call.
+        void commit_read()
+        {
+            const size_t r = m_read.load(std::memory_order_relaxed);
+            m_read.store((r + 1) & (Capacity - 1), std::memory_order_release);
+        }
+
     private:
         // Cache-line padding to prevent false sharing between producer and consumer.
         alignas(64) std::atomic<size_t> m_write{0};

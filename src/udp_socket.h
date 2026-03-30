@@ -38,11 +38,14 @@ namespace entanglement
     };
 #endif
 
-    // --- Parsed packet from IOCP completion ---
+    // --- Zero-copy parsed packet from async batch receive ---
+    // payload_ptr points into internal receive buffer and is valid until
+    // the next recv_batch call (epoll) or until repost_iocp_batch (IOCP).
     struct recv_completion
     {
         packet_header header{};
-        uint8_t payload[MAX_PAYLOAD_SIZE]{};
+        const uint8_t *payload_ptr = nullptr;
+        uint16_t payload_size = 0;
         endpoint_key sender{};
     };
 
@@ -102,11 +105,15 @@ namespace entanglement
         // The socket is automatically put into overlapped mode (non-blocking is not required).
         error_code init_iocp(int pool_size = ASYNC_RECV_POOL_SIZE);
 
-        // Dequeue up to max_count completed recv operations.
+        // Dequeue up to max_count completed recv operations (zero-copy).
         // Returns number of completions (0 if none ready within timeout_ms).
-        // Each completion is parsed into header + payload + sender.
-        // Completed operations are automatically re-posted.
+        // payload_ptr in each completion points into the IOCP buffer pool.
+        // Caller MUST call repost_iocp_batch() after processing all payloads.
         int recv_batch_iocp(recv_completion *out, int max_count, DWORD timeout_ms = 0);
+
+        // Re-post all IOCP receive operations from the last recv_batch_iocp call.
+        // Must be called after the caller has finished reading payload_ptr data.
+        void repost_iocp_batch();
 
         // Shut down IOCP: cancel pending I/O, close completion port.
         void shutdown_iocp();
@@ -151,6 +158,10 @@ namespace entanglement
 
         // Post a single overlapped WSARecvFrom
         bool post_recv(iocp_recv_op &op);
+
+        // Deferred re-post tracking for zero-copy batch receive
+        iocp_recv_op *m_pending_repost[IOCP_MAX_COMPLETIONS]{};
+        int m_pending_repost_count = 0;
 #endif
 
 #ifdef ENTANGLEMENT_PLATFORM_LINUX

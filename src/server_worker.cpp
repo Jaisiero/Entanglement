@@ -21,13 +21,13 @@ namespace entanglement
         m_free_top = -1;
         m_free_initialized = false;
 
-        // Create one SPSC recv queue per receiver thread
+        // Create one SPSC recv queue per receiver thread (zero-copy via write_slot/read_slot)
         if (recv_queue_count < 1)
             recv_queue_count = 1;
         m_recv_queues.clear();
         m_recv_queues.reserve(static_cast<size_t>(recv_queue_count));
         for (int i = 0; i < recv_queue_count; ++i)
-            m_recv_queues.push_back(std::make_unique<spsc_queue<queued_datagram, WORKER_RECV_QUEUE_SIZE>>());
+            m_recv_queues.push_back(std::make_unique<recv_queue_t>());
 
         m_send_queue = std::make_unique<spsc_queue<send_command, WORKER_SEND_QUEUE_SIZE>>();
     }
@@ -36,13 +36,18 @@ namespace entanglement
     // Queue interface
     // -----------------------------------------------------------------------
 
-    bool server_worker::enqueue(queued_datagram &&dgram, int queue_id)
+    bool server_worker::enqueue_packet(const packet_header &hdr, const uint8_t *payload, uint16_t payload_size,
+                                       const endpoint_key &sender, int queue_id)
     {
-        return m_recv_queues[static_cast<size_t>(queue_id)]->try_push(std::move(dgram));
-    }
-    bool server_worker::enqueue(const queued_datagram &dgram, int queue_id)
-    {
-        return m_recv_queues[static_cast<size_t>(queue_id)]->try_push(dgram);
+        auto *slot = m_recv_queues[static_cast<size_t>(queue_id)]->write_slot();
+        if (!slot)
+            return false; // Queue full
+        slot->header = hdr;
+        slot->sender = sender;
+        if (payload_size > 0)
+            std::memcpy(slot->payload, payload, payload_size);
+        m_recv_queues[static_cast<size_t>(queue_id)]->commit_write();
+        return true;
     }
     bool server_worker::enqueue_send(send_command &&cmd)
     {
@@ -64,13 +69,17 @@ namespace entanglement
 
         // 2. Dequeue and process received datagrams (drain all recv queues round-robin)
         int count = 0;
-        queued_datagram dgram;
         if (m_recv_queues.size() == 1)
         {
-            // Fast path: single recv queue (common case)
-            while (count < max_packets && m_recv_queues[0]->try_pop(dgram))
+            // Fast path: single recv queue (common case) — zero-copy read
+            auto &q = *m_recv_queues[0];
+            while (count < max_packets)
             {
-                process_datagram(dgram.header, dgram.payload, dgram.sender);
+                auto *slot = q.read_slot();
+                if (!slot)
+                    break;
+                process_datagram(slot->header, slot->payload, slot->sender);
+                q.commit_read();
                 ++count;
             }
         }
@@ -81,13 +90,15 @@ namespace entanglement
             while (count < max_packets && any)
             {
                 any = false;
-                for (auto &q : m_recv_queues)
+                for (auto &qp : m_recv_queues)
                 {
                     if (count >= max_packets)
                         break;
-                    if (q->try_pop(dgram))
+                    auto *slot = qp->read_slot();
+                    if (slot)
                     {
-                        process_datagram(dgram.header, dgram.payload, dgram.sender);
+                        process_datagram(slot->header, slot->payload, slot->sender);
+                        qp->commit_read();
                         ++count;
                         any = true;
                     }
@@ -257,8 +268,12 @@ namespace entanglement
         udp_connection *conn = find(dest);
         if (conn && conn->state() == connection_state::CONNECTED)
         {
-            bool reliable = m_channels->is_reliable(header.channel_id);
-            conn->prepare_header(header, reliable, m_cached_now);
+            // Raw sends (server echoes) are always transport-unreliable:
+            // if the echo is lost, the client retransmits the original message
+            // and the server generates a fresh echo.  Marking them reliable
+            // would cause the server's CC to fire on_packet_lost for every
+            // dropped ACK, collapsing the congestion window under loss.
+            conn->prepare_header(header, /*reliable=*/false, m_cached_now);
         }
         return m_socket->send_packet(header, payload, dest);
     }

@@ -784,10 +784,13 @@ int main(int argc, char *argv[])
 
     // =========================================================================
 
-    // Register the loss callback for both single-threaded and multi-threaded mode.
-    // In MT mode, srv.update() is a no-op so set_on_packet_lost ensures the callback
-    // is propagated to each worker thread.
-    srv.set_on_packet_lost(on_echo_loss);
+    // Echo retransmission is intentionally disabled.  The client already
+    // handles reliability end-to-end: if an echo is lost, the client
+    // retransmits the original message and the server generates a fresh
+    // echo.  Server-side echo retransmission created a positive-feedback
+    // cascade under simulated packet loss, collapsing the server's
+    // congestion window and amplifying traffic ~35×.
+    // srv.set_on_packet_lost(on_echo_loss);
 
     if (failed(srv.start()))
     {

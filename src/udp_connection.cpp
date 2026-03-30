@@ -886,6 +886,11 @@ namespace entanglement
         if (!m_retransmit)
             return false;
 
+        // Respect congestion window: don't pile up retransmissions beyond cwnd.
+        // The loss already decremented in_flight; this retransmit would re-increment it.
+        if (!m_cc.can_send())
+            return false;
+
         auto *entry = m_retransmit->find(loss.sequence);
         if (!entry || entry->attempts >= MAX_RETRANSMIT_ATTEMPTS)
             return false;
@@ -896,14 +901,24 @@ namespace entanglement
         {
             // Fragment retransmit: resend via send_fragment (gets new sequence, preserves message_id)
             uint8_t base_flags = entry->flags & ~FLAG_FRAGMENT; // send_fragment adds FLAG_FRAGMENT
+            int saved_attempts = entry->attempts;
             int result =
                 send_fragment(socket, channels, loss.message_id, loss.fragment_index, loss.fragment_count, entry->data,
                               entry->data_size, base_flags, entry->channel_id, dest, entry->channel_sequence);
             if (result > 0)
             {
-                // send_fragment already stored a new retransmit entry (via prepare_header path).
-                // Deactivate the old entry (keyed by old sequence).
+                // send_fragment stored a new retransmit entry with attempts=0.
+                // Propagate the real attempt count to prevent infinite retransmissions.
                 entry->active = false;
+                for (auto &e : m_retransmit->entries)
+                {
+                    if (e.active && e.message_id == loss.message_id && e.fragment_index == loss.fragment_index &&
+                        e.sequence != loss.sequence)
+                    {
+                        e.attempts = saved_attempts;
+                        break;
+                    }
+                }
                 return true;
             }
         }

@@ -14,6 +14,7 @@ namespace entanglement
         m_cwnd_accumulator = 0.0;
         m_srtt_us = 0.0;
         m_last_cwnd_reduction = {};
+        m_loss_rate = 0.0; // Optimistic start — loss tolerance active immediately
     }
 
     // --- Events ---
@@ -29,6 +30,9 @@ namespace entanglement
         {
             --m_in_flight;
         }
+
+        // Update EWMA loss rate: ACK = no loss event (0)
+        m_loss_rate *= (1.0 - CC_LOSS_ALPHA);
 
         if (in_slow_start())
         {
@@ -59,6 +63,15 @@ namespace entanglement
         {
             --m_in_flight;
         }
+
+        // Update EWMA loss rate: loss event (1)
+        m_loss_rate = m_loss_rate * (1.0 - CC_LOSS_ALPHA) + CC_LOSS_ALPHA;
+
+        // Loss tolerance: if the smoothed loss rate is below the threshold,
+        // this is likely random/wireless loss — don't apply multiplicative decrease.
+        // The connection keeps its throughput and relies on retransmissions instead.
+        if (m_loss_rate < CC_LOSS_TOLERANCE)
+            return;
 
         // Loss-event coalescing: only reduce cwnd once per RTT.
         // Multiple losses within the same congestion window are a single event.

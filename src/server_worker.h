@@ -27,6 +27,9 @@ namespace entanglement
         uint8_t payload[MAX_PAYLOAD_SIZE]{};
     };
 
+    // Per-receiver SPSC queue type (zero-copy via write_slot/read_slot)
+    using recv_queue_t = spsc_queue<queued_datagram, WORKER_RECV_QUEUE_SIZE>;
+
     // --- Send command (game thread → worker via queue) ---
     struct send_command
     {
@@ -89,10 +92,10 @@ namespace entanglement
         void init(size_t pool_capacity, udp_socket *socket, channel_manager *channels,
                   const std::atomic<bool> *running_flag, int recv_queue_count = 1);
 
-        // --- Receive queue (receiver thread → this worker) ---
-        // queue_id selects which SPSC queue to push to (one per receiver thread).
-        bool enqueue(queued_datagram &&dgram, int queue_id = 0);
-        bool enqueue(const queued_datagram &dgram, int queue_id = 0);
+        // --- Receive queue (receiver thread → this worker, zero-copy) ---
+        // Acquires a pool slot, copies payload once from source, pushes slot index.
+        bool enqueue_packet(const packet_header &hdr, const uint8_t *payload, uint16_t payload_size,
+                            const endpoint_key &sender, int queue_id = 0);
 
         // --- Send command queue (any thread → this worker) ---
         bool enqueue_send(send_command &&cmd);
@@ -174,7 +177,8 @@ namespace entanglement
 
         // SPSC queues (heap-allocated to keep worker movable-by-pointer)
         // One recv queue per receiver thread (size 1 in single-socket mode).
-        std::vector<std::unique_ptr<spsc_queue<queued_datagram, WORKER_RECV_QUEUE_SIZE>>> m_recv_queues;
+        // Uses write_slot/read_slot zero-copy API (no full-struct copies).
+        std::vector<std::unique_ptr<recv_queue_t>> m_recv_queues;
         std::unique_ptr<spsc_queue<send_command, WORKER_SEND_QUEUE_SIZE>> m_send_queue;
 
         // Flush pending send commands from the cross-thread queue

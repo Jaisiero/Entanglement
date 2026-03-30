@@ -585,6 +585,9 @@ static bool test_rtt_convergence()
     // Simulate ACKs coming back with a small delay
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
 
+    // Update cached timestamp so RTT sample = now - send_time > 0
+    sender.set_cached_now(std::chrono::steady_clock::now());
+
     // Build incoming header that ACKs up to seq 20
     packet_header ack_hdr{};
     ack_hdr.magic = PROTOCOL_MAGIC;
@@ -1108,7 +1111,11 @@ static bool test_cc_loss_decrease()
     congestion_control cc;
     cc.reset();
 
-    // Grow cwnd to 16 via slow start
+    // Grow cwnd via slow start: INITIAL_CWND=10, INITIAL_SSTHRESH=32
+    // Round 0: send 10, ack 10 → cwnd=20 (slow start, +1 per ACK)
+    // Round 1: send 20, ack 20 → first 12 ACKs grow cwnd to 32 (=ssthresh),
+    //          remaining 8 ACKs are congestion avoidance (+1/cwnd each, <1 total)
+    //          → cwnd=32 after round 1
     for (int round = 0; round < 2; ++round)
     {
         uint32_t w = cc.cwnd();
@@ -1117,16 +1124,39 @@ static bool test_cc_loss_decrease()
         for (uint32_t i = 0; i < w; ++i)
             cc.on_packet_acked();
     }
-    // initial=4 → 8 → 16
-    TEST_ASSERT(cc.cwnd() == 16, "cwnd should be 16 after two slow-start rounds");
+    uint32_t cwnd_before = cc.cwnd();
+    TEST_ASSERT(cwnd_before == INITIAL_SSTHRESH, "cwnd should hit ssthresh after two slow-start rounds");
 
-    // Simulate a packet in flight then lost
+    // Loss tolerance: loss_rate starts at 0.0 (optimistic). A single loss won't
+    // trigger MD because loss_rate stays below CC_LOSS_TOLERANCE (0.15).
+    // Push loss_rate above threshold with a burst of losses first.
+    // After 11 consecutive losses from 0: loss_rate ≈ 1 - (1-α)^11 ≈ 0.157 > 0.15
+    for (int i = 0; i < 11; ++i)
+    {
+        cc.on_packet_sent();
+        cc.on_packet_lost();
+    }
+    TEST_ASSERT(cc.loss_rate() > CC_LOSS_TOLERANCE, "loss rate should exceed tolerance after burst");
+    // cwnd hasn't changed yet (first 10 losses below threshold, 11th triggers MD)
+    // 11th loss: cwnd = max(32*0.7, MIN_CWND) = 22
+    uint32_t reduced = static_cast<uint32_t>(cwnd_before * CC_BETA);
+    uint32_t expected_ss = (reduced > MIN_CWND) ? reduced : MIN_CWND;
+    TEST_ASSERT(cc.ssthresh() == expected_ss, "ssthresh should be cwnd * CC_BETA");
+    TEST_ASSERT(cc.cwnd() == expected_ss, "cwnd should drop to ssthresh after burst loss");
+    TEST_ASSERT(!cc.in_slow_start(), "should NOT be in slow start (cwnd >= ssthresh)");
+
+    // Verify that below-threshold loss does NOT trigger further MD
+    // Feed enough ACKs to bring loss_rate well below threshold
+    for (int i = 0; i < 200; ++i)
+    {
+        cc.on_packet_sent();
+        cc.on_packet_acked();
+    }
+    TEST_ASSERT(cc.loss_rate() < CC_LOSS_TOLERANCE, "loss rate should be below tolerance after many ACKs");
+    uint32_t cwnd_now = cc.cwnd();
     cc.on_packet_sent();
     cc.on_packet_lost();
-
-    TEST_ASSERT(cc.ssthresh() == 8, "ssthresh should be cwnd/2 = 8");
-    TEST_ASSERT(cc.cwnd() == 8, "cwnd should drop to ssthresh");
-    TEST_ASSERT(!cc.in_slow_start(), "should NOT be in slow start (cwnd == ssthresh)");
+    TEST_ASSERT(cc.cwnd() == cwnd_now, "cwnd should NOT decrease when loss rate is below tolerance");
 
     return true;
 }
@@ -1142,22 +1172,25 @@ static bool test_cc_pacing_interval()
     congestion_control cc;
     cc.reset();
 
-    // Simulate srtt = 100ms = 100000 us, cwnd = 4
+    // Simulate srtt = 100ms = 100000 us, INITIAL_CWND = 10
     cc.update_pacing(100'000.0);
 
-    // Expected interval: 100000 / 4 = 25000 us
-    TEST_ASSERT(cc.pacing_interval_us() == 25'000, "pacing should be srtt/cwnd");
+    // Expected interval: 100000 / 10 = 10000 us
+    int64_t expected = 100'000 / static_cast<int64_t>(INITIAL_CWND);
+    TEST_ASSERT(cc.pacing_interval_us() == expected, "pacing should be srtt/cwnd");
 
-    // Grow cwnd and recalculate
-    for (uint32_t i = 0; i < 4; ++i)
+    // Grow cwnd via slow-start and recalculate
+    uint32_t w = cc.cwnd();
+    for (uint32_t i = 0; i < w; ++i)
         cc.on_packet_sent();
-    for (uint32_t i = 0; i < 4; ++i)
+    for (uint32_t i = 0; i < w; ++i)
         cc.on_packet_acked();
-    // cwnd is now 8 (slow start)
+    // cwnd is now 2 * INITIAL_CWND = 20 (slow start)
     cc.update_pacing(100'000.0);
 
-    // Expected: 100000 / 8 = 12500 us
-    TEST_ASSERT(cc.pacing_interval_us() == 12'500, "pacing should decrease as cwnd grows");
+    // Expected: 100000 / 20 = 5000 us
+    int64_t expected2 = 100'000 / static_cast<int64_t>(cc.cwnd());
+    TEST_ASSERT(cc.pacing_interval_us() == expected2, "pacing should decrease as cwnd grows");
 
     return true;
 }

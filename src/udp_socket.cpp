@@ -363,6 +363,7 @@ namespace entanglement
     {
         OVERLAPPED_ENTRY entries[IOCP_MAX_COMPLETIONS];
         ULONG dequeued = 0;
+        m_pending_repost_count = 0;
 
         int to_dequeue = (max_count < IOCP_MAX_COMPLETIONS) ? max_count : IOCP_MAX_COMPLETIONS;
 
@@ -381,6 +382,9 @@ namespace entanglement
             // Recover the iocp_recv_op from the OVERLAPPED pointer
             auto *op = reinterpret_cast<iocp_recv_op *>(overlap);
 
+            // Defer re-posting until caller has finished reading payload data
+            m_pending_repost[m_pending_repost_count++] = op;
+
             // Validate
             if (bytes >= sizeof(packet_header))
             {
@@ -398,20 +402,24 @@ namespace entanglement
                         c.sender.address = op->from_addr.sin_addr.s_addr;
                         c.sender.port = ntohs(op->from_addr.sin_port);
 
-                        size_t payload_bytes = bytes - sizeof(packet_header);
-                        if (payload_bytes > 0)
-                            std::memcpy(c.payload, op->buffer + sizeof(packet_header), payload_bytes);
+                        // Zero-copy: point directly into the IOCP buffer (valid until repost)
+                        c.payload_size = static_cast<uint16_t>(bytes - sizeof(packet_header));
+                        c.payload_ptr = op->buffer + sizeof(packet_header);
 
                         ++count;
                     }
                 }
             }
-
-            // Re-post this operation for the next recv
-            post_recv(*op);
         }
 
         return count;
+    }
+
+    void udp_socket::repost_iocp_batch()
+    {
+        for (int i = 0; i < m_pending_repost_count; ++i)
+            post_recv(*m_pending_repost[i]);
+        m_pending_repost_count = 0;
     }
 
     void udp_socket::shutdown_iocp()
@@ -542,9 +550,9 @@ namespace entanglement
             c.sender.address = slot.from_addr.sin_addr.s_addr;
             c.sender.port = ntohs(slot.from_addr.sin_port);
 
-            size_t payload_bytes = bytes - sizeof(packet_header);
-            if (payload_bytes > 0)
-                std::memcpy(c.payload, slot.buffer + sizeof(packet_header), payload_bytes);
+            // Zero-copy: point directly into the recvmmsg buffer (valid until next batch call)
+            c.payload_size = static_cast<uint16_t>(bytes - sizeof(packet_header));
+            c.payload_ptr = slot.buffer + sizeof(packet_header);
 
             ++count;
         }
