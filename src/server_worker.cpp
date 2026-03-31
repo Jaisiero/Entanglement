@@ -9,7 +9,7 @@ namespace entanglement
     server_worker::server_worker() = default;
 
     void server_worker::init(size_t pool_capacity, udp_socket *socket, channel_manager *channels,
-                             const std::atomic<bool> *running_flag)
+                             const std::atomic<bool> *running_flag, int recv_queue_count)
     {
         m_socket = socket;
         m_channels = channels;
@@ -21,7 +21,14 @@ namespace entanglement
         m_free_top = -1;
         m_free_initialized = false;
 
-        m_recv_queue = std::make_unique<spsc_queue<queued_datagram, WORKER_RECV_QUEUE_SIZE>>();
+        // Create one SPSC recv queue per receiver thread (zero-copy via write_slot/read_slot)
+        if (recv_queue_count < 1)
+            recv_queue_count = 1;
+        m_recv_queues.clear();
+        m_recv_queues.reserve(static_cast<size_t>(recv_queue_count));
+        for (int i = 0; i < recv_queue_count; ++i)
+            m_recv_queues.push_back(std::make_unique<recv_queue_t>());
+
         m_send_queue = std::make_unique<spsc_queue<send_command, WORKER_SEND_QUEUE_SIZE>>();
     }
 
@@ -29,13 +36,18 @@ namespace entanglement
     // Queue interface
     // -----------------------------------------------------------------------
 
-    bool server_worker::enqueue(queued_datagram &&dgram)
+    bool server_worker::enqueue_packet(const packet_header &hdr, const uint8_t *payload, uint16_t payload_size,
+                                       const endpoint_key &sender, int queue_id)
     {
-        return m_recv_queue->try_push(std::move(dgram));
-    }
-    bool server_worker::enqueue(const queued_datagram &dgram)
-    {
-        return m_recv_queue->try_push(dgram);
+        auto *slot = m_recv_queues[static_cast<size_t>(queue_id)]->write_slot();
+        if (!slot)
+            return false; // Queue full
+        slot->header = hdr;
+        slot->sender = sender;
+        if (payload_size > 0)
+            std::memcpy(slot->payload, payload, payload_size);
+        m_recv_queues[static_cast<size_t>(queue_id)]->commit_write();
+        return true;
     }
     bool server_worker::enqueue_send(send_command &&cmd)
     {
@@ -48,16 +60,50 @@ namespace entanglement
 
     int server_worker::poll_local(int max_packets)
     {
+        // Cache timestamp for this batch — used by send paths to avoid
+        // per-packet steady_clock::now() calls.
+        m_cached_now = std::chrono::steady_clock::now();
+
         // 1. Process cross-thread send commands first
         flush_send_queue();
 
-        // 2. Dequeue and process received datagrams
+        // 2. Dequeue and process received datagrams (drain all recv queues round-robin)
         int count = 0;
-        queued_datagram dgram;
-        while (count < max_packets && m_recv_queue->try_pop(dgram))
+        if (m_recv_queues.size() == 1)
         {
-            process_datagram(dgram.header, dgram.payload, dgram.sender);
-            ++count;
+            // Fast path: single recv queue (common case) — zero-copy read
+            auto &q = *m_recv_queues[0];
+            while (count < max_packets)
+            {
+                auto *slot = q.read_slot();
+                if (!slot)
+                    break;
+                process_datagram(slot->header, slot->payload, slot->sender);
+                q.commit_read();
+                ++count;
+            }
+        }
+        else
+        {
+            // Multi-queue: drain all queues round-robin
+            bool any = true;
+            while (count < max_packets && any)
+            {
+                any = false;
+                for (auto &qp : m_recv_queues)
+                {
+                    if (count >= max_packets)
+                        break;
+                    auto *slot = qp->read_slot();
+                    if (slot)
+                    {
+                        process_datagram(slot->header, slot->payload, slot->sender);
+                        qp->commit_read();
+                        ++count;
+                        any = true;
+                    }
+                }
+            }
         }
         return count;
     }
@@ -77,7 +123,8 @@ namespace entanglement
         if (!conn || conn->state() != connection_state::CONNECTED)
             return;
 
-        bool is_new = conn->process_incoming(header);
+        conn->set_cached_now(m_cached_now);
+        bool is_new = conn->process_incoming(header, m_cached_now);
         if (!is_new)
             return;
 
@@ -121,6 +168,13 @@ namespace entanglement
     int server_worker::update(on_server_packet_lost loss_callback)
     {
         auto now = std::chrono::steady_clock::now();
+        m_cached_now = now;
+        uint32_t tick = m_tick_counter++;
+
+        // Stagger period for expensive per-connection operations.
+        // At 120 Hz server tick rate, period=4 means each connection runs
+        // cleanup/stall/backpressure every ~33 ms — well within timeout margins.
+        constexpr uint32_t STAGGER_PERIOD = 4;
 
         endpoint_key timed_out[MAX_TIMEOUTS_PER_UPDATE];
         int timeout_count = 0;
@@ -128,6 +182,7 @@ namespace entanglement
         for (auto &[key, idx] : m_index)
         {
             auto &conn = m_pool[idx];
+            conn.set_cached_now(now);
 
             if (conn.has_timed_out(now))
             {
@@ -168,12 +223,16 @@ namespace entanglement
                 }
             }
 
+            // --- Staggered expensive operations (run every STAGGER_PERIOD ticks) ---
+            if ((idx % STAGGER_PERIOD) != (tick % STAGGER_PERIOD))
+                continue;
+
             // Reassembly cleanup
             auto &ra = conn.reassembler();
             ra.cleanup_stale(now, ra.reassembly_timeout());
 
             // Ordered-delivery stall check
-            conn.check_ordered_stalls(*m_channels);
+            conn.check_ordered_stalls(*m_channels, now);
 
             // Back-pressure relief
             if (conn.backpressure_sent() && ra.usage_percent() < BACKPRESSURE_LOW_WATERMARK)
@@ -209,8 +268,12 @@ namespace entanglement
         udp_connection *conn = find(dest);
         if (conn && conn->state() == connection_state::CONNECTED)
         {
-            bool reliable = m_channels->is_reliable(header.channel_id);
-            conn->prepare_header(header, reliable);
+            // Raw sends (server echoes) are always transport-unreliable:
+            // if the echo is lost, the client retransmits the original message
+            // and the server generates a fresh echo.  Marking them reliable
+            // would cause the server's CC to fire on_packet_lost for every
+            // dropped ACK, collapsing the congestion window under loss.
+            conn->prepare_header(header, /*reliable=*/false, m_cached_now);
         }
         return m_socket->send_packet(header, payload, dest);
     }
@@ -433,7 +496,7 @@ namespace entanglement
             {
                 if (conn)
                 {
-                    conn->process_incoming(header);
+                    conn->process_incoming(header, m_cached_now);
                     send_control_to(conn, CONTROL_CONNECTION_ACCEPTED, key);
                     return;
                 }
@@ -452,7 +515,8 @@ namespace entanglement
                 }
 
                 conn->set_state(connection_state::CONNECTED);
-                conn->process_incoming(header);
+                conn->set_cached_now(m_cached_now);
+                conn->process_incoming(header, m_cached_now);
                 send_control_to(conn, CONTROL_CONNECTION_ACCEPTED, key);
 
                 if (m_verbose || m_on_client_connected)
@@ -473,7 +537,7 @@ namespace entanglement
             {
                 if (conn)
                 {
-                    conn->process_incoming(header);
+                    conn->process_incoming(header, m_cached_now);
                     if (m_verbose || m_on_client_disconnected)
                     {
                         std::string address = endpoint_address_string(key);
@@ -490,7 +554,7 @@ namespace entanglement
             case CONTROL_HEARTBEAT:
             {
                 if (conn)
-                    conn->process_incoming(header);
+                    conn->process_incoming(header, m_cached_now);
                 break;
             }
 
@@ -498,7 +562,7 @@ namespace entanglement
             {
                 if (conn && payload_size >= 2)
                 {
-                    conn->process_incoming(header);
+                    conn->process_incoming(header, m_cached_now);
                     uint8_t available = payload[1];
                     conn->set_fragment_backpressured(available == 0);
                 }
@@ -510,7 +574,7 @@ namespace entanglement
                 if (!conn || conn->state() != connection_state::CONNECTED)
                     break;
 
-                conn->process_incoming(header);
+                conn->process_incoming(header, m_cached_now);
 
                 if (payload_size < 4)
                     break;
@@ -579,7 +643,7 @@ namespace entanglement
         header.flags = FLAG_CONTROL;
         header.channel_id = channels::CONTROL.id;
         header.payload_size = static_cast<uint16_t>(size);
-        conn->prepare_header(header, true);
+        conn->prepare_header(header, true, m_cached_now);
         m_socket->send_packet(header, payload, dest);
     }
 

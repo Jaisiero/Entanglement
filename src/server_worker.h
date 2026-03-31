@@ -27,6 +27,9 @@ namespace entanglement
         uint8_t payload[MAX_PAYLOAD_SIZE]{};
     };
 
+    // Per-receiver SPSC queue type (zero-copy via write_slot/read_slot)
+    using recv_queue_t = spsc_queue<queued_datagram, WORKER_RECV_QUEUE_SIZE>;
+
     // --- Send command (game thread → worker via queue) ---
     struct send_command
     {
@@ -84,12 +87,15 @@ namespace entanglement
         server_worker &operator=(const server_worker &) = delete;
 
         // --- Initialisation (called once before start) ---
+        // recv_queue_count: number of SPSC recv queues (one per receiver thread).
+        // Default 1 for single-socket mode. Set > 1 for SO_REUSEPORT multi-socket.
         void init(size_t pool_capacity, udp_socket *socket, channel_manager *channels,
-                  const std::atomic<bool> *running_flag);
+                  const std::atomic<bool> *running_flag, int recv_queue_count = 1);
 
-        // --- Receive queue (receiver thread → this worker) ---
-        bool enqueue(queued_datagram &&dgram);
-        bool enqueue(const queued_datagram &dgram);
+        // --- Receive queue (receiver thread → this worker, zero-copy) ---
+        // Acquires a pool slot, copies payload once from source, pushes slot index.
+        bool enqueue_packet(const packet_header &hdr, const uint8_t *payload, uint16_t payload_size,
+                            const endpoint_key &sender, int queue_id = 0);
 
         // --- Send command queue (any thread → this worker) ---
         bool enqueue_send(send_command &&cmd);
@@ -170,7 +176,9 @@ namespace entanglement
         int allocate_slot();
 
         // SPSC queues (heap-allocated to keep worker movable-by-pointer)
-        std::unique_ptr<spsc_queue<queued_datagram, WORKER_RECV_QUEUE_SIZE>> m_recv_queue;
+        // One recv queue per receiver thread (size 1 in single-socket mode).
+        // Uses write_slot/read_slot zero-copy API (no full-struct copies).
+        std::vector<std::unique_ptr<recv_queue_t>> m_recv_queues;
         std::unique_ptr<spsc_queue<send_command, WORKER_SEND_QUEUE_SIZE>> m_send_queue;
 
         // Flush pending send commands from the cross-thread queue
@@ -193,6 +201,13 @@ namespace entanglement
         bool m_verbose = true;
 
         std::thread::id m_thread_id{};
+
+        // Tick counter for staggering expensive per-connection operations
+        uint32_t m_tick_counter = 0;
+
+        // Cached timestamp — set once per poll_local/update batch, used in send paths
+        // to avoid redundant steady_clock::now() calls.
+        std::chrono::steady_clock::time_point m_cached_now{};
 
         // --- Internal helpers ---
         void handle_control(const endpoint_key &key, const packet_header &header, const uint8_t *payload,

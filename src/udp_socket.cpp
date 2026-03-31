@@ -50,7 +50,7 @@ namespace entanglement
         return *this;
     }
 
-    error_code udp_socket::bind(uint16_t port, const std::string &address)
+    error_code udp_socket::bind(uint16_t port, const std::string &address, bool reuse_port)
     {
         m_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (m_socket == INVALID_SOCK)
@@ -63,9 +63,29 @@ namespace entanglement
         int opt = 1;
         setsockopt(m_socket, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char *>(&opt), sizeof(opt));
 
+#ifdef ENTANGLEMENT_PLATFORM_LINUX
+        // SO_REUSEPORT: allow multiple sockets on the same port (kernel distributes by 5-tuple hash)
+        if (reuse_port)
+        {
+            int rp = 1;
+            if (setsockopt(m_socket, SOL_SOCKET, SO_REUSEPORT, &rp, sizeof(rp)) != 0)
+            {
+                std::cerr << "[udp_socket] SO_REUSEPORT failed: " << last_socket_error() << std::endl;
+                close();
+                return error_code::socket_error;
+            }
+        }
+#else
+        (void)reuse_port; // SO_REUSEPORT not available on Windows
+#endif
+
         // Increase receive buffer for high-throughput scenarios
         int rcvbuf = SOCKET_RECV_BUFFER_SIZE;
         setsockopt(m_socket, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char *>(&rcvbuf), sizeof(rcvbuf));
+
+        // Increase send buffer to match (prevents burst drops on send side)
+        int sndbuf = SOCKET_RECV_BUFFER_SIZE;
+        setsockopt(m_socket, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char *>(&sndbuf), sizeof(sndbuf));
 
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
@@ -256,12 +276,309 @@ namespace entanglement
 
     void udp_socket::close()
     {
+#ifdef ENTANGLEMENT_PLATFORM_WINDOWS
+        if (m_iocp_enabled)
+            shutdown_iocp();
+#endif
+#ifdef ENTANGLEMENT_PLATFORM_LINUX
+        if (m_epoll_enabled)
+            shutdown_epoll();
+#endif
         if (m_socket != INVALID_SOCK)
         {
             close_socket(m_socket);
             m_socket = INVALID_SOCK;
         }
     }
+
+    // -----------------------------------------------------------------------
+    // IOCP batch receive (Windows only)
+    // -----------------------------------------------------------------------
+
+#ifdef ENTANGLEMENT_PLATFORM_WINDOWS
+
+    bool udp_socket::post_recv(iocp_recv_op &op)
+    {
+        std::memset(&op.overlapped, 0, sizeof(OVERLAPPED));
+        op.wsa_buf.buf = reinterpret_cast<char *>(op.buffer);
+        op.wsa_buf.len = MAX_PACKET_SIZE;
+        op.from_len = sizeof(sockaddr_in);
+
+        DWORD flags = 0;
+        DWORD bytes_received = 0;
+
+        int result = WSARecvFrom(m_socket, &op.wsa_buf, 1, &bytes_received, &flags,
+                                 reinterpret_cast<sockaddr *>(&op.from_addr), &op.from_len, &op.overlapped, nullptr);
+
+        if (result == 0)
+            return true; // Completed immediately — will appear in IOCP
+
+        int err = WSAGetLastError();
+        if (err == WSA_IO_PENDING)
+            return true; // Normal async path
+
+        // Real error — don't repost
+        return false;
+    }
+
+    error_code udp_socket::init_iocp(int pool_size)
+    {
+        if (m_socket == INVALID_SOCK)
+            return error_code::socket_error;
+
+        // Create I/O Completion Port and associate the socket
+        m_iocp = CreateIoCompletionPort(reinterpret_cast<HANDLE>(m_socket), nullptr, 0, 1);
+        if (!m_iocp)
+        {
+            std::cerr << "[udp_socket] CreateIoCompletionPort failed: " << GetLastError() << std::endl;
+            return error_code::socket_error;
+        }
+
+        // Allocate recv operation pool
+        m_recv_pool_size = pool_size;
+        m_recv_pool = std::make_unique<iocp_recv_op[]>(static_cast<size_t>(pool_size));
+
+        // Post all initial receives
+        int posted = 0;
+        for (int i = 0; i < pool_size; ++i)
+        {
+            if (post_recv(m_recv_pool[i]))
+                ++posted;
+        }
+
+        if (posted == 0)
+        {
+            std::cerr << "[udp_socket] Failed to post any IOCP recv operations" << std::endl;
+            CloseHandle(m_iocp);
+            m_iocp = nullptr;
+            m_recv_pool.reset();
+            return error_code::socket_error;
+        }
+
+        m_iocp_enabled = true;
+        return error_code::ok;
+    }
+
+    int udp_socket::recv_batch_iocp(recv_completion *out, int max_count, DWORD timeout_ms)
+    {
+        OVERLAPPED_ENTRY entries[IOCP_MAX_COMPLETIONS];
+        ULONG dequeued = 0;
+        m_pending_repost_count = 0;
+
+        int to_dequeue = (max_count < IOCP_MAX_COMPLETIONS) ? max_count : IOCP_MAX_COMPLETIONS;
+
+        BOOL ok =
+            GetQueuedCompletionStatusEx(m_iocp, entries, static_cast<ULONG>(to_dequeue), &dequeued, timeout_ms, FALSE);
+
+        if (!ok || dequeued == 0)
+            return 0;
+
+        int count = 0;
+        for (ULONG i = 0; i < dequeued; ++i)
+        {
+            auto *overlap = entries[i].lpOverlapped;
+            DWORD bytes = entries[i].dwNumberOfBytesTransferred;
+
+            // Recover the iocp_recv_op from the OVERLAPPED pointer
+            auto *op = reinterpret_cast<iocp_recv_op *>(overlap);
+
+            // Defer re-posting until caller has finished reading payload data
+            m_pending_repost[m_pending_repost_count++] = op;
+
+            // Validate
+            if (bytes >= sizeof(packet_header))
+            {
+                packet_header hdr;
+                std::memcpy(&hdr, op->buffer, sizeof(packet_header));
+
+                if (hdr.magic == PROTOCOL_MAGIC)
+                {
+#ifdef ENTANGLEMENT_SIMULATE_LOSS
+                    if (!should_drop())
+#endif
+                    {
+                        auto &c = out[count];
+                        c.header = hdr;
+                        c.sender.address = op->from_addr.sin_addr.s_addr;
+                        c.sender.port = ntohs(op->from_addr.sin_port);
+
+                        // Zero-copy: point directly into the IOCP buffer (valid until repost)
+                        c.payload_size = static_cast<uint16_t>(bytes - sizeof(packet_header));
+                        c.payload_ptr = op->buffer + sizeof(packet_header);
+
+                        ++count;
+                    }
+                }
+            }
+        }
+
+        return count;
+    }
+
+    void udp_socket::repost_iocp_batch()
+    {
+        for (int i = 0; i < m_pending_repost_count; ++i)
+            post_recv(*m_pending_repost[i]);
+        m_pending_repost_count = 0;
+    }
+
+    void udp_socket::shutdown_iocp()
+    {
+        if (!m_iocp_enabled)
+            return;
+
+        m_iocp_enabled = false;
+
+        // Cancel all pending overlapped I/O on this socket
+        if (m_socket != INVALID_SOCK)
+            CancelIoEx(reinterpret_cast<HANDLE>(m_socket), nullptr);
+
+        // Drain any remaining completions
+        if (m_iocp)
+        {
+            OVERLAPPED_ENTRY entries[IOCP_MAX_COMPLETIONS];
+            ULONG dequeued = 0;
+            // Brief wait to let cancellations complete
+            GetQueuedCompletionStatusEx(m_iocp, entries, IOCP_MAX_COMPLETIONS, &dequeued, 100, FALSE);
+
+            CloseHandle(m_iocp);
+            m_iocp = nullptr;
+        }
+
+        m_recv_pool.reset();
+        m_recv_pool_size = 0;
+    }
+
+#endif // ENTANGLEMENT_PLATFORM_WINDOWS
+
+    // -----------------------------------------------------------------------
+    // epoll + recvmmsg batch receive (Linux only)
+    // -----------------------------------------------------------------------
+
+#ifdef ENTANGLEMENT_PLATFORM_LINUX
+
+    error_code udp_socket::init_epoll(int pool_size)
+    {
+        if (m_socket == INVALID_SOCK)
+            return error_code::socket_error;
+
+        // Create epoll instance
+        m_epoll_fd = epoll_create1(0);
+        if (m_epoll_fd < 0)
+        {
+            std::cerr << "[udp_socket] epoll_create1 failed: " << errno << std::endl;
+            return error_code::socket_error;
+        }
+
+        // Register socket for level-triggered read events
+        struct epoll_event ev{};
+        ev.events = EPOLLIN;
+        ev.data.fd = m_socket;
+        if (epoll_ctl(m_epoll_fd, EPOLL_CTL_ADD, m_socket, &ev) < 0)
+        {
+            std::cerr << "[udp_socket] epoll_ctl failed: " << errno << std::endl;
+            ::close(m_epoll_fd);
+            m_epoll_fd = -1;
+            return error_code::socket_error;
+        }
+
+        // Allocate recvmmsg buffer pool
+        m_epoll_pool_size = pool_size;
+        m_recv_slots = std::make_unique<recvmmsg_slot[]>(static_cast<size_t>(pool_size));
+        m_mmsg_hdrs = std::make_unique<struct mmsghdr[]>(static_cast<size_t>(pool_size));
+
+        // Wire up the iovec → buffer and msghdr → slot pointers (one-time setup)
+        for (int i = 0; i < pool_size; ++i)
+        {
+            auto &slot = m_recv_slots[i];
+            slot.iov.iov_base = slot.buffer;
+            slot.iov.iov_len = MAX_PACKET_SIZE;
+
+            auto &mh = m_mmsg_hdrs[i];
+            std::memset(&mh, 0, sizeof(mh));
+            mh.msg_hdr.msg_name = &slot.from_addr;
+            mh.msg_hdr.msg_namelen = sizeof(sockaddr_in);
+            mh.msg_hdr.msg_iov = &slot.iov;
+            mh.msg_hdr.msg_iovlen = 1;
+        }
+
+        m_epoll_enabled = true;
+        return error_code::ok;
+    }
+
+    int udp_socket::recv_batch_epoll(recv_completion *out, int max_count, int timeout_ms)
+    {
+        // Wait for socket readability (avoids busy-spinning)
+        struct epoll_event ev;
+        int nfds = epoll_wait(m_epoll_fd, &ev, 1, timeout_ms);
+        if (nfds <= 0)
+            return 0;
+
+        // Drain up to batch_size datagrams in a single syscall
+        int batch = (max_count < m_epoll_pool_size) ? max_count : m_epoll_pool_size;
+
+        // Reset msg_namelen for each slot (recvmmsg overwrites it)
+        for (int i = 0; i < batch; ++i)
+            m_mmsg_hdrs[i].msg_hdr.msg_namelen = sizeof(sockaddr_in);
+
+        int n = recvmmsg(m_socket, m_mmsg_hdrs.get(), static_cast<unsigned int>(batch), MSG_DONTWAIT, nullptr);
+        if (n <= 0)
+            return 0;
+
+        // Parse valid packets into completions
+        int count = 0;
+        for (int i = 0; i < n; ++i)
+        {
+            unsigned int bytes = m_mmsg_hdrs[i].msg_len;
+            if (bytes < sizeof(packet_header))
+                continue;
+
+            auto &slot = m_recv_slots[i];
+            packet_header hdr;
+            std::memcpy(&hdr, slot.buffer, sizeof(packet_header));
+
+            if (hdr.magic != PROTOCOL_MAGIC)
+                continue;
+
+#ifdef ENTANGLEMENT_SIMULATE_LOSS
+            if (should_drop())
+                continue;
+#endif
+
+            auto &c = out[count];
+            c.header = hdr;
+            c.sender.address = slot.from_addr.sin_addr.s_addr;
+            c.sender.port = ntohs(slot.from_addr.sin_port);
+
+            // Zero-copy: point directly into the recvmmsg buffer (valid until next batch call)
+            c.payload_size = static_cast<uint16_t>(bytes - sizeof(packet_header));
+            c.payload_ptr = slot.buffer + sizeof(packet_header);
+
+            ++count;
+        }
+
+        return count;
+    }
+
+    void udp_socket::shutdown_epoll()
+    {
+        if (!m_epoll_enabled)
+            return;
+
+        m_epoll_enabled = false;
+
+        if (m_epoll_fd >= 0)
+        {
+            ::close(m_epoll_fd);
+            m_epoll_fd = -1;
+        }
+
+        m_recv_slots.reset();
+        m_mmsg_hdrs.reset();
+        m_epoll_pool_size = 0;
+    }
+
+#endif // ENTANGLEMENT_PLATFORM_LINUX
 
 #ifdef ENTANGLEMENT_SIMULATE_LOSS
     void udp_socket::set_drop_rate(double rate)

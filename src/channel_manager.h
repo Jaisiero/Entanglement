@@ -86,6 +86,10 @@ namespace entanglement
         // Number of registered channels
         size_t channel_count() const { return m_count; }
 
+        // Fast access to ordered channel IDs (avoids iterating all 256 slots)
+        const uint8_t *ordered_channel_ids() const { return m_ordered_ids; }
+        size_t ordered_channel_count() const { return m_ordered_count; }
+
         // Register the predefined gaming channel presets
         void register_defaults();
 
@@ -93,6 +97,11 @@ namespace entanglement
         std::array<channel_config, MAX_CHANNELS> m_channels{};
         std::array<bool, MAX_CHANNELS> m_registered{};
         size_t m_count = 0;
+
+        // Cached list of ordered channel IDs (rebuilt on register/unregister)
+        uint8_t m_ordered_ids[MAX_CHANNELS]{};
+        size_t m_ordered_count = 0;
+        void rebuild_ordered_cache();
     };
 
 } // namespace entanglement

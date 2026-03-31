@@ -11,6 +11,7 @@ namespace entanglement
         m_channels[config.id] = config;
         m_registered[config.id] = true;
         ++m_count;
+        rebuild_ordered_cache();
         return error_code::ok;
     }
 
@@ -46,6 +47,7 @@ namespace entanglement
         m_channels[id] = {};
         m_registered[id] = false;
         --m_count;
+        rebuild_ordered_cache();
         return error_code::ok;
     }
 
@@ -83,6 +85,16 @@ namespace entanglement
         register_channel(channels::UNRELIABLE);
         register_channel(channels::RELIABLE);
         register_channel(channels::ORDERED);
+    }
+
+    void channel_manager::rebuild_ordered_cache()
+    {
+        m_ordered_count = 0;
+        for (size_t i = 0; i < MAX_CHANNELS; ++i)
+        {
+            if (m_registered[i] && m_channels[i].mode == channel_mode::RELIABLE_ORDERED)
+                m_ordered_ids[m_ordered_count++] = static_cast<uint8_t>(i);
+        }
     }
 
 } // namespace entanglement

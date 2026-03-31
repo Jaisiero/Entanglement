@@ -13,8 +13,8 @@ namespace entanglement
     // --- Network limits ---
     constexpr size_t MAX_PACKET_SIZE = 1200; // Safe MTU minus IP/UDP headers
     constexpr uint16_t DEFAULT_PORT = 9876;
-    constexpr size_t MAX_CONNECTIONS = 1024;
-    constexpr int SOCKET_RECV_BUFFER_SIZE = 1024 * 1024; // 1 MB SO_RCVBUF
+    constexpr size_t MAX_CONNECTIONS = 4096;
+    constexpr int SOCKET_RECV_BUFFER_SIZE = 4 * 1024 * 1024; // 4 MB SO_RCVBUF
 
     // --- Poll defaults ---
     constexpr int DEFAULT_MAX_POLL_PACKETS = 256;
@@ -37,11 +37,13 @@ namespace entanglement
     constexpr int64_t CLOCK_GRANULARITY_US = 1000;  // 1 ms minimum granularity (G)
 
     // --- Congestion control ---
-    constexpr uint32_t INITIAL_CWND = 10;     // initial window (packets) — 10 per RFC 6928
-    constexpr uint32_t MIN_CWND = 8;          // floor — never starve the connection
-    constexpr uint32_t INITIAL_SSTHRESH = 32; // switch slow-start → congestion avoidance
-    constexpr uint32_t MAX_CWND = 256;        // cap for gaming (low-latency priority)
-    constexpr double CC_BETA = 0.7;           // multiplicative decrease factor (CUBIC-style)
+    constexpr uint32_t INITIAL_CWND = 10;      // initial window (packets) — 10 per RFC 6928
+    constexpr uint32_t MIN_CWND = 8;           // floor — never starve the connection
+    constexpr uint32_t INITIAL_SSTHRESH = 32;  // switch slow-start → congestion avoidance
+    constexpr uint32_t MAX_CWND = 256;         // cap for gaming (low-latency priority)
+    constexpr double CC_BETA = 0.7;            // multiplicative decrease factor (CUBIC-style)
+    constexpr double CC_LOSS_TOLERANCE = 0.15; // ignore MD when smoothed loss rate < 15% (random/wireless loss)
+    constexpr double CC_LOSS_ALPHA = 0.015625; // EWMA smoothing factor for loss rate (1/64)
 
     // --- ACK timing ---
     constexpr int64_t ACK_FLUSH_INTERVAL_US = 5'000; // 5 ms — send ACK-only packet if pending

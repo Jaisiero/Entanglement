@@ -145,13 +145,18 @@ namespace entanglement
         uint8_t payload[MAX_PAYLOAD_SIZE];
         endpoint_key sender{};
 
+        // Cache timestamp once per poll batch — avoids repeated now() calls inside
+        // process_incoming / ack_packet / advance_ordered_seq for every packet.
+        auto batch_now = std::chrono::steady_clock::now();
+        m_connection.set_cached_now(batch_now);
+
         while (count < max_packets)
         {
             int result = m_socket.recv_packet(header, payload, MAX_PAYLOAD_SIZE, sender);
             if (result <= 0)
                 break;
 
-            bool is_new = m_connection.process_incoming(header);
+            bool is_new = m_connection.process_incoming(header, batch_now);
             if (!is_new)
             {
                 ++count;
@@ -212,6 +217,7 @@ namespace entanglement
             return 0;
 
         auto now = std::chrono::steady_clock::now();
+        m_connection.set_cached_now(now);
 
         // Check connection timeout
         if (m_connection.has_timed_out(now))
@@ -261,7 +267,7 @@ namespace entanglement
         ra.cleanup_stale(now, ra.reassembly_timeout());
 
         // Check for ordered-delivery stalls (auto-skip gaps that block delivery)
-        m_connection.check_ordered_stalls(m_channels);
+        m_connection.check_ordered_stalls(m_channels, now);
 
         // Send backpressure relief if usage dropped below low watermark
         if (m_connection.backpressure_sent() && ra.usage_percent() < BACKPRESSURE_LOW_WATERMARK)

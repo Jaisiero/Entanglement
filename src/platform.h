@@ -26,6 +26,10 @@ inline void close_socket(socket_t s)
 
 #elif defined(__linux__) || defined(__APPLE__)
 #define ENTANGLEMENT_PLATFORM_POSIX
+#ifdef __linux__
+#define ENTANGLEMENT_PLATFORM_LINUX
+#include <sys/epoll.h>
+#endif
 #include <arpa/inet.h>
 #include <cerrno>
 #include <netinet/in.h>

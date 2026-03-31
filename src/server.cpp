@@ -24,12 +24,19 @@ namespace entanglement
         if (pool_per_worker == 0)
             pool_per_worker = 1;
 
+        // Effective number of receive sockets (1 on Windows, m_socket_count on Linux)
+        int recv_queue_count = 1;
+#ifdef ENTANGLEMENT_PLATFORM_LINUX
+        if (m_socket_count > 1 && m_use_async_io && m_worker_count > 0)
+            recv_queue_count = m_socket_count;
+#endif
+
         m_workers.clear();
         m_workers.reserve(static_cast<size_t>(actual));
         for (int i = 0; i < actual; ++i)
         {
             auto w = std::make_unique<server_worker>();
-            w->init(pool_per_worker, &m_socket, &m_channels, &m_running);
+            w->init(pool_per_worker, &m_socket, &m_channels, &m_running, recv_queue_count);
             w->set_verbose(m_verbose);
             w->set_auto_retransmit(m_auto_retransmit);
             m_workers.push_back(std::move(w));
@@ -68,7 +75,17 @@ namespace entanglement
 
     error_code server::start()
     {
-        if (auto ec = m_socket.bind(m_port, m_bind_address); failed(ec))
+        // Determine effective socket count (SO_REUSEPORT only on Linux + async + threaded)
+        int effective_sockets = 1;
+#ifdef ENTANGLEMENT_PLATFORM_LINUX
+        if (m_socket_count > 1 && m_use_async_io && m_worker_count > 0)
+            effective_sockets = m_socket_count;
+#endif
+        const bool multi_socket = (effective_sockets > 1);
+        const bool reuse_port = multi_socket;
+
+        // Bind primary socket
+        if (auto ec = m_socket.bind(m_port, m_bind_address, reuse_port); failed(ec))
             return ec;
 
         if (auto ec = m_socket.set_non_blocking(true); failed(ec))
@@ -79,14 +96,102 @@ namespace entanglement
             return ec;
         }
 
+        // Bind extra sockets for SO_REUSEPORT (Linux)
+        m_extra_recv_sockets.clear();
+        if (multi_socket)
+        {
+            m_extra_recv_sockets.resize(static_cast<size_t>(effective_sockets - 1));
+            for (int i = 0; i < effective_sockets - 1; ++i)
+            {
+                if (auto ec = m_extra_recv_sockets[static_cast<size_t>(i)].bind(m_port, m_bind_address, true);
+                    failed(ec))
+                {
+                    if (m_verbose)
+                        std::cerr << "[server] Failed to bind extra socket " << (i + 1) << std::endl;
+                    // Clean up already-bound extra sockets
+                    for (int j = 0; j < i; ++j)
+                        m_extra_recv_sockets[static_cast<size_t>(j)].close();
+                    m_extra_recv_sockets.clear();
+                    m_socket.close();
+                    return ec;
+                }
+                m_extra_recv_sockets[static_cast<size_t>(i)].set_non_blocking(true);
+            }
+        }
+
         m_running = true;
         create_workers();
 
         m_threaded = (m_worker_count > 0);
         if (m_threaded)
         {
-            // Launch receiver thread
+#if defined(ENTANGLEMENT_PLATFORM_WINDOWS) || defined(ENTANGLEMENT_PLATFORM_LINUX)
+            // Initialise platform-optimized async I/O if requested
+            if (m_use_async_io)
+            {
+                // Init async I/O on primary socket
+#ifdef ENTANGLEMENT_PLATFORM_WINDOWS
+                if (auto ec = m_socket.init_iocp(); failed(ec))
+#elif defined(ENTANGLEMENT_PLATFORM_LINUX)
+                if (auto ec = m_socket.init_epoll(); failed(ec))
+#endif
+                {
+                    if (m_verbose)
+                        std::cerr << "[server] Async I/O init failed, falling back to polling" << std::endl;
+                    m_use_async_io = false;
+                    // Ensure socket is non-blocking for fallback path
+                    m_socket.set_non_blocking(true);
+                    // Close extra sockets on fallback
+                    for (auto &s : m_extra_recv_sockets)
+                        s.close();
+                    m_extra_recv_sockets.clear();
+                }
+
+#ifdef ENTANGLEMENT_PLATFORM_LINUX
+                // Init epoll on extra sockets (multi-socket mode)
+                if (m_use_async_io && !m_extra_recv_sockets.empty())
+                {
+                    for (size_t i = 0; i < m_extra_recv_sockets.size(); ++i)
+                    {
+                        if (auto ec = m_extra_recv_sockets[i].init_epoll(); failed(ec))
+                        {
+                            if (m_verbose)
+                                std::cerr << "[server] Extra socket " << (i + 1) << " epoll init failed" << std::endl;
+                            // Shut down all extra sockets
+                            for (auto &s : m_extra_recv_sockets)
+                            {
+                                s.shutdown_epoll();
+                                s.close();
+                            }
+                            m_extra_recv_sockets.clear();
+                            break;
+                        }
+                    }
+                }
+#endif
+            }
+
+            // Launch primary receiver thread (async or polling)
+            if (m_use_async_io)
+                m_receiver_thread = std::thread([this]() { receiver_loop_async(0); });
+            else
+                m_receiver_thread = std::thread([this]() { receiver_loop(); });
+
+#ifdef ENTANGLEMENT_PLATFORM_LINUX
+            // Launch extra receiver threads (one per extra socket)
+            m_extra_receiver_threads.clear();
+            for (size_t i = 0; i < m_extra_recv_sockets.size(); ++i)
+            {
+                int receiver_id = static_cast<int>(i + 1);
+                m_extra_receiver_threads.emplace_back([this, i, receiver_id]()
+                                                      { receiver_loop_async_extra(static_cast<int>(i), receiver_id); });
+            }
+#endif
+
+#else
+            // No platform async I/O — use polling
             m_receiver_thread = std::thread([this]() { receiver_loop(); });
+#endif
 
             // Launch worker threads
             m_worker_threads.reserve(m_workers.size());
@@ -100,7 +205,20 @@ namespace entanglement
         {
             std::cout << "[server] Listening on " << m_bind_address << ":" << m_port;
             if (m_threaded)
-                std::cout << " (" << m_workers.size() << " worker threads)";
+            {
+                std::cout << " (" << m_workers.size() << " worker threads";
+                if (m_use_async_io)
+                {
+#ifdef ENTANGLEMENT_PLATFORM_WINDOWS
+                    std::cout << ", IOCP";
+#elif defined(ENTANGLEMENT_PLATFORM_LINUX)
+                    std::cout << ", epoll";
+                    if (!m_extra_recv_sockets.empty())
+                        std::cout << ", " << (m_extra_recv_sockets.size() + 1) << " sockets (SO_REUSEPORT)";
+#endif
+                }
+                std::cout << ")";
+            }
             std::cout << std::endl;
         }
         return error_code::ok;
@@ -115,6 +233,12 @@ namespace entanglement
         // Join threads (multi-threaded mode)
         if (m_receiver_thread.joinable())
             m_receiver_thread.join();
+        for (auto &t : m_extra_receiver_threads)
+        {
+            if (t.joinable())
+                t.join();
+        }
+        m_extra_receiver_threads.clear();
         for (auto &t : m_worker_threads)
         {
             if (t.joinable())
@@ -126,6 +250,9 @@ namespace entanglement
         disconnect_all();
 
         m_socket.close();
+        for (auto &s : m_extra_recv_sockets)
+            s.close();
+        m_extra_recv_sockets.clear();
         m_workers.clear();
 
         if (m_verbose)
@@ -144,26 +271,89 @@ namespace entanglement
 
         while (m_running.load(std::memory_order_relaxed))
         {
-            int result = m_socket.recv_packet(header, payload, MAX_PAYLOAD_SIZE, sender);
-            if (result <= 0)
+            // Drain up to a batch of packets before checking m_running / yielding.
+            // Reduces per-packet overhead of atomic loads and yield syscalls.
+            int batch = 0;
+            while (batch < DEFAULT_MAX_POLL_PACKETS)
             {
+                int result = m_socket.recv_packet(header, payload, MAX_PAYLOAD_SIZE, sender);
+                if (result <= 0)
+                    break;
+
+                size_t w = worker_index(sender);
+                if (!m_workers[w]->enqueue_packet(header, payload, header.payload_size, sender))
+                {
+                    m_recv_queue_drops.fetch_add(1, std::memory_order_relaxed);
+                }
+                ++batch;
+            }
+
+            if (batch == 0)
                 std::this_thread::yield();
-                continue;
-            }
-
-            size_t w = worker_index(sender);
-            queued_datagram dgram;
-            dgram.header = header;
-            dgram.sender = sender;
-            std::memcpy(dgram.payload, payload, header.payload_size);
-
-            if (!m_workers[w]->enqueue(std::move(dgram)))
-            {
-                // Queue full — drop packet (UDP, sender retransmits if reliable)
-                m_recv_queue_drops.fetch_add(1, std::memory_order_relaxed);
-            }
         }
     }
+
+#if defined(ENTANGLEMENT_PLATFORM_WINDOWS) || defined(ENTANGLEMENT_PLATFORM_LINUX)
+    void server::receiver_loop_async(int receiver_id)
+    {
+        recv_completion completions[ASYNC_MAX_COMPLETIONS];
+
+        while (m_running.load(std::memory_order_relaxed))
+        {
+            // Batch dequeue — waits up to 1ms for completions, returns immediately if any ready
+#ifdef ENTANGLEMENT_PLATFORM_WINDOWS
+            int count = m_socket.recv_batch_iocp(completions, ASYNC_MAX_COMPLETIONS, 1);
+#elif defined(ENTANGLEMENT_PLATFORM_LINUX)
+            int count = m_socket.recv_batch_epoll(completions, ASYNC_MAX_COMPLETIONS, 1);
+#endif
+
+            for (int i = 0; i < count; ++i)
+            {
+                auto &c = completions[i];
+                size_t w = worker_index(c.sender);
+                if (!m_workers[w]->enqueue_packet(c.header, c.payload_ptr, c.payload_size, c.sender, receiver_id))
+                {
+                    m_recv_queue_drops.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+
+#ifdef ENTANGLEMENT_PLATFORM_WINDOWS
+            // Re-post IOCP buffers after all payloads have been copied to pool slots
+            if (count > 0)
+                m_socket.repost_iocp_batch();
+#endif
+
+            if (count == 0)
+                std::this_thread::yield();
+        }
+    }
+#endif
+
+#ifdef ENTANGLEMENT_PLATFORM_LINUX
+    void server::receiver_loop_async_extra(int extra_index, int receiver_id)
+    {
+        recv_completion completions[ASYNC_MAX_COMPLETIONS];
+        auto &sock = m_extra_recv_sockets[static_cast<size_t>(extra_index)];
+
+        while (m_running.load(std::memory_order_relaxed))
+        {
+            int count = sock.recv_batch_epoll(completions, ASYNC_MAX_COMPLETIONS, 1);
+
+            for (int i = 0; i < count; ++i)
+            {
+                auto &c = completions[i];
+                size_t w = worker_index(c.sender);
+                if (!m_workers[w]->enqueue_packet(c.header, c.payload_ptr, c.payload_size, c.sender, receiver_id))
+                {
+                    m_recv_queue_drops.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+
+            if (count == 0)
+                std::this_thread::yield();
+        }
+    }
+#endif
 
     void server::worker_loop(size_t worker_idx)
     {

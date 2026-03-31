@@ -21,7 +21,16 @@ namespace entanglement
     {
         size_t operator()(const endpoint_key &k) const
         {
-            return std::hash<uint64_t>{}((static_cast<uint64_t>(k.address) << 16) | k.port);
+            // splitmix64 finalizer — excellent distribution for (IP, port) pairs.
+            // Avoids the collision problem of identity-hash (MSVC) when many
+            // clients share the same port but differ in IP address.
+            uint64_t h = (static_cast<uint64_t>(k.address) << 16) ^ k.port;
+            h ^= h >> 33;
+            h *= 0xff51afd7ed558ccdULL;
+            h ^= h >> 33;
+            h *= 0xc4ceb9fe1a85ec53ULL;
+            h ^= h >> 33;
+            return static_cast<size_t>(h);
         }
     };
 

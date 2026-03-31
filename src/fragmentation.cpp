@@ -26,6 +26,7 @@ namespace entanglement
                     m_on_failed(entry->sender, entry->message_id, entry->channel_id, entry->app_buffer,
                                 message_fail_reason::expired, entry->received_count, entry->fragment_count);
                 entry->reset();
+                --m_active_count;
                 entry = nullptr; // fall through to allocate new
             }
         }
@@ -75,6 +76,7 @@ namespace entanglement
             }
 
             entry->active = true;
+            ++m_active_count;
             entry->message_id = fhdr.message_id;
             entry->sender = sender;
             entry->channel_id = channel_id;
@@ -123,6 +125,7 @@ namespace entanglement
 
         record_completed(entry->message_id);
         entry->reset();
+        --m_active_count;
         return fragment_result::completed;
     }
 
@@ -148,6 +151,9 @@ namespace entanglement
 
     int fragment_reassembler::cleanup_stale(std::chrono::steady_clock::time_point now, int64_t timeout_us)
     {
+        if (m_active_count == 0)
+            return 0;
+
         int evicted = 0;
         for (auto &e : m_entries)
         {
@@ -160,6 +166,7 @@ namespace entanglement
                     m_on_failed(e.sender, e.message_id, e.channel_id, e.app_buffer, message_fail_reason::expired,
                                 e.received_count, e.fragment_count);
                 e.reset();
+                --m_active_count;
                 ++evicted;
             }
         }
@@ -178,14 +185,14 @@ namespace entanglement
                 e.reset();
             }
         }
+        m_active_count = 0;
     }
 
     int fragment_reassembler::usage_percent() const
     {
-        size_t count = pending_count();
         if (MAX_INCOMING_FRAGMENTED_MESSAGES == 0)
             return 0;
-        return static_cast<int>((count * 100) / MAX_INCOMING_FRAGMENTED_MESSAGES);
+        return static_cast<int>((m_active_count * 100) / MAX_INCOMING_FRAGMENTED_MESSAGES);
     }
 
     reassembly_entry *fragment_reassembler::try_evict_least_progress()
@@ -214,6 +221,7 @@ namespace entanglement
                 m_on_failed(victim->sender, victim->message_id, victim->channel_id, victim->app_buffer,
                             message_fail_reason::evicted, victim->received_count, victim->fragment_count);
             victim->reset();
+            --m_active_count;
         }
 
         return victim;

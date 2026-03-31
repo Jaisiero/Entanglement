@@ -25,6 +25,13 @@ endif()
 # Platform-specific libraries
 if(WIN32)
     target_link_libraries(entanglement_core PUBLIC ws2_32)
+elseif(UNIX)
+    find_package(Threads REQUIRED)
+    target_link_libraries(entanglement_core PUBLIC Threads::Threads)
+    # _GNU_SOURCE needed for recvmmsg / mmsghdr on Linux
+    if(NOT APPLE)
+        target_compile_definitions(entanglement_core PUBLIC _GNU_SOURCE)
+    endif()
 endif()
 
 # Executables
@@ -39,6 +46,9 @@ target_link_libraries(EntanglementTests PRIVATE entanglement_core)
 
 add_executable(EntanglementChurnTest apps/churn_test_main.cpp)
 target_link_libraries(EntanglementChurnTest PRIVATE entanglement_core)
+
+add_executable(EntanglementStress apps/stress_test_main.cpp)
+target_link_libraries(EntanglementStress PRIVATE entanglement_core)
 
 # Create log directory at build time
 add_custom_target(create_log_dir ALL

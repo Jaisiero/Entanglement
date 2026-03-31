@@ -75,6 +75,7 @@ namespace entanglement
         uint32_t ssthresh() const { return m_ssthresh; }
         int64_t pacing_interval_us() const { return m_pacing_interval_us; }
         bool in_slow_start() const { return m_cwnd < m_ssthresh; }
+        double loss_rate() const { return m_loss_rate; }
 
     private:
         uint32_t m_cwnd = INITIAL_CWND;
@@ -90,6 +91,10 @@ namespace entanglement
         // Multiple losses within the same RTT window are a single congestion event.
         double m_srtt_us = 0.0;
         std::chrono::steady_clock::time_point m_last_cwnd_reduction{};
+
+        // EWMA loss rate estimator: separate random/wireless loss from congestion.
+        // Starts at 0.0 (optimistic — random loss tolerated until rate exceeds threshold).
+        double m_loss_rate = 0.0;
     };
 
 } // namespace entanglement
