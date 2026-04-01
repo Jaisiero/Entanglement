@@ -220,13 +220,17 @@ static void cli_connected(void *ud)
 
 static void run_client(const char *server_ip, uint16_t port,
                        int num_clients, int duration_secs,
-                       int payload_size, int burst)
+                       int payload_size, int burst, bool coalesced)
 {
     std::printf("=== NET BENCH CLIENT (C++) ===\n");
     std::printf("  Server: %s:%u  Clients: %d  Duration: %ds\n",
                 server_ip, port, num_clients, duration_secs);
-    std::printf("  Payload: %dB  Burst: %d\n", payload_size, burst);
+    std::printf("  Payload: %dB  Burst: %d  Coalesced: %s\n",
+                payload_size, burst, coalesced ? "YES" : "NO");
     std::printf("=============================================\n\n");
+
+    // Choose channel: coalesced unreliable (ch 4) or plain unreliable (ch 1)
+    const uint8_t send_channel = coalesced ? 4 : 1;
 
     Stats stats;
     std::atomic<bool> running{true};
@@ -234,7 +238,8 @@ static void run_client(const char *server_ip, uint16_t port,
 
     for (int i = 0; i < num_clients; ++i) {
         threads.emplace_back([&stats, &running, i,
-                              server_ip, port, payload_size, burst]()
+                              server_ip, port, payload_size, burst,
+                              send_channel]()
         {
             // Each thread owns its client + context
             ClientCtx ctx{&stats, {}};
@@ -283,7 +288,7 @@ static void run_client(const char *server_ip, uint16_t port,
                         if (!ent_client_can_send(cli)) break;
                         int r = ent_client_send(
                             cli, buf.data(), buf.size(),
-                            1,        // channel_id (unreliable)
+                            send_channel, // channel_id
                             0,        // flags
                             nullptr,  // out_message_id
                             nullptr,  // out_sequence
@@ -367,7 +372,8 @@ int main(int argc, char *argv[])
             "Usage:\n"
             "  net_bench server [port] [workers]\n"
             "  net_bench client <server_ip> [port] [clients]"
-            " [duration] [payload] [burst]\n");
+            " [duration] [payload] [burst] [coalesced]\n"
+            "\n  coalesced: 0 or 1 (default 0) — use coalesced channel\n");
         return 1;
     }
 
@@ -383,7 +389,8 @@ int main(int argc, char *argv[])
         int duration   = argc > 5 ? std::atoi(argv[5]) : 10;
         int payload    = argc > 6 ? std::atoi(argv[6]) : 1100;
         int burst      = argc > 7 ? std::atoi(argv[7]) : 32;
-        run_client(ip, port, clients, duration, payload, burst);
+        bool coalesced = argc > 8 ? std::atoi(argv[8]) != 0 : false;
+        run_client(ip, port, clients, duration, payload, burst, coalesced);
     }
     else {
         std::fprintf(stderr,

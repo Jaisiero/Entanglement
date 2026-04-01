@@ -65,6 +65,9 @@ namespace entanglement
         // Disconnect all clients
         void disconnect_all();
 
+        // Flush coalesced message buffers for a specific client.
+        void flush_coalesce(const endpoint_key &dest);
+
         uint16_t port() const { return m_port; }
 
         size_t connection_count() const

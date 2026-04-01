@@ -134,6 +134,8 @@ extern "C"
         ent_channel_mode mode;
         uint8_t priority;
         char name[32];
+        int coalesce;              /* bool: enable message coalescing */
+        uint16_t coalesce_max_bytes; /* max coalesced payload (0 = default 1160) */
     } ent_channel_config;
 
     /* -----------------------------------------------------------------------
@@ -260,6 +262,9 @@ extern "C"
     /* Reassembly timeout override (microseconds) */
     ENT_API void ent_client_set_reassembly_timeout(ent_client_t *c, int64_t timeout_us);
 
+    /* Flush pending coalesced messages for all channels. */
+    ENT_API void ent_client_flush_coalesce(ent_client_t *c);
+
     ENT_API void ent_client_set_verbose(ent_client_t *c, int verbose);
     ENT_API uint16_t ent_client_local_port(const ent_client_t *c);
 
@@ -332,6 +337,9 @@ extern "C"
 
     /* Fragment flow control */
     ENT_API int ent_server_is_fragment_throttled(const ent_server_t *s, ent_endpoint dest);
+
+    /* Flush pending coalesced messages for a specific client. */
+    ENT_API void ent_server_flush_coalesce(ent_server_t *s, ent_endpoint dest);
 
     ENT_API void ent_server_set_verbose(ent_server_t *s, int verbose);
     ENT_API uint16_t ent_server_port(const ent_server_t *s);

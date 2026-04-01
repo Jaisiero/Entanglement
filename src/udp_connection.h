@@ -293,12 +293,7 @@ namespace entanglement
 
         // Send a user message (auto-fragments if needed).
         // Returns bytes of user data sent, or a negative error_code.
-        // out_message_id:       if non-null, receives the library message_id (non-zero for fragmented sends).
-        // out_sequence:         if non-null, receives the packet sequence (only for single-packet sends).
-        // channel_sequence:     if non-zero, the packet reuses this channel_sequence instead of
-        //                       auto-assigning a new one. Used for ordered retransmissions so the
-        //                       receiver sees the same slot in its hold-back buffer.
-        // out_channel_sequence: if non-null, receives the channel_sequence that was assigned/used.
+        // For coalesced channels, data is buffered and flushed later.
         int send_payload(udp_socket &socket, const channel_manager &channels, const void *data, size_t size,
                          uint8_t flags, uint8_t channel_id, const endpoint_key &dest,
                          uint32_t *out_message_id = nullptr, uint64_t *out_sequence = nullptr,
@@ -308,6 +303,19 @@ namespace entanglement
         int send_fragment(udp_socket &socket, const channel_manager &channels, uint32_t message_id, uint8_t index,
                           uint8_t count, const void *data, size_t size, uint8_t flags, uint8_t channel_id,
                           const endpoint_key &dest, uint32_t channel_sequence = 0);
+
+        // --- Message coalescing ---
+
+        // Flush all pending coalesce buffers for this connection.
+        // Called at the end of each update() tick.
+        void flush_all_coalesce(udp_socket &socket, const channel_manager &channels, const endpoint_key &dest);
+
+        // Flush a single channel's coalesce buffer.
+        void flush_coalesce(uint8_t channel_id, udp_socket &socket, const channel_manager &channels,
+                            const endpoint_key &dest);
+
+        // Returns true if any channel has buffered coalesce data.
+        bool has_pending_coalesce() const;
 
         // --- Fragment reassembly (receiver side, per-connection) ---
 
@@ -470,6 +478,21 @@ namespace entanglement
 
         // Helper: record a received sequence in the bitmap
         void record_received(uint64_t sequence);
+
+        // --- Message coalescing (per-channel send-side buffer) ---
+        // Lazily-allocated: only channels with coalesce=true get a buffer.
+        struct coalesce_buffer
+        {
+            uint8_t data[MAX_COALESCE_PAYLOAD]{};
+            uint16_t used = 0;     // bytes written so far
+            uint8_t msg_count = 0; // sub-messages in buffer
+        };
+        // Sparse map: index = channel_id, only populated for coalesced channels.
+        // Using unique_ptr to avoid 256 × ~1.2 KB = ~300 KB per connection.
+        std::unique_ptr<coalesce_buffer> m_coalesce[MAX_CHANNELS]{};
+
+        // Ensure a coalesce buffer exists for a channel (lazily created)
+        coalesce_buffer &ensure_coalesce(uint8_t channel_id);
     };
 
 } // namespace entanglement

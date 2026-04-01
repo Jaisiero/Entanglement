@@ -122,6 +122,9 @@ namespace entanglement
                              size_t size, uint8_t flags, uint8_t channel_id, const endpoint_key &dest,
                              uint32_t channel_sequence = 0);
 
+        // Flush coalesced message buffers for a specific client.
+        void flush_coalesce_for(const endpoint_key &dest);
+
         // --- Connection management ---
 
         udp_connection *find(const endpoint_key &key);

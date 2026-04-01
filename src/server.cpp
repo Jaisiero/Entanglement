@@ -646,6 +646,14 @@ namespace entanglement
             w->disconnect_all();
     }
 
+    void server::flush_coalesce(const endpoint_key &dest)
+    {
+        if (m_workers.empty())
+            return;
+        size_t w = worker_index(dest);
+        m_workers[w]->flush_coalesce_for(dest);
+    }
+
     // -----------------------------------------------------------------------
     // Fragmentation callbacks — store and propagate
     // -----------------------------------------------------------------------

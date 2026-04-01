@@ -1312,7 +1312,7 @@ static bool test_channel_modes()
 // ============================================================================
 // TEST 29: Default channel presets
 // ============================================================================
-// Verify register_defaults() populates all 6 gaming presets.
+// Verify register_defaults() populates all 7 presets (0-3 standard + 4-6 coalesced).
 // ============================================================================
 
 static bool test_channel_defaults()
@@ -1320,7 +1320,7 @@ static bool test_channel_defaults()
     channel_manager cm;
     cm.register_defaults();
 
-    TEST_ASSERT(cm.channel_count() == 4, "should have 4 default channels");
+    TEST_ASSERT(cm.channel_count() == 7, "should have 7 default channels");
 
     // CONTROL — reliable ordered, priority 255
     auto *ctrl = cm.get_channel(channels::CONTROL.id);
@@ -1340,6 +1340,21 @@ static bool test_channel_defaults()
     // ORDERED — reliable ordered, priority 128
     TEST_ASSERT(cm.is_ordered(channels::ORDERED.id), "ORDERED should be ordered");
     TEST_ASSERT(cm.priority(channels::ORDERED.id) == 128, "ORDERED priority should be 128");
+
+    // UNRELIABLE_COALESCED — unreliable, coalesced, priority 64
+    TEST_ASSERT(cm.is_registered(channels::UNRELIABLE_COALESCED.id), "UNRELIABLE_COALESCED should exist");
+    TEST_ASSERT(!cm.is_reliable(channels::UNRELIABLE_COALESCED.id), "UNRELIABLE_COALESCED should be unreliable");
+    TEST_ASSERT(cm.is_coalesced(channels::UNRELIABLE_COALESCED.id), "UNRELIABLE_COALESCED should be coalesced");
+
+    // RELIABLE_COALESCED — reliable, coalesced, priority 128
+    TEST_ASSERT(cm.is_registered(channels::RELIABLE_COALESCED.id), "RELIABLE_COALESCED should exist");
+    TEST_ASSERT(cm.is_reliable(channels::RELIABLE_COALESCED.id), "RELIABLE_COALESCED should be reliable");
+    TEST_ASSERT(cm.is_coalesced(channels::RELIABLE_COALESCED.id), "RELIABLE_COALESCED should be coalesced");
+
+    // ORDERED_COALESCED — reliable ordered, coalesced, priority 128
+    TEST_ASSERT(cm.is_registered(channels::ORDERED_COALESCED.id), "ORDERED_COALESCED should exist");
+    TEST_ASSERT(cm.is_ordered(channels::ORDERED_COALESCED.id), "ORDERED_COALESCED should be ordered");
+    TEST_ASSERT(cm.is_coalesced(channels::ORDERED_COALESCED.id), "ORDERED_COALESCED should be coalesced");
 
     return true;
 }
@@ -1506,20 +1521,20 @@ static bool test_channel_unreliable_no_loss()
 static bool test_open_channel()
 {
     channel_manager cm;
-    cm.register_defaults(); // occupies ids 0-3
+    cm.register_defaults(); // occupies ids 0-6 (0-3 standard + 4-6 coalesced)
 
-    // First open — should get id 4 (default hint=4)
+    // First open — should get id 7 (default hint=4 will skip to first free)
     int id1 = cm.open_channel(channel_mode::RELIABLE, 180, "combat");
-    TEST_ASSERT(id1 == 4, "first open_channel should get id 4");
-    TEST_ASSERT(cm.is_registered(4), "channel 4 should be registered");
-    TEST_ASSERT(cm.is_reliable(4), "channel 4 should be reliable");
-    TEST_ASSERT(!cm.is_ordered(4), "channel 4 should not be ordered");
-    TEST_ASSERT(cm.priority(4) == 180, "channel 4 priority should be 180");
-    TEST_ASSERT(cm.channel_count() == 5, "should have 5 channels after open");
+    TEST_ASSERT(id1 == 7, "first open_channel should get id 7");
+    TEST_ASSERT(cm.is_registered(7), "channel 7 should be registered");
+    TEST_ASSERT(cm.is_reliable(7), "channel 7 should be reliable");
+    TEST_ASSERT(!cm.is_ordered(7), "channel 7 should not be ordered");
+    TEST_ASSERT(cm.priority(7) == 180, "channel 7 priority should be 180");
+    TEST_ASSERT(cm.channel_count() == 8, "should have 8 channels after open");
 
-    // Second open — should get id 5
+    // Second open — should get id 8
     int id2 = cm.open_channel(channel_mode::UNRELIABLE, 50, "physics");
-    TEST_ASSERT(id2 == 5, "second open_channel should get id 5");
+    TEST_ASSERT(id2 == 8, "second open_channel should get id 8");
 
     // Open with explicit hint
     int id3 = cm.open_channel(channel_mode::RELIABLE_ORDERED, 200, "chat", 100);
@@ -1716,8 +1731,8 @@ static bool test_channel_negotiation_rejected()
     TEST_ASSERT(ch_id < 0, "open_channel should return negative error_code when rejected");
 
     // Verify the channel was NOT registered locally (rolled back)
-    // The hint was 4, so if it was registered and rolled back, slot 4 should be free
-    TEST_ASSERT(!c.channels().is_registered(4), "rejected channel should not remain registered on client");
+    // The hint was 4 but defaults occupy 0-6, so it would try id 7 then roll back
+    TEST_ASSERT(!c.channels().is_registered(7), "rejected channel should not remain registered on client");
 
     c.disconnect();
     stop_flag = true;
@@ -4144,6 +4159,496 @@ static bool test_server_stop_with_clients()
     return true;
 }
 
+// ============================================================================
+// TEST: Coalesce buffer unit test
+// ============================================================================
+// Verify that coalesce queries, buffer allocation, and flush work correctly.
+// ============================================================================
+
+static bool test_coalesce_buffer_unit()
+{
+    channel_manager cm;
+    cm.register_defaults();
+
+    // Channels 4-6 should be coalesced, channels 0-3 should not
+    TEST_ASSERT(!cm.is_coalesced(0), "CONTROL should NOT be coalesced");
+    TEST_ASSERT(!cm.is_coalesced(1), "UNRELIABLE should NOT be coalesced");
+    TEST_ASSERT(!cm.is_coalesced(2), "RELIABLE should NOT be coalesced");
+    TEST_ASSERT(!cm.is_coalesced(3), "ORDERED should NOT be coalesced");
+    TEST_ASSERT(cm.is_coalesced(4), "UNRELIABLE_COALESCED should be coalesced");
+    TEST_ASSERT(cm.is_coalesced(5), "RELIABLE_COALESCED should be coalesced");
+    TEST_ASSERT(cm.is_coalesced(6), "ORDERED_COALESCED should be coalesced");
+
+    TEST_ASSERT(cm.coalesce_max_bytes(5) == 1160, "default coalesce_max_bytes should be 1160");
+
+    // Connection should start with no pending coalesce
+    udp_connection conn;
+    conn.reset();
+    conn.set_active(true);
+    conn.set_state(connection_state::CONNECTED);
+    TEST_ASSERT(!conn.has_pending_coalesce(), "fresh connection should have no pending coalesce");
+
+    return true;
+}
+
+// ============================================================================
+// TEST: Coalesce unreliable echo E2E
+// ============================================================================
+// Send multiple small messages on UNRELIABLE_COALESCED (ch 4), verify all
+// arrive at server even though they may be batched into fewer datagrams.
+// ============================================================================
+
+static bool test_coalesce_unreliable_echo()
+{
+    server srv(9960);
+    srv.channels().register_defaults();
+    std::atomic<bool> stop_flag{false};
+    std::atomic<int> server_msgs{0};
+
+    srv.set_on_client_data_received(
+        [&](const packet_header &header, const uint8_t *payload, size_t payload_size, const endpoint_key &sender)
+        {
+            server_msgs++;
+            srv.send_to(payload, payload_size, header.channel_id, sender);
+        });
+
+    TEST_ASSERT(succeeded(srv.start()), "server should start");
+
+    std::thread server_thread(
+        [&]()
+        {
+            while (!stop_flag.load())
+            {
+                srv.poll();
+                srv.update();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+
+    client c("127.0.0.1", 9960);
+    c.set_verbose(false);
+    c.channels().register_defaults();
+
+    std::atomic<int> echoes{0};
+    c.set_on_data_received(
+        [&](const packet_header &, const uint8_t *, size_t) { echoes++; });
+
+    TEST_ASSERT(succeeded(c.connect()), "client should connect");
+
+    // Send 20 small messages on UNRELIABLE_COALESCED (ch 4)
+    constexpr int N = 20;
+    for (int i = 0; i < N; ++i)
+    {
+        uint32_t val = static_cast<uint32_t>(i);
+        c.send(&val, sizeof(val), channels::UNRELIABLE_COALESCED.id);
+    }
+
+    // Flush + poll loop
+    c.update(nullptr); // triggers flush_all_coalesce
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while ((server_msgs.load() < N || echoes.load() < N / 2) && std::chrono::steady_clock::now() < deadline)
+    {
+        c.poll();
+        c.update(nullptr);
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+
+    // Unreliable on localhost — all should arrive
+    TEST_ASSERT(server_msgs.load() >= N, "server should receive all N coalesced messages");
+    TEST_ASSERT(echoes.load() >= N / 2, "should receive majority of echoes");
+
+    c.disconnect();
+    stop_flag = true;
+    server_thread.join();
+    srv.stop();
+    return true;
+}
+
+// ============================================================================
+// TEST: Coalesce reliable echo E2E
+// ============================================================================
+// Send multiple small messages on RELIABLE_COALESCED (ch 5) with
+// auto-retransmit, verify ALL arrive and are echoed back.
+// ============================================================================
+
+static bool test_coalesce_reliable_echo()
+{
+    server srv(9961);
+    srv.channels().register_defaults();
+    srv.enable_auto_retransmit();
+    std::atomic<bool> stop_flag{false};
+    std::atomic<int> server_msgs{0};
+
+    srv.set_on_client_data_received(
+        [&](const packet_header &header, const uint8_t *payload, size_t payload_size, const endpoint_key &sender)
+        {
+            server_msgs++;
+            srv.send_to(payload, payload_size, header.channel_id, sender);
+        });
+
+    TEST_ASSERT(succeeded(srv.start()), "server should start");
+
+    std::thread server_thread(
+        [&]()
+        {
+            while (!stop_flag.load())
+            {
+                srv.poll();
+                srv.update();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+
+    client c("127.0.0.1", 9961);
+    c.set_verbose(false);
+    c.channels().register_defaults();
+    c.enable_auto_retransmit();
+
+    std::atomic<int> echoes{0};
+    c.set_on_data_received(
+        [&](const packet_header &, const uint8_t *, size_t) { echoes++; });
+
+    TEST_ASSERT(succeeded(c.connect()), "client should connect");
+
+    // Send 30 small messages on RELIABLE_COALESCED (ch 5)
+    constexpr int N = 30;
+    for (int i = 0; i < N; ++i)
+    {
+        uint32_t val = static_cast<uint32_t>(i);
+        c.send(&val, sizeof(val), channels::RELIABLE_COALESCED.id);
+    }
+
+    // Poll loop — update() will flush coalesce + detect losses + retransmit
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (echoes.load() < N && std::chrono::steady_clock::now() < deadline)
+    {
+        c.poll();
+        c.update(nullptr);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    TEST_ASSERT(server_msgs.load() == N, "server should receive all N reliable-coalesced messages");
+    TEST_ASSERT(echoes.load() == N, "client should receive all N echoes");
+
+    c.disconnect();
+    stop_flag = true;
+    server_thread.join();
+    srv.stop();
+    return true;
+}
+
+// ============================================================================
+// TEST: Coalesce ordered echo E2E
+// ============================================================================
+// Send messages on ORDERED_COALESCED (ch 6), verify all arrive and in order.
+// ============================================================================
+
+static bool test_coalesce_ordered_echo()
+{
+    server srv(9962);
+    srv.channels().register_defaults();
+    srv.enable_auto_retransmit();
+    std::atomic<bool> stop_flag{false};
+
+    srv.set_on_client_data_received(
+        [&](const packet_header &header, const uint8_t *payload, size_t payload_size, const endpoint_key &sender)
+        { srv.send_to(payload, payload_size, header.channel_id, sender); });
+
+    TEST_ASSERT(succeeded(srv.start()), "server should start");
+
+    std::thread server_thread(
+        [&]()
+        {
+            while (!stop_flag.load())
+            {
+                srv.poll();
+                srv.update();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+
+    client c("127.0.0.1", 9962);
+    c.set_verbose(false);
+    c.channels().register_defaults();
+    c.enable_auto_retransmit();
+
+    std::vector<uint32_t> echo_order;
+    std::mutex echo_mutex;
+    std::atomic<int> echo_count{0};
+
+    c.set_on_data_received(
+        [&](const packet_header &, const uint8_t *payload, size_t size)
+        {
+            if (size >= sizeof(uint32_t))
+            {
+                uint32_t val;
+                std::memcpy(&val, payload, sizeof(uint32_t));
+                std::lock_guard<std::mutex> lk(echo_mutex);
+                echo_order.push_back(val);
+            }
+            echo_count++;
+        });
+
+    TEST_ASSERT(succeeded(c.connect()), "client should connect");
+
+    // Send 15 ordered messages on ORDERED_COALESCED (ch 6)
+    constexpr int N = 15;
+    for (int i = 0; i < N; ++i)
+    {
+        uint32_t val = static_cast<uint32_t>(i);
+        c.send(&val, sizeof(val), channels::ORDERED_COALESCED.id);
+    }
+
+    // Poll loop
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (echo_count.load() < N && std::chrono::steady_clock::now() < deadline)
+    {
+        c.poll();
+        c.update(nullptr);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    TEST_ASSERT(echo_count.load() == N, "should receive all N ordered echoes");
+
+    // Verify ordering
+    {
+        std::lock_guard<std::mutex> lk(echo_mutex);
+        int violations = 0;
+        for (size_t i = 1; i < echo_order.size(); ++i)
+        {
+            if (echo_order[i] <= echo_order[i - 1])
+                ++violations;
+        }
+        TEST_ASSERT(violations == 0, "ordered echoes must have zero order violations");
+    }
+
+    c.disconnect();
+    stop_flag = true;
+    server_thread.join();
+    srv.stop();
+    return true;
+}
+
+// ============================================================================
+// TEST: Coalesce batching efficiency
+// ============================================================================
+// Verify that N small messages sent on a coalesced channel result in fewer
+// actual datagrams than N messages sent on a non-coalesced channel.
+// Uses local_sequence delta as a proxy for datagram count.
+// ============================================================================
+
+static bool test_coalesce_batching_efficiency()
+{
+    channel_manager cm;
+    cm.register_defaults();
+
+    udp_connection conn;
+    conn.reset();
+    conn.set_active(true);
+    conn.set_state(connection_state::CONNECTED);
+
+    udp_socket sock;
+    auto ec = sock.bind(0);
+    TEST_ASSERT(succeeded(ec), "socket should bind");
+    sock.set_non_blocking(true);
+
+    endpoint_key dest = endpoint_from_string("127.0.0.1", 9999);
+
+    // Send 50 messages on non-coalesced unreliable (ch 1)
+    uint64_t seq_before = conn.local_sequence();
+    for (int i = 0; i < 50; ++i)
+    {
+        uint32_t val = static_cast<uint32_t>(i);
+        conn.send_payload(sock, cm, &val, sizeof(val), 0, channels::UNRELIABLE.id, dest);
+    }
+    uint64_t non_coal_pkts = conn.local_sequence() - seq_before;
+
+    // Reset connection for clean slate
+    conn.reset();
+    conn.set_active(true);
+    conn.set_state(connection_state::CONNECTED);
+
+    // Send 50 messages on coalesced unreliable (ch 4)
+    seq_before = conn.local_sequence();
+    for (int i = 0; i < 50; ++i)
+    {
+        uint32_t val = static_cast<uint32_t>(i);
+        conn.send_payload(sock, cm, &val, sizeof(val), 0, channels::UNRELIABLE_COALESCED.id, dest);
+    }
+    // Flush remaining buffer
+    conn.flush_all_coalesce(sock, cm, dest);
+    uint64_t coal_pkts = conn.local_sequence() - seq_before;
+
+    // Non-coalesced: should use exactly 50 packets (1 per message)
+    TEST_ASSERT(non_coal_pkts == 50, "non-coalesced should use exactly 50 packets");
+
+    // Coalesced: each message is 4 bytes + 2 bytes framing = 6 bytes
+    // Buffer limit ~1160 bytes → ~193 messages per packet → 50 msgs fit in 1 packet
+    // (50 * 6 = 300 bytes < 1160)
+    TEST_ASSERT(coal_pkts <= 2, "coalesced should use far fewer packets (50 msgs of 4B should fit in 1-2 packets)");
+    TEST_ASSERT(coal_pkts >= 1, "coalesced should use at least 1 packet");
+
+    sock.close();
+    return true;
+}
+
+// ============================================================================
+// TEST: Coalesce explicit flush
+// ============================================================================
+// Verify client::flush_coalesce() sends buffered data immediately.
+// ============================================================================
+
+static bool test_coalesce_explicit_flush()
+{
+    server srv(9963);
+    srv.channels().register_defaults();
+    std::atomic<bool> stop_flag{false};
+    std::atomic<int> server_msgs{0};
+
+    srv.set_on_client_data_received(
+        [&](const packet_header &, const uint8_t *, size_t, const endpoint_key &)
+        { server_msgs++; });
+
+    TEST_ASSERT(succeeded(srv.start()), "server should start");
+
+    std::thread server_thread(
+        [&]()
+        {
+            while (!stop_flag.load())
+            {
+                srv.poll();
+                srv.update();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+
+    client c("127.0.0.1", 9963);
+    c.set_verbose(false);
+    c.channels().register_defaults();
+    TEST_ASSERT(succeeded(c.connect()), "client should connect");
+
+    // Send 5 messages but don't call update() yet
+    for (int i = 0; i < 5; ++i)
+    {
+        uint32_t val = static_cast<uint32_t>(i);
+        c.send(&val, sizeof(val), channels::UNRELIABLE_COALESCED.id);
+    }
+
+    // Explicit flush should send the batch
+    c.flush_coalesce();
+
+    // Wait for server to receive
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (server_msgs.load() < 5 && std::chrono::steady_clock::now() < deadline)
+    {
+        c.poll();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    TEST_ASSERT(server_msgs.load() == 5, "server should receive all 5 messages after explicit flush");
+
+    c.disconnect();
+    stop_flag = true;
+    server_thread.join();
+    srv.stop();
+    return true;
+}
+
+// ============================================================================
+// TEST: Coalesce data integrity
+// ============================================================================
+// Send messages with known payloads on coalesced channel, verify exact
+// byte-perfect delivery on server side.
+// ============================================================================
+
+static bool test_coalesce_data_integrity()
+{
+    server srv(9964);
+    srv.channels().register_defaults();
+    srv.enable_auto_retransmit();
+    std::atomic<bool> stop_flag{false};
+
+    std::mutex recv_mutex;
+    std::vector<std::vector<uint8_t>> received_payloads;
+
+    srv.set_on_client_data_received(
+        [&](const packet_header &, const uint8_t *payload, size_t payload_size, const endpoint_key &)
+        {
+            std::lock_guard<std::mutex> lk(recv_mutex);
+            received_payloads.emplace_back(payload, payload + payload_size);
+        });
+
+    TEST_ASSERT(succeeded(srv.start()), "server should start");
+
+    std::thread server_thread(
+        [&]()
+        {
+            while (!stop_flag.load())
+            {
+                srv.poll();
+                srv.update();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+
+    client c("127.0.0.1", 9964);
+    c.set_verbose(false);
+    c.channels().register_defaults();
+    c.enable_auto_retransmit();
+    TEST_ASSERT(succeeded(c.connect()), "client should connect");
+
+    // Send 10 messages with unique payloads (different sizes)
+    constexpr int N = 10;
+    std::vector<std::vector<uint8_t>> sent_payloads;
+    for (int i = 0; i < N; ++i)
+    {
+        size_t msg_size = 8 + i * 12; // 8, 20, 32, ... 116 bytes
+        std::vector<uint8_t> buf(msg_size);
+        for (size_t j = 0; j < msg_size; ++j)
+            buf[j] = static_cast<uint8_t>((i * 37 + j) & 0xFF);
+        sent_payloads.push_back(buf);
+        c.send(buf.data(), buf.size(), channels::RELIABLE_COALESCED.id);
+    }
+
+    // Poll loop
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (true)
+    {
+        {
+            std::lock_guard<std::mutex> lk(recv_mutex);
+            if (static_cast<int>(received_payloads.size()) >= N)
+                break;
+        }
+        if (std::chrono::steady_clock::now() >= deadline)
+            break;
+        c.poll();
+        c.update(nullptr);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(recv_mutex);
+        TEST_ASSERT(static_cast<int>(received_payloads.size()) == N,
+                    "server should receive exactly N messages");
+
+        // Verify each payload is byte-perfect
+        for (int i = 0; i < N; ++i)
+        {
+            TEST_ASSERT(received_payloads[i].size() == sent_payloads[i].size(),
+                        "message size should match");
+            TEST_ASSERT(received_payloads[i] == sent_payloads[i],
+                        "message data should match byte-for-byte");
+        }
+    }
+
+    c.disconnect();
+    stop_flag = true;
+    server_thread.join();
+    srv.stop();
+    return true;
+}
+
 int main()
 {
     platform_init();
@@ -4241,6 +4746,15 @@ int main()
     // -- Boundary payloads --
     register_test("Zero-length payload", test_zero_length_payload);
     register_test("Exact MAX_PAYLOAD_SIZE", test_exact_max_payload);
+
+    // -- Message coalescing --
+    register_test("Coalesce buffer unit", test_coalesce_buffer_unit);
+    register_test("Coalesce unreliable echo", test_coalesce_unreliable_echo);
+    register_test("Coalesce reliable echo", test_coalesce_reliable_echo);
+    register_test("Coalesce ordered echo", test_coalesce_ordered_echo);
+    register_test("Coalesce batching efficiency", test_coalesce_batching_efficiency);
+    register_test("Coalesce explicit flush", test_coalesce_explicit_flush);
+    register_test("Coalesce data integrity", test_coalesce_data_integrity);
 
     std::cout << "========================================" << std::endl;
     std::cout << " Entanglement Test Battery" << std::endl;

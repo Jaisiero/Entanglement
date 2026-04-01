@@ -146,6 +146,11 @@ namespace entanglement
     constexpr size_t RETRANSMIT_BUFFER_SIZE = 64; // Max buffered payloads for auto-retransmit per connection
     constexpr int MAX_RETRANSMIT_ATTEMPTS = 5;    // Max times a single packet is auto-retransmitted
 
+    // --- Message coalescing ---
+    constexpr size_t COALESCE_FRAMING_SIZE = 2;   // uint16_t length prefix per sub-message
+    constexpr size_t MAX_COALESCE_PAYLOAD =
+        MAX_PACKET_SIZE - PACKET_HEADER_SIZE;     // Max coalesce buffer (~1166 bytes)
+
     // --- Sequence comparison helpers (wrap-safe, half-range modular arithmetic) ---
     // Works correctly across uint32_t wrap-around as long as the gap < 2^31.
     inline bool sequence_greater_than(uint32_t a, uint32_t b)

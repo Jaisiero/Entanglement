@@ -115,6 +115,12 @@ namespace entanglement
         void enable_auto_retransmit() { m_connection.enable_auto_retransmit(); }
         bool auto_retransmit_enabled() const { return m_connection.auto_retransmit_enabled(); }
 
+        // Flush all pending coalesced message buffers immediately.
+        void flush_coalesce()
+        {
+            m_connection.flush_all_coalesce(m_socket, m_channels, m_server_endpoint);
+        }
+
         // Congestion control: application queries these to pace sends
         bool can_send() const { return m_connection.can_send(); }
         congestion_info congestion() const { return m_connection.congestion(); }

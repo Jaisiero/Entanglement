@@ -73,6 +73,16 @@ namespace entanglement
             op.active = false;
         for (auto &om : m_ordered_msg_buffer)
             om.active = false;
+
+        // Reset coalesce buffers (keep allocation)
+        for (auto &cb : m_coalesce)
+        {
+            if (cb)
+            {
+                cb->used = 0;
+                cb->msg_count = 0;
+            }
+        }
     }
 
     // --- Sending side ---
@@ -610,6 +620,43 @@ namespace entanglement
                                      uint32_t *out_message_id, uint64_t *out_sequence, uint32_t channel_sequence,
                                      uint32_t *out_channel_sequence)
     {
+        // --- Message coalescing path ---
+        // For coalesced channels, append the message to a per-channel buffer.
+        // The buffer is flushed when full or at the end of update().
+        // Only applies to single-packet-sized messages (not fragmented).
+        if (channels.is_coalesced(channel_id) && size <= MAX_PAYLOAD_SIZE &&
+            size + COALESCE_FRAMING_SIZE <= MAX_COALESCE_PAYLOAD)
+        {
+            auto &buf = ensure_coalesce(channel_id);
+            uint16_t framed_size = static_cast<uint16_t>(COALESCE_FRAMING_SIZE + size);
+
+            // If appending would overflow, flush the current buffer first
+            if (buf.used + framed_size > channels.coalesce_max_bytes(channel_id) ||
+                buf.used + framed_size > MAX_COALESCE_PAYLOAD)
+            {
+                flush_coalesce(channel_id, socket, channels, dest);
+            }
+
+            // Append [len:2B][data] to the buffer
+            uint16_t msg_len = static_cast<uint16_t>(size);
+            std::memcpy(buf.data + buf.used, &msg_len, sizeof(msg_len));
+            buf.used += sizeof(msg_len);
+            if (size > 0 && data)
+            {
+                std::memcpy(buf.data + buf.used, data, size);
+                buf.used += static_cast<uint16_t>(size);
+            }
+            ++buf.msg_count;
+
+            if (out_message_id)
+                *out_message_id = 0;
+            if (out_sequence)
+                *out_sequence = 0;
+            if (out_channel_sequence)
+                *out_channel_sequence = 0;
+            return static_cast<int>(size);
+        }
+
         // Single-packet path (no fragmentation overhead)
         if (size <= MAX_PAYLOAD_SIZE)
         {
@@ -963,6 +1010,63 @@ namespace entanglement
             }
         }
 
+        return false;
+    }
+
+    // --- Message coalescing ---
+
+    udp_connection::coalesce_buffer &udp_connection::ensure_coalesce(uint8_t channel_id)
+    {
+        if (!m_coalesce[channel_id])
+            m_coalesce[channel_id] = std::make_unique<coalesce_buffer>();
+        return *m_coalesce[channel_id];
+    }
+
+    void udp_connection::flush_coalesce(uint8_t channel_id, udp_socket &socket, const channel_manager &channels,
+                                        const endpoint_key &dest)
+    {
+        auto &buf_ptr = m_coalesce[channel_id];
+        if (!buf_ptr || buf_ptr->used == 0)
+            return;
+
+        auto &buf = *buf_ptr;
+
+        packet_header header{};
+        header.flags = FLAG_COALESCED;
+        header.channel_id = channel_id;
+        header.payload_size = buf.used;
+        bool reliable = channels.is_reliable(channel_id);
+        prepare_header(header, reliable);
+
+        // Store for auto-retransmit (reliable channels only)
+        if (reliable && m_retransmit)
+            m_retransmit->store(header.sequence, buf.data, buf.used, header.flags, channel_id,
+                                header.channel_sequence, 0, 0, 0);
+
+        socket.send_packet(header, buf.data, dest);
+
+        // Reset buffer for next batch
+        buf.used = 0;
+        buf.msg_count = 0;
+    }
+
+    void udp_connection::flush_all_coalesce(udp_socket &socket, const channel_manager &channels,
+                                            const endpoint_key &dest)
+    {
+        for (size_t i = 0; i < MAX_CHANNELS; ++i)
+        {
+            if (m_coalesce[i] && m_coalesce[i]->used > 0)
+                flush_coalesce(static_cast<uint8_t>(i), socket, channels, dest);
+        }
+    }
+
+    bool udp_connection::has_pending_coalesce() const
+    {
+        for (size_t i = 0; i < MAX_CHANNELS; ++i)
+        {
+            if (m_coalesce[i] && m_coalesce[i]->used > 0)
+                return true;
+        }
         return false;
     }
 
