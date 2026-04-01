@@ -191,7 +191,41 @@ namespace entanglement
                                reinterpret_cast<sockaddr *>(&addr), sizeof(addr), nullptr, nullptr);
         return (result == 0) ? static_cast<int>(bytes_sent) : -1;
 #else
-        // sendmsg scatter-gather — no intermediate buffer copy
+        // --- Linux: batch-mode or immediate sendmsg ---
+        if (m_send_batch_mode)
+        {
+            // Linearise header + payload into the current batch slot
+            auto &slot = m_send_slots[m_send_batch_count];
+            slot.dest = addr;
+
+            uint8_t *p = slot.buffer;
+            std::memcpy(p, &header, sizeof(packet_header));
+            p += sizeof(packet_header);
+            for (size_t i = 0; i < count; ++i)
+            {
+                std::memcpy(p, segments[i], sizes[i]);
+                p += sizes[i];
+            }
+            size_t pkt_size = static_cast<size_t>(p - slot.buffer);
+
+            slot.iov.iov_base = slot.buffer;
+            slot.iov.iov_len = pkt_size;
+
+            auto &mh = m_send_mmsg[m_send_batch_count];
+            std::memset(&mh, 0, sizeof(mh));
+            mh.msg_hdr.msg_name = &slot.dest;
+            mh.msg_hdr.msg_namelen = sizeof(sockaddr_in);
+            mh.msg_hdr.msg_iov = &slot.iov;
+            mh.msg_hdr.msg_iovlen = 1;
+
+            ++m_send_batch_count;
+            if (m_send_batch_count >= SEND_BATCH_MAX)
+                flush_send_batch();
+
+            return static_cast<int>(total);
+        }
+
+        // Immediate sendmsg scatter-gather — no intermediate buffer copy
         struct iovec iov[MAX_GATHER_SEGMENTS + 1]; // slot 0 = header, rest = payload segments
         iov[0].iov_base = const_cast<packet_header *>(&header);
         iov[0].iov_len = sizeof(packet_header);
@@ -576,6 +610,45 @@ namespace entanglement
         m_recv_slots.reset();
         m_mmsg_hdrs.reset();
         m_epoll_pool_size = 0;
+    }
+
+    // --- sendmmsg batch send ---
+
+    void udp_socket::begin_send_batch()
+    {
+        // Lazily allocate on first call
+        if (!m_send_slots)
+        {
+            m_send_slots = std::make_unique<sendmmsg_slot[]>(SEND_BATCH_MAX);
+            m_send_mmsg = std::make_unique<struct mmsghdr[]>(SEND_BATCH_MAX);
+        }
+        m_send_batch_mode = true;
+        m_send_batch_count = 0;
+    }
+
+    int udp_socket::flush_send_batch()
+    {
+        m_send_batch_mode = false;
+
+        if (m_send_batch_count == 0)
+            return 0;
+
+        int total_sent = 0;
+        int remaining = m_send_batch_count;
+        int offset = 0;
+
+        while (remaining > 0)
+        {
+            int sent = sendmmsg(m_socket, &m_send_mmsg[offset], remaining, 0);
+            if (sent <= 0)
+                break;
+            total_sent += sent;
+            offset += sent;
+            remaining -= sent;
+        }
+
+        m_send_batch_count = 0;
+        return total_sent;
     }
 
 #endif // ENTANGLEMENT_PLATFORM_LINUX

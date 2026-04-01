@@ -119,6 +119,10 @@ namespace entanglement
         void shutdown_iocp();
 
         bool iocp_enabled() const { return m_iocp_enabled; }
+
+        // No-op batch send on Windows – individual WSASendTo is already efficient.
+        void begin_send_batch() {}
+        int flush_send_batch() { return 0; }
 #endif
 
 #ifdef ENTANGLEMENT_PLATFORM_LINUX
@@ -137,6 +141,17 @@ namespace entanglement
         void shutdown_epoll();
 
         bool epoll_enabled() const { return m_epoll_enabled; }
+
+        // --- sendmmsg batch send ---
+
+        // Enable send batching: subsequent send_packet / send_packet_gather calls
+        // buffer packets instead of sending immediately.  Call flush_send_batch()
+        // to send all buffered packets in a single sendmmsg() syscall.
+        void begin_send_batch();
+
+        // Flush all buffered sends via sendmmsg. Returns number of packets sent.
+        // Automatically exits batch mode.
+        int flush_send_batch();
 #endif
 
 #ifdef ENTANGLEMENT_SIMULATE_LOSS
@@ -181,6 +196,21 @@ namespace entanglement
         };
         std::unique_ptr<recvmmsg_slot[]> m_recv_slots;
         std::unique_ptr<struct mmsghdr[]> m_mmsg_hdrs;
+
+        // --- sendmmsg batch send ---
+        static constexpr int SEND_BATCH_MAX = 64;
+
+        struct sendmmsg_slot
+        {
+            uint8_t buffer[MAX_PACKET_SIZE]{};
+            sockaddr_in dest{};
+            struct iovec iov{};
+        };
+
+        bool m_send_batch_mode = false;
+        int m_send_batch_count = 0;
+        std::unique_ptr<sendmmsg_slot[]> m_send_slots;
+        std::unique_ptr<struct mmsghdr[]> m_send_mmsg;
 #endif
 
 #ifdef ENTANGLEMENT_SIMULATE_LOSS
