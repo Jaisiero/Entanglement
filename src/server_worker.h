@@ -157,9 +157,15 @@ namespace entanglement
         void set_thread_id(std::thread::id id) { m_thread_id = id; }
         std::thread::id thread_id() const { return m_thread_id; }
 
+        // Assign a dedicated send socket for this worker (eliminates socket-lock
+        // contention when multiple workers send concurrently).  When not set,
+        // the shared receive socket is used for both send and receive.
+        void set_send_socket(udp_socket *s) { m_send_socket = s ? s : m_socket; }
+
     private:
         // Shared resources (not owned)
-        udp_socket *m_socket = nullptr;
+        udp_socket *m_socket = nullptr;      // receive (and default send) socket
+        udp_socket *m_send_socket = nullptr; // per-worker send socket (may == m_socket)
         channel_manager *m_channels = nullptr;
         const std::atomic<bool> *m_running = nullptr;
 

@@ -12,6 +12,7 @@ namespace entanglement
                              const std::atomic<bool> *running_flag, int recv_queue_count)
     {
         m_socket = socket;
+        m_send_socket = socket; // default: shared socket for send + recv
         m_channels = channels;
         m_running = running_flag;
         m_pool_capacity = pool_capacity;
@@ -196,7 +197,7 @@ namespace entanglement
 
             // Flush pending ACKs promptly so the remote's RTT isn't inflated
             if (conn.needs_ack_flush(now))
-                conn.send_ack_flush(*m_socket, key);
+                conn.send_ack_flush(*m_send_socket, key);
 
             // Loss detection
             if (loss_callback || m_on_packet_lost)
@@ -207,7 +208,7 @@ namespace entanglement
                 for (int l = 0; l < loss_count; ++l)
                 {
                     if (conn.auto_retransmit_enabled() &&
-                        conn.try_auto_retransmit(lost[l], *m_socket, *m_channels, key))
+                        conn.try_auto_retransmit(lost[l], *m_send_socket, *m_channels, key))
                         continue;
                     cb(lost[l], key);
                 }
@@ -219,7 +220,7 @@ namespace entanglement
                 if (conn.auto_retransmit_enabled())
                 {
                     for (int l = 0; l < loss_count; ++l)
-                        conn.try_auto_retransmit(lost[l], *m_socket, *m_channels, key);
+                        conn.try_auto_retransmit(lost[l], *m_send_socket, *m_channels, key);
                 }
             }
 
@@ -275,7 +276,7 @@ namespace entanglement
             // dropped ACK, collapsing the congestion window under loss.
             conn->prepare_header(header, /*reliable=*/false, m_cached_now);
         }
-        return m_socket->send_packet(header, payload, dest);
+        return m_send_socket->send_packet(header, payload, dest);
     }
 
     int server_worker::send_to(const void *data, size_t size, uint8_t channel_id, const endpoint_key &dest,
@@ -284,7 +285,7 @@ namespace entanglement
         udp_connection *conn = find(dest);
         if (!conn || conn->state() == connection_state::DISCONNECTED)
             return static_cast<int>(error_code::not_connected);
-        return conn->send_payload(*m_socket, *m_channels, data, size, flags, channel_id, dest, out_message_id);
+        return conn->send_payload(*m_send_socket, *m_channels, data, size, flags, channel_id, dest, out_message_id);
     }
 
     int server_worker::send_fragment_to(uint32_t message_id, uint8_t fragment_index, uint8_t fragment_count,
@@ -294,7 +295,7 @@ namespace entanglement
         udp_connection *conn = find(dest);
         if (!conn || conn->state() == connection_state::DISCONNECTED)
             return static_cast<int>(error_code::not_connected);
-        return conn->send_fragment(*m_socket, *m_channels, message_id, fragment_index, fragment_count, data, size,
+        return conn->send_fragment(*m_send_socket, *m_channels, message_id, fragment_index, fragment_count, data, size,
                                    flags, channel_id, dest, channel_sequence);
     }
 
@@ -644,7 +645,7 @@ namespace entanglement
         header.channel_id = channels::CONTROL.id;
         header.payload_size = static_cast<uint16_t>(size);
         conn->prepare_header(header, true, m_cached_now);
-        m_socket->send_packet(header, payload, dest);
+        m_send_socket->send_packet(header, payload, dest);
     }
 
     void server_worker::send_raw_control(uint8_t control_type, const endpoint_key &dest)
@@ -657,7 +658,7 @@ namespace entanglement
         header.ack = 0;
         header.ack_bitmap = 0;
         header.payload_size = 1;
-        m_socket->send_packet(header, &control_type, dest);
+        m_send_socket->send_packet(header, &control_type, dest);
     }
 
 } // namespace entanglement

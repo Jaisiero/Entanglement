@@ -176,6 +176,11 @@ namespace entanglement
         // m_socket is always the primary (index 0). These are indices 1..N-1.
         std::vector<udp_socket> m_extra_recv_sockets;
 
+        // Per-worker send sockets (one per worker in multi-threaded mode).
+        // Eliminates kernel socket-lock contention when workers send concurrently.
+        // Each binds to the server port so the source address matches.
+        std::vector<udp_socket> m_worker_send_sockets;
+
         // Threading (multi-threaded mode only)
         std::thread m_receiver_thread;                     // Primary receiver (socket index 0)
         std::vector<std::thread> m_extra_receiver_threads; // Extra receivers (socket indices 1..N-1)

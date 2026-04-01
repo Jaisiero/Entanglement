@@ -41,6 +41,66 @@ namespace entanglement
             w->set_auto_retransmit(m_auto_retransmit);
             m_workers.push_back(std::move(w));
         }
+
+        // --- Per-worker send sockets ---
+        // Eliminates kernel socket-lock contention when workers send concurrently.
+        m_worker_send_sockets.clear();
+        if (actual > 1)
+        {
+#ifdef ENTANGLEMENT_PLATFORM_LINUX
+            // On Linux, extra sockets bound to the same port (even SO_REUSEADDR only)
+            // steal inbound packets. Instead, when SO_REUSEPORT multi-socket mode is
+            // active, reuse the existing recv sockets for sending:
+            //   worker 0 → m_socket (already the default from init())
+            //   worker i → m_extra_recv_sockets[i-1]
+            // This gives 1:1 contention (recv+send on same socket) instead of N:1.
+            if (!m_extra_recv_sockets.empty())
+            {
+                int shared_sockets = 1 + static_cast<int>(m_extra_recv_sockets.size());
+                int assignable = std::min(actual, shared_sockets);
+                for (int i = 1; i < assignable; ++i)
+                    m_workers[static_cast<size_t>(i)]->set_send_socket(
+                        &m_extra_recv_sockets[static_cast<size_t>(i - 1)]);
+                if (m_verbose)
+                    std::cout << "[server] Per-worker send: reusing " << assignable << " recv sockets (SO_REUSEPORT)"
+                              << std::endl;
+            }
+#else
+            // On Windows, SO_REUSEADDR allows multiple UDP sockets bound to the
+            // same port without inbound packet distribution (no SO_REUSEPORT).
+            // Create dedicated per-worker send sockets.
+            m_worker_send_sockets.resize(static_cast<size_t>(actual));
+            bool all_ok = true;
+            for (int i = 0; i < actual; ++i)
+            {
+                auto &ss = m_worker_send_sockets[static_cast<size_t>(i)];
+                if (auto ec = ss.bind(m_port, m_bind_address, /*reuse_port=*/false); failed(ec))
+                {
+                    if (m_verbose)
+                        std::cerr << "[server] Per-worker send socket " << i
+                                  << " bind failed, falling back to shared socket" << std::endl;
+                    all_ok = false;
+                    break;
+                }
+                ss.set_non_blocking(true);
+            }
+
+            if (all_ok)
+            {
+                for (int i = 0; i < actual; ++i)
+                    m_workers[static_cast<size_t>(i)]->set_send_socket(&m_worker_send_sockets[static_cast<size_t>(i)]);
+                if (m_verbose)
+                    std::cout << "[server] Per-worker send sockets enabled (" << actual << " sockets)" << std::endl;
+            }
+            else
+            {
+                for (auto &ss : m_worker_send_sockets)
+                    ss.close();
+                m_worker_send_sockets.clear();
+            }
+#endif
+        }
+
         propagate_callbacks();
     }
 
@@ -214,7 +274,7 @@ namespace entanglement
 #elif defined(ENTANGLEMENT_PLATFORM_LINUX)
                     std::cout << ", epoll";
                     if (!m_extra_recv_sockets.empty())
-                        std::cout << ", " << (m_extra_recv_sockets.size() + 1) << " sockets (SO_REUSEPORT)";
+                        std::cout << ", " << (m_extra_recv_sockets.size() + 1) << " recv sockets (SO_REUSEPORT)";
 #endif
                 }
                 std::cout << ")";
@@ -253,6 +313,9 @@ namespace entanglement
         for (auto &s : m_extra_recv_sockets)
             s.close();
         m_extra_recv_sockets.clear();
+        for (auto &s : m_worker_send_sockets)
+            s.close();
+        m_worker_send_sockets.clear();
         m_workers.clear();
 
         if (m_verbose)
