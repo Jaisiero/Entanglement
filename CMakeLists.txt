@@ -16,7 +16,7 @@ option(ENTANGLEMENT_SIMULATE_LOSS "Enable simulated packet loss for testing" OFF
 file(GLOB_RECURSE LIB_SOURCES CONFIGURE_DEPENDS "src/*.cpp")
 
 add_library(entanglement_core STATIC ${LIB_SOURCES})
-target_include_directories(entanglement_core PUBLIC src)
+target_include_directories(entanglement_core PUBLIC src include)
 
 if(ENTANGLEMENT_SIMULATE_LOSS)
     target_compile_definitions(entanglement_core PUBLIC ENTANGLEMENT_SIMULATE_LOSS)
