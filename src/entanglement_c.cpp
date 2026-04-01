@@ -79,6 +79,8 @@ static channel_config to_cpp_config(const ent_channel_config &cc)
     cfg.id = cc.id;
     cfg.mode = to_cpp_mode(cc.mode);
     cfg.priority = cc.priority;
+    cfg.coalesce = cc.coalesce != 0;
+    cfg.coalesce_max_bytes = cc.coalesce_max_bytes;
     std::memset(cfg.name, 0, sizeof(cfg.name));
     std::strncpy(cfg.name, cc.name, MAX_CHANNEL_NAME - 1);
     return cfg;
@@ -408,6 +410,12 @@ void ent_client_set_reassembly_timeout(ent_client_t *c, int64_t timeout_us)
         c->cpp.set_reassembly_timeout(timeout_us);
 }
 
+void ent_client_flush_coalesce(ent_client_t *c)
+{
+    if (c)
+        c->cpp.flush_coalesce();
+}
+
 void ent_client_set_verbose(ent_client_t *c, int verbose)
 {
     if (c)
@@ -577,6 +585,17 @@ int ent_server_auto_retransmit_enabled(const ent_server_t *s)
     return s ? s->cpp.auto_retransmit_enabled() : 0;
 }
 
+void ent_server_flush_coalesce(ent_server_t *s, ent_endpoint dest)
+{
+    if (s)
+    {
+        endpoint_key key{};
+        key.address = dest.address;
+        key.port = dest.port;
+        s->cpp.flush_coalesce(key);
+    }
+}
+
 void ent_server_set_verbose(ent_server_t *s, int verbose)
 {
     if (s)
@@ -608,6 +627,26 @@ void ent_server_set_on_client_data(ent_server_t *s, ent_on_client_data_fn fn, vo
     else
     {
         s->cpp.set_on_client_data_received(nullptr);
+    }
+}
+
+void ent_server_set_on_coalesced_data(ent_server_t *s, ent_on_coalesced_data_fn fn, void *user_data)
+{
+    if (!s)
+        return;
+    if (fn)
+    {
+        s->cpp.set_on_coalesced_data(
+            [fn, user_data](const packet_header &hdr, const uint8_t *raw_payload, size_t size, int msg_count,
+                            const endpoint_key &sender)
+            {
+                ent_packet_header ch = to_c_header(hdr);
+                fn(&ch, raw_payload, size, msg_count, to_c(sender), user_data);
+            });
+    }
+    else
+    {
+        s->cpp.set_on_coalesced_data(nullptr);
     }
 }
 

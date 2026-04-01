@@ -110,6 +110,8 @@ namespace entanglement
         {
             if (m_on_client_data_received)
                 w->set_on_client_data_received(m_on_client_data_received);
+            if (m_on_coalesced_data)
+                w->set_on_coalesced_data(m_on_coalesced_data);
             if (m_on_client_connected)
                 w->set_on_client_connected(m_on_client_connected);
             if (m_on_client_disconnected)
@@ -483,6 +485,13 @@ namespace entanglement
             w->set_on_client_data_received(callback);
     }
 
+    void server::set_on_coalesced_data(on_client_coalesced_data callback)
+    {
+        m_on_coalesced_data = callback;
+        for (auto &w : m_workers)
+            w->set_on_coalesced_data(callback);
+    }
+
     void server::set_on_client_connected(on_client_connected callback)
     {
         m_on_client_connected = std::move(callback);
@@ -644,6 +653,14 @@ namespace entanglement
     {
         for (auto &w : m_workers)
             w->disconnect_all();
+    }
+
+    void server::flush_coalesce(const endpoint_key &dest)
+    {
+        if (m_workers.empty())
+            return;
+        size_t w = worker_index(dest);
+        m_workers[w]->flush_coalesce_for(dest);
     }
 
     // -----------------------------------------------------------------------

@@ -50,8 +50,9 @@ namespace entanglement
         // A reliable packet was detected as lost (RTO expired)
         void on_packet_lost();
 
-        // An unreliable packet expired without ACK — reclaim in_flight only,
-        // no congestion response (unreliable loss is expected and non-actionable).
+        // An unreliable packet expired without ACK — reclaim in_flight and
+        // apply congestion response when loss rate exceeds tolerance.
+        // Prevents unreliable channels from saturating the link.
         void on_packet_expired();
 
         // --- Queries (read by application via client/connection) ---

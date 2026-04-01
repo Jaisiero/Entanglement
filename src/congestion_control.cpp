@@ -92,12 +92,30 @@ namespace entanglement
     void congestion_control::on_packet_expired()
     {
         // Reclaim in_flight for timed-out unreliable packets.
-        // No congestion response — unreliable packets are fire-and-forget;
-        // their expiry doesn't indicate congestion the same way reliable loss does.
         if (m_in_flight > 0)
         {
             --m_in_flight;
         }
+
+        // Update EWMA loss rate: expired = lost for congestion purposes
+        m_loss_rate = m_loss_rate * (1.0 - CC_LOSS_ALPHA) + CC_LOSS_ALPHA;
+
+        // Apply congestion response when loss rate exceeds tolerance.
+        // Without this, unreliable channels never reduce cwnd and can
+        // saturate the link because only ACKs grow the window.
+        if (m_loss_rate < CC_LOSS_TOLERANCE)
+            return;
+
+        auto now = std::chrono::steady_clock::now();
+        auto since_last = std::chrono::duration_cast<std::chrono::microseconds>(now - m_last_cwnd_reduction).count();
+        int64_t guard = (m_srtt_us > 0.0) ? static_cast<int64_t>(m_srtt_us) : MIN_RTO_US;
+        if (since_last < guard)
+            return;
+
+        m_last_cwnd_reduction = now;
+        m_ssthresh = std::max(static_cast<uint32_t>(m_cwnd * CC_BETA), MIN_CWND);
+        m_cwnd = m_ssthresh;
+        m_cwnd_accumulator = 0.0;
     }
 
     // --- Queries ---

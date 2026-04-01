@@ -85,6 +85,9 @@ namespace entanglement
         register_channel(channels::UNRELIABLE);
         register_channel(channels::RELIABLE);
         register_channel(channels::ORDERED);
+        register_channel(channels::UNRELIABLE_COALESCED);
+        register_channel(channels::RELIABLE_COALESCED);
+        register_channel(channels::ORDERED_COALESCED);
     }
 
     void channel_manager::rebuild_ordered_cache()

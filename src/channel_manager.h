@@ -23,17 +23,22 @@ namespace entanglement
     {
         uint8_t id = 0;
         channel_mode mode = channel_mode::UNRELIABLE;
-        uint8_t priority = 0; // Higher = more important (0–255)
+        uint8_t priority = 0;               // Higher = more important (0–255)
+        bool coalesce = false;              // Batch small messages into a single datagram
+        uint16_t coalesce_max_bytes = 1160; // Flush when buffer reaches this size (default ~MAX_FRAGMENT_PAYLOAD)
         char name[MAX_CHANNEL_NAME] = {};
     };
 
     // constexpr helper to build a channel_config with a string literal name
-    constexpr channel_config make_channel_config(uint8_t id, channel_mode mode, uint8_t priority, const char *src)
+    constexpr channel_config make_channel_config(uint8_t id, channel_mode mode, uint8_t priority, const char *src,
+                                                 bool coalesce = false, uint16_t coalesce_max_bytes = 1160)
     {
         channel_config cfg{};
         cfg.id = id;
         cfg.mode = mode;
         cfg.priority = priority;
+        cfg.coalesce = coalesce;
+        cfg.coalesce_max_bytes = coalesce_max_bytes;
         for (size_t i = 0; i < MAX_CHANNEL_NAME - 1 && src[i] != '\0'; ++i)
         {
             cfg.name[i] = src[i];
@@ -49,6 +54,14 @@ namespace entanglement
         constexpr channel_config UNRELIABLE = make_channel_config(1, channel_mode::UNRELIABLE, 64, "unreliable");
         constexpr channel_config RELIABLE = make_channel_config(2, channel_mode::RELIABLE, 128, "reliable");
         constexpr channel_config ORDERED = make_channel_config(3, channel_mode::RELIABLE_ORDERED, 128, "ordered");
+
+        // Coalesced variants — batch small messages into fewer datagrams for higher throughput
+        constexpr channel_config UNRELIABLE_COALESCED =
+            make_channel_config(4, channel_mode::UNRELIABLE, 64, "unreliable_coal", true);
+        constexpr channel_config RELIABLE_COALESCED =
+            make_channel_config(5, channel_mode::RELIABLE, 128, "reliable_coal", true);
+        constexpr channel_config ORDERED_COALESCED =
+            make_channel_config(6, channel_mode::RELIABLE_ORDERED, 128, "ordered_coal", true);
     } // namespace channels
 
     // --- Channel manager ---
@@ -78,7 +91,12 @@ namespace entanglement
         // Quick mode queries
         bool is_reliable(uint8_t id) const;
         bool is_ordered(uint8_t id) const;
+        bool is_coalesced(uint8_t id) const { return m_registered[id] && m_channels[id].coalesce; }
         uint8_t priority(uint8_t id) const;
+        uint16_t coalesce_max_bytes(uint8_t id) const
+        {
+            return m_registered[id] ? m_channels[id].coalesce_max_bytes : uint16_t(0);
+        }
 
         // Is this channel ID registered?
         bool is_registered(uint8_t id) const { return m_registered[id]; }

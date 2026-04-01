@@ -31,6 +31,7 @@ namespace entanglement
 
         // Callbacks
         void set_on_client_data_received(on_client_data_received callback);
+        void set_on_coalesced_data(on_client_coalesced_data callback);
         void set_on_client_connected(on_client_connected callback);
         void set_on_client_disconnected(on_client_disconnected callback);
         void set_on_channel_requested(on_channel_requested callback);
@@ -64,6 +65,9 @@ namespace entanglement
 
         // Disconnect all clients
         void disconnect_all();
+
+        // Flush coalesced message buffers for a specific client.
+        void flush_coalesce(const endpoint_key &dest);
 
         uint16_t port() const { return m_port; }
 
@@ -153,6 +157,7 @@ namespace entanglement
         on_message_failed m_frag_failed_cb;
 
         on_client_data_received m_on_client_data_received;
+        on_client_coalesced_data m_on_coalesced_data;
         on_client_connected m_on_client_connected;
         on_client_disconnected m_on_client_disconnected;
         on_channel_requested m_on_channel_requested;

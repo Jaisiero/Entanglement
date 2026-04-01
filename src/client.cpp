@@ -197,10 +197,33 @@ namespace entanglement
             }
 
             // Data packets — only when connected
-            if (m_connection.state() == connection_state::CONNECTED && m_on_data_received)
+            // Skip ack-only packets (sequence 0): they carry no user data.
+            if (m_connection.state() == connection_state::CONNECTED && m_on_data_received && header.sequence > 0)
             {
+                // Coalesced packets: unpack sub-messages
+                if (header.flags & FLAG_COALESCED)
+                {
+                    uint16_t offset = 0;
+                    while (offset + COALESCE_FRAMING_SIZE <= header.payload_size)
+                    {
+                        uint16_t msg_len = 0;
+                        std::memcpy(&msg_len, payload + offset, sizeof(msg_len));
+                        offset += COALESCE_FRAMING_SIZE;
+                        if (msg_len == 0 || offset + msg_len > header.payload_size)
+                            break;
+                        // Build a synthetic header for each sub-message
+                        packet_header sub_hdr = header;
+                        sub_hdr.flags &= ~FLAG_COALESCED;
+                        sub_hdr.payload_size = msg_len;
+                        if (!m_connection.deliver_ordered(sub_hdr, payload + offset, msg_len, m_channels))
+                        {
+                            m_on_data_received(sub_hdr, payload + offset, msg_len);
+                        }
+                        offset += msg_len;
+                    }
+                }
                 // RELIABLE_ORDERED channels: deliver_ordered handles hold-back + drain
-                if (!m_connection.deliver_ordered(header, payload, header.payload_size, m_channels))
+                else if (!m_connection.deliver_ordered(header, payload, header.payload_size, m_channels))
                 {
                     m_on_data_received(header, payload, header.payload_size);
                 }
@@ -277,6 +300,9 @@ namespace entanglement
             send_control_payload(bp, 2);
             m_connection.set_backpressure_sent(false);
         }
+
+        // Flush coalesced message buffers at end of tick
+        m_connection.flush_all_coalesce(m_socket, m_channels, m_server_endpoint);
 
         return count;
     }

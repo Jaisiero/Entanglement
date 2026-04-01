@@ -153,8 +153,55 @@ namespace entanglement
         }
 
         // Normal (non-fragment) data delivery
-        if (is_new && m_on_client_data_received)
+        // Skip ack-only packets (sequence 0): they carry no user data.
+        if (is_new && m_on_client_data_received && header.sequence > 0)
         {
+            // Coalesced packets: unpack sub-messages
+            if (header.flags & FLAG_COALESCED)
+            {
+                // Bulk coalesced callback: deliver the raw coalesced payload
+                // as a single unit instead of unpacking each sub-message.
+                // Enables O(1) echo instead of O(N) per-message callbacks.
+                if (m_on_coalesced_data)
+                {
+                    // Count sub-messages (lightweight scan)
+                    int msg_count = 0;
+                    uint16_t off = 0;
+                    while (off + COALESCE_FRAMING_SIZE <= header.payload_size)
+                    {
+                        uint16_t len = 0;
+                        std::memcpy(&len, payload + off, sizeof(len));
+                        off += COALESCE_FRAMING_SIZE;
+                        if (len == 0 || off + len > header.payload_size)
+                            break;
+                        ++msg_count;
+                        off += len;
+                    }
+                    m_on_coalesced_data(header, payload, header.payload_size, msg_count, sender);
+                    return;
+                }
+
+                uint16_t offset = 0;
+                while (offset + COALESCE_FRAMING_SIZE <= header.payload_size)
+                {
+                    uint16_t msg_len = 0;
+                    std::memcpy(&msg_len, payload + offset, sizeof(msg_len));
+                    offset += COALESCE_FRAMING_SIZE;
+                    if (msg_len == 0 || offset + msg_len > header.payload_size)
+                        break;
+                    // Build a synthetic header for each sub-message
+                    packet_header sub_hdr = header;
+                    sub_hdr.flags &= ~FLAG_COALESCED;
+                    sub_hdr.payload_size = msg_len;
+                    if (!conn->deliver_ordered(sub_hdr, payload + offset, msg_len, *m_channels))
+                    {
+                        m_on_client_data_received(sub_hdr, payload + offset, msg_len, sender);
+                    }
+                    offset += msg_len;
+                }
+                return;
+            }
+
             if (!conn->deliver_ordered(header, payload, header.payload_size, *m_channels))
             {
                 m_on_client_data_received(header, payload, header.payload_size, sender);
@@ -198,6 +245,9 @@ namespace entanglement
             // Flush pending ACKs promptly so the remote's RTT isn't inflated
             if (conn.needs_ack_flush(now))
                 conn.send_ack_flush(*m_send_socket, key);
+
+            // Flush coalesced message buffers at end of tick
+            conn.flush_all_coalesce(*m_send_socket, *m_channels, key);
 
             // Loss detection
             if (loss_callback || m_on_packet_lost)
@@ -297,6 +347,13 @@ namespace entanglement
             return static_cast<int>(error_code::not_connected);
         return conn->send_fragment(*m_send_socket, *m_channels, message_id, fragment_index, fragment_count, data, size,
                                    flags, channel_id, dest, channel_sequence);
+    }
+
+    void server_worker::flush_coalesce_for(const endpoint_key &dest)
+    {
+        udp_connection *conn = find(dest);
+        if (conn && conn->state() == connection_state::CONNECTED)
+            conn->flush_all_coalesce(*m_send_socket, *m_channels, dest);
     }
 
     // -----------------------------------------------------------------------
