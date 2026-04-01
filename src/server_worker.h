@@ -62,9 +62,9 @@ namespace entanglement
     // Forward declarations for server callback types (duplicated from server.h to avoid circular include)
     using on_client_data_received = std::function<void(const packet_header &header, const uint8_t *payload,
                                                        size_t payload_size, const endpoint_key &sender)>;
-    using on_client_coalesced_data = std::function<void(const packet_header &header, const uint8_t *raw_payload,
-                                                        size_t payload_size, int message_count,
-                                                        const endpoint_key &sender)>;
+    using on_client_coalesced_data =
+        std::function<void(const packet_header &header, const uint8_t *raw_payload, size_t payload_size,
+                           int message_count, const endpoint_key &sender)>;
     using on_client_connected = std::function<void(const endpoint_key &key, const std::string &address, uint16_t port)>;
     using on_client_disconnected =
         std::function<void(const endpoint_key &key, const std::string &address, uint16_t port)>;
