@@ -50,6 +50,9 @@ target_link_libraries(EntanglementChurnTest PRIVATE entanglement_core)
 add_executable(EntanglementStress apps/stress_test_main.cpp)
 target_link_libraries(EntanglementStress PRIVATE entanglement_core)
 
+add_executable(EntanglementNetBench apps/net_bench.cpp)
+target_link_libraries(EntanglementNetBench PRIVATE entanglement_core)
+
 # Create log directory at build time
 add_custom_target(create_log_dir ALL
     COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_SOURCE_DIR}/log"
