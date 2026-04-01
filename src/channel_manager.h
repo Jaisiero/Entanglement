@@ -91,9 +91,9 @@ namespace entanglement
         // Quick mode queries
         bool is_reliable(uint8_t id) const;
         bool is_ordered(uint8_t id) const;
-        bool is_coalesced(uint8_t id) const;
+        bool is_coalesced(uint8_t id) const { return m_registered[id] && m_channels[id].coalesce; }
         uint8_t priority(uint8_t id) const;
-        uint16_t coalesce_max_bytes(uint8_t id) const;
+        uint16_t coalesce_max_bytes(uint8_t id) const { return m_registered[id] ? m_channels[id].coalesce_max_bytes : uint16_t(0); }
 
         // Is this channel ID registered?
         bool is_registered(uint8_t id) const { return m_registered[id]; }

@@ -160,7 +160,14 @@ namespace entanglement
     class udp_connection
     {
     public:
-        udp_connection() = default;
+        udp_connection() { std::memset(m_coalesce_map, 0xFF, sizeof(m_coalesce_map)); }
+        ~udp_connection();
+
+        // Non-copyable, non-movable (owns raw pointers, used in pool array)
+        udp_connection(const udp_connection &) = delete;
+        udp_connection &operator=(const udp_connection &) = delete;
+        udp_connection(udp_connection &&) = delete;
+        udp_connection &operator=(udp_connection &&) = delete;
 
         // Reset to initial state (reuse pool slot)
         void reset();
@@ -486,10 +493,15 @@ namespace entanglement
             uint8_t data[MAX_COALESCE_PAYLOAD]{};
             uint16_t used = 0;     // bytes written so far
             uint8_t msg_count = 0; // sub-messages in buffer
+            uint8_t channel_id = 0;
         };
-        // Sparse map: index = channel_id, only populated for coalesced channels.
-        // Using unique_ptr to avoid 256 × ~1.2 KB = ~300 KB per connection.
-        std::unique_ptr<coalesce_buffer> m_coalesce[MAX_CHANNELS]{};
+        // Compact storage: at most MAX_COALESCE_CHANNELS active coalesce buffers.
+        // Avoids 256 × 8B = 2 KB of null unique_ptrs per connection.
+        static constexpr size_t MAX_COALESCE_CHANNELS = 8;
+        coalesce_buffer *m_coalesce_slots[MAX_COALESCE_CHANNELS]{};
+        uint8_t m_coalesce_count = 0; // number of active slots
+        // Fast lookup: channel_id → slot index (0xFF = not allocated)
+        uint8_t m_coalesce_map[MAX_CHANNELS];
 
         // Ensure a coalesce buffer exists for a channel (lazily created)
         coalesce_buffer &ensure_coalesce(uint8_t channel_id);

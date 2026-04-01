@@ -79,20 +79,6 @@ namespace entanglement
         return m_channels[id].priority;
     }
 
-    bool channel_manager::is_coalesced(uint8_t id) const
-    {
-        if (!m_registered[id])
-            return false;
-        return m_channels[id].coalesce;
-    }
-
-    uint16_t channel_manager::coalesce_max_bytes(uint8_t id) const
-    {
-        if (!m_registered[id])
-            return 0;
-        return m_channels[id].coalesce_max_bytes;
-    }
-
     void channel_manager::register_defaults()
     {
         register_channel(channels::CONTROL);

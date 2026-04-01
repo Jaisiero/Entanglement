@@ -2,11 +2,18 @@
 #include "channel_manager.h"
 #include "udp_socket.h"
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <cstring>
 
 namespace entanglement
 {
+
+    udp_connection::~udp_connection()
+    {
+        for (uint8_t i = 0; i < m_coalesce_count; ++i)
+            delete m_coalesce_slots[i];
+    }
 
     void udp_connection::reset()
     {
@@ -74,13 +81,13 @@ namespace entanglement
         for (auto &om : m_ordered_msg_buffer)
             om.active = false;
 
-        // Reset coalesce buffers (keep allocation)
-        for (auto &cb : m_coalesce)
+        // Reset coalesce buffers (keep allocation, just clear data)
+        for (uint8_t i = 0; i < m_coalesce_count; ++i)
         {
-            if (cb)
+            if (m_coalesce_slots[i])
             {
-                cb->used = 0;
-                cb->msg_count = 0;
+                m_coalesce_slots[i]->used = 0;
+                m_coalesce_slots[i]->msg_count = 0;
             }
         }
     }
@@ -1017,54 +1024,64 @@ namespace entanglement
 
     udp_connection::coalesce_buffer &udp_connection::ensure_coalesce(uint8_t channel_id)
     {
-        if (!m_coalesce[channel_id])
-            m_coalesce[channel_id] = std::make_unique<coalesce_buffer>();
-        return *m_coalesce[channel_id];
+        uint8_t slot = m_coalesce_map[channel_id];
+        if (slot != 0xFF)
+            return *m_coalesce_slots[slot];
+
+        // Allocate a new slot
+        assert(m_coalesce_count < MAX_COALESCE_CHANNELS);
+        slot = m_coalesce_count++;
+        m_coalesce_map[channel_id] = slot;
+        m_coalesce_slots[slot] = new coalesce_buffer();
+        m_coalesce_slots[slot]->channel_id = channel_id;
+        return *m_coalesce_slots[slot];
     }
 
     void udp_connection::flush_coalesce(uint8_t channel_id, udp_socket &socket, const channel_manager &channels,
                                         const endpoint_key &dest)
     {
-        auto &buf_ptr = m_coalesce[channel_id];
-        if (!buf_ptr || buf_ptr->used == 0)
+        uint8_t slot = m_coalesce_map[channel_id];
+        if (slot == 0xFF)
             return;
-
-        auto &buf = *buf_ptr;
+        auto *buf = m_coalesce_slots[slot];
+        if (!buf || buf->used == 0)
+            return;
 
         packet_header header{};
         header.flags = FLAG_COALESCED;
         header.channel_id = channel_id;
-        header.payload_size = buf.used;
+        header.payload_size = buf->used;
         bool reliable = channels.is_reliable(channel_id);
         prepare_header(header, reliable);
 
         // Store for auto-retransmit (reliable channels only)
         if (reliable && m_retransmit)
-            m_retransmit->store(header.sequence, buf.data, buf.used, header.flags, channel_id,
+            m_retransmit->store(header.sequence, buf->data, buf->used, header.flags, channel_id,
                                 header.channel_sequence, 0, 0, 0);
 
-        socket.send_packet(header, buf.data, dest);
+        socket.send_packet(header, buf->data, dest);
 
         // Reset buffer for next batch
-        buf.used = 0;
-        buf.msg_count = 0;
+        buf->used = 0;
+        buf->msg_count = 0;
     }
 
     void udp_connection::flush_all_coalesce(udp_socket &socket, const channel_manager &channels,
                                             const endpoint_key &dest)
     {
-        for (size_t i = 0; i < MAX_CHANNELS; ++i)
+        for (uint8_t i = 0; i < m_coalesce_count; ++i)
         {
-            if (m_coalesce[i] && m_coalesce[i]->used > 0)
-                flush_coalesce(static_cast<uint8_t>(i), socket, channels, dest);
+            auto *buf = m_coalesce_slots[i];
+            if (buf && buf->used > 0)
+                flush_coalesce(buf->channel_id, socket, channels, dest);
         }
     }
 
     bool udp_connection::has_pending_coalesce() const
     {
-        for (size_t i = 0; i < MAX_CHANNELS; ++i)
+        for (uint8_t i = 0; i < m_coalesce_count; ++i)
         {
-            if (m_coalesce[i] && m_coalesce[i]->used > 0)
+            if (m_coalesce_slots[i] && m_coalesce_slots[i]->used > 0)
                 return true;
         }
         return false;
