@@ -630,6 +630,26 @@ void ent_server_set_on_client_data(ent_server_t *s, ent_on_client_data_fn fn, vo
     }
 }
 
+void ent_server_set_on_coalesced_data(ent_server_t *s, ent_on_coalesced_data_fn fn, void *user_data)
+{
+    if (!s)
+        return;
+    if (fn)
+    {
+        s->cpp.set_on_coalesced_data(
+            [fn, user_data](const packet_header &hdr, const uint8_t *raw_payload, size_t size, int msg_count,
+                            const endpoint_key &sender)
+            {
+                ent_packet_header ch = to_c_header(hdr);
+                fn(&ch, raw_payload, size, msg_count, to_c(sender), user_data);
+            });
+    }
+    else
+    {
+        s->cpp.set_on_coalesced_data(nullptr);
+    }
+}
+
 void ent_server_set_on_client_connected(ent_server_t *s, ent_on_client_connected_fn fn, void *user_data)
 {
     if (!s)

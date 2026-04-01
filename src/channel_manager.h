@@ -23,15 +23,15 @@ namespace entanglement
     {
         uint8_t id = 0;
         channel_mode mode = channel_mode::UNRELIABLE;
-        uint8_t priority = 0; // Higher = more important (0–255)
-        bool coalesce = false; // Batch small messages into a single datagram
+        uint8_t priority = 0;               // Higher = more important (0–255)
+        bool coalesce = false;              // Batch small messages into a single datagram
         uint16_t coalesce_max_bytes = 1160; // Flush when buffer reaches this size (default ~MAX_FRAGMENT_PAYLOAD)
         char name[MAX_CHANNEL_NAME] = {};
     };
 
     // constexpr helper to build a channel_config with a string literal name
     constexpr channel_config make_channel_config(uint8_t id, channel_mode mode, uint8_t priority, const char *src,
-                                                    bool coalesce = false, uint16_t coalesce_max_bytes = 1160)
+                                                 bool coalesce = false, uint16_t coalesce_max_bytes = 1160)
     {
         channel_config cfg{};
         cfg.id = id;
@@ -93,7 +93,10 @@ namespace entanglement
         bool is_ordered(uint8_t id) const;
         bool is_coalesced(uint8_t id) const { return m_registered[id] && m_channels[id].coalesce; }
         uint8_t priority(uint8_t id) const;
-        uint16_t coalesce_max_bytes(uint8_t id) const { return m_registered[id] ? m_channels[id].coalesce_max_bytes : uint16_t(0); }
+        uint16_t coalesce_max_bytes(uint8_t id) const
+        {
+            return m_registered[id] ? m_channels[id].coalesce_max_bytes : uint16_t(0);
+        }
 
         // Is this channel ID registered?
         bool is_registered(uint8_t id) const { return m_registered[id]; }

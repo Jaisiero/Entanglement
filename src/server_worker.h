@@ -62,6 +62,9 @@ namespace entanglement
     // Forward declarations for server callback types (duplicated from server.h to avoid circular include)
     using on_client_data_received = std::function<void(const packet_header &header, const uint8_t *payload,
                                                        size_t payload_size, const endpoint_key &sender)>;
+    using on_client_coalesced_data = std::function<void(const packet_header &header, const uint8_t *raw_payload,
+                                                        size_t payload_size, int message_count,
+                                                        const endpoint_key &sender)>;
     using on_client_connected = std::function<void(const endpoint_key &key, const std::string &address, uint16_t port)>;
     using on_client_disconnected =
         std::function<void(const endpoint_key &key, const std::string &address, uint16_t port)>;
@@ -138,6 +141,7 @@ namespace entanglement
         // --- Callback setters (copies stored per worker) ---
 
         void set_on_client_data_received(on_client_data_received cb);
+        void set_on_coalesced_data(on_client_coalesced_data cb) { m_on_coalesced_data = std::move(cb); }
         void set_on_client_connected(on_client_connected cb) { m_on_client_connected = std::move(cb); }
         void set_on_client_disconnected(on_client_disconnected cb) { m_on_client_disconnected = std::move(cb); }
         void set_on_channel_requested(on_channel_requested cb) { m_on_channel_requested = std::move(cb); }
@@ -195,6 +199,7 @@ namespace entanglement
 
         // Callbacks (copies — each worker invokes from its own thread)
         on_client_data_received m_on_client_data_received;
+        on_client_coalesced_data m_on_coalesced_data;
         on_client_connected m_on_client_connected;
         on_client_disconnected m_on_client_disconnected;
         on_channel_requested m_on_channel_requested;

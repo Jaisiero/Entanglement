@@ -134,7 +134,7 @@ extern "C"
         ent_channel_mode mode;
         uint8_t priority;
         char name[32];
-        int coalesce;              /* bool: enable message coalescing */
+        int coalesce;                /* bool: enable message coalescing */
         uint16_t coalesce_max_bytes; /* max coalesced payload (0 = default 1160) */
     } ent_channel_config;
 
@@ -156,6 +156,15 @@ extern "C"
     /* Server: data received from client */
     typedef void (*ent_on_client_data_fn)(const ent_packet_header *header, const uint8_t *payload, size_t payload_size,
                                           ent_endpoint sender, void *user_data);
+
+    /* Server: bulk coalesced data received from client (raw, not unpacked).
+     * When registered, coalesced packets are delivered as a single call instead
+     * of N per-sub-message callbacks.  The raw_payload contains the coalesced
+     * wire format ([len:u16][data]...).  message_count is the number of
+     * sub-messages in the packet. */
+    typedef void (*ent_on_coalesced_data_fn)(const ent_packet_header *header, const uint8_t *raw_payload,
+                                             size_t payload_size, int message_count, ent_endpoint sender,
+                                             void *user_data);
 
     /* Server: client connected/disconnected */
     typedef void (*ent_on_client_connected_fn)(ent_endpoint key, const char *address, uint16_t port, void *user_data);
@@ -321,6 +330,7 @@ extern "C"
 
     /* Callbacks */
     ENT_API void ent_server_set_on_client_data(ent_server_t *s, ent_on_client_data_fn fn, void *user_data);
+    ENT_API void ent_server_set_on_coalesced_data(ent_server_t *s, ent_on_coalesced_data_fn fn, void *user_data);
     ENT_API void ent_server_set_on_client_connected(ent_server_t *s, ent_on_client_connected_fn fn, void *user_data);
     ENT_API void ent_server_set_on_client_disconnected(ent_server_t *s, ent_on_client_disconnected_fn fn,
                                                        void *user_data);

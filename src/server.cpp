@@ -110,6 +110,8 @@ namespace entanglement
         {
             if (m_on_client_data_received)
                 w->set_on_client_data_received(m_on_client_data_received);
+            if (m_on_coalesced_data)
+                w->set_on_coalesced_data(m_on_coalesced_data);
             if (m_on_client_connected)
                 w->set_on_client_connected(m_on_client_connected);
             if (m_on_client_disconnected)
@@ -481,6 +483,13 @@ namespace entanglement
         m_on_client_data_received = callback;
         for (auto &w : m_workers)
             w->set_on_client_data_received(callback);
+    }
+
+    void server::set_on_coalesced_data(on_client_coalesced_data callback)
+    {
+        m_on_coalesced_data = callback;
+        for (auto &w : m_workers)
+            w->set_on_coalesced_data(callback);
     }
 
     void server::set_on_client_connected(on_client_connected callback)

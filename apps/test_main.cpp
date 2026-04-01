@@ -4230,8 +4230,7 @@ static bool test_coalesce_unreliable_echo()
     c.channels().register_defaults();
 
     std::atomic<int> echoes{0};
-    c.set_on_data_received(
-        [&](const packet_header &, const uint8_t *, size_t) { echoes++; });
+    c.set_on_data_received([&](const packet_header &, const uint8_t *, size_t) { echoes++; });
 
     TEST_ASSERT(succeeded(c.connect()), "client should connect");
 
@@ -4306,8 +4305,7 @@ static bool test_coalesce_reliable_echo()
     c.enable_auto_retransmit();
 
     std::atomic<int> echoes{0};
-    c.set_on_data_received(
-        [&](const packet_header &, const uint8_t *, size_t) { echoes++; });
+    c.set_on_data_received([&](const packet_header &, const uint8_t *, size_t) { echoes++; });
 
     TEST_ASSERT(succeeded(c.connect()), "client should connect");
 
@@ -4506,9 +4504,8 @@ static bool test_coalesce_explicit_flush()
     std::atomic<bool> stop_flag{false};
     std::atomic<int> server_msgs{0};
 
-    srv.set_on_client_data_received(
-        [&](const packet_header &, const uint8_t *, size_t, const endpoint_key &)
-        { server_msgs++; });
+    srv.set_on_client_data_received([&](const packet_header &, const uint8_t *, size_t, const endpoint_key &)
+                                    { server_msgs++; });
 
     TEST_ASSERT(succeeded(srv.start()), "server should start");
 
@@ -4629,16 +4626,13 @@ static bool test_coalesce_data_integrity()
 
     {
         std::lock_guard<std::mutex> lk(recv_mutex);
-        TEST_ASSERT(static_cast<int>(received_payloads.size()) == N,
-                    "server should receive exactly N messages");
+        TEST_ASSERT(static_cast<int>(received_payloads.size()) == N, "server should receive exactly N messages");
 
         // Verify each payload is byte-perfect
         for (int i = 0; i < N; ++i)
         {
-            TEST_ASSERT(received_payloads[i].size() == sent_payloads[i].size(),
-                        "message size should match");
-            TEST_ASSERT(received_payloads[i] == sent_payloads[i],
-                        "message data should match byte-for-byte");
+            TEST_ASSERT(received_payloads[i].size() == sent_payloads[i].size(), "message size should match");
+            TEST_ASSERT(received_payloads[i] == sent_payloads[i], "message data should match byte-for-byte");
         }
     }
 

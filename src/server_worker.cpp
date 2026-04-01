@@ -159,6 +159,28 @@ namespace entanglement
             // Coalesced packets: unpack sub-messages
             if (header.flags & FLAG_COALESCED)
             {
+                // Bulk coalesced callback: deliver the raw coalesced payload
+                // as a single unit instead of unpacking each sub-message.
+                // Enables O(1) echo instead of O(N) per-message callbacks.
+                if (m_on_coalesced_data)
+                {
+                    // Count sub-messages (lightweight scan)
+                    int msg_count = 0;
+                    uint16_t off = 0;
+                    while (off + COALESCE_FRAMING_SIZE <= header.payload_size)
+                    {
+                        uint16_t len = 0;
+                        std::memcpy(&len, payload + off, sizeof(len));
+                        off += COALESCE_FRAMING_SIZE;
+                        if (len == 0 || off + len > header.payload_size)
+                            break;
+                        ++msg_count;
+                        off += len;
+                    }
+                    m_on_coalesced_data(header, payload, header.payload_size, msg_count, sender);
+                    return;
+                }
+
                 uint16_t offset = 0;
                 while (offset + COALESCE_FRAMING_SIZE <= header.payload_size)
                 {

@@ -12,7 +12,7 @@ namespace entanglement
         FLAG_CONTROL = 1 << 1,     // Control packet (handshake, disconnect, heartbeat)
         FLAG_COMPRESSED = 1 << 2,  // Payload is compressed
         FLAG_SHARD_RELAY = 1 << 3, // Cross-shard relay (halo region forwarding)
-        FLAG_COALESCED = 1 << 4,  // Payload contains multiple length-prefixed sub-messages
+        FLAG_COALESCED = 1 << 4,   // Payload contains multiple length-prefixed sub-messages
         // Bits 5–7 reserved for future use.
         // Reliability, ordering, and priority are determined by channel_config,
         // not by per-packet flags.
