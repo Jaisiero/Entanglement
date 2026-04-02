@@ -114,7 +114,11 @@ namespace entanglement
         // (non-zero for fragment 0 of ordered messages, zero for all others).
         // For simple packets: preserve caller-set value (retransmissions on
         // RELIABLE_ORDERED), otherwise auto-assign the next monotonic value.
-        if (!(header.flags & FLAG_FRAGMENT) && header.channel_sequence == 0)
+        // Control packets (FLAG_CONTROL) must NOT consume a channel_sequence
+        // because the receiver's handle_control path bypasses deliver_ordered;
+        // if they did, subsequent data packets would appear to have a gap and
+        // be held back until the ordered-stall timeout fires.
+        if (!(header.flags & FLAG_CONTROL) && !(header.flags & FLAG_FRAGMENT) && header.channel_sequence == 0)
             header.channel_sequence = ++m_channel_sequences[header.channel_id];
 
         // Register metadata in send buffer (no payload copy)
