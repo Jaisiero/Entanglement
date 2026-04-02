@@ -156,6 +156,23 @@ namespace entanglement
             if (result <= 0)
                 break;
 
+            bool is_control = (header.flags & FLAG_CONTROL) && header.payload_size >= 1;
+
+            // Non-control packets received before CONNECTED must NOT be passed to
+            // process_incoming.  process_incoming records the sequence in the ACK
+            // bitmap, so the sender would consider the packet delivered.  But since
+            // we cannot hand it to the application yet (state != CONNECTED), the
+            // data would be silently lost — and auto-retransmit would never fire
+            // because the ACK already covered the sequence.
+            //
+            // By skipping these packets entirely, the sender detects the loss via
+            // its normal retransmit path and re-sends once we reach CONNECTED.
+            if (!is_control && m_connection.state() != connection_state::CONNECTED)
+            {
+                ++count;
+                continue;
+            }
+
             bool is_new = m_connection.process_incoming(header, batch_now);
             if (!is_new)
             {
@@ -164,7 +181,7 @@ namespace entanglement
             }
 
             // Handle control packets internally
-            if ((header.flags & FLAG_CONTROL) && header.payload_size >= 1)
+            if (is_control)
             {
                 handle_control(payload, header.payload_size);
                 ++count;
@@ -196,9 +213,9 @@ namespace entanglement
                 continue;
             }
 
-            // Data packets — only when connected
+            // Data packets — state is guaranteed CONNECTED at this point.
             // Skip ack-only packets (sequence 0): they carry no user data.
-            if (m_connection.state() == connection_state::CONNECTED && m_on_data_received && header.sequence > 0)
+            if (m_on_data_received && header.sequence > 0)
             {
                 // Coalesced packets: unpack sub-messages
                 if (header.flags & FLAG_COALESCED)
