@@ -642,6 +642,18 @@ int ent_server_worker_send_to(ent_server_t *s, size_t worker_idx,
     return s->cpp.worker_send_to(worker_idx, data, size, channel_id, key, flags);
 }
 
+void ent_server_worker_begin_send_batch(ent_server_t *s, size_t worker_idx)
+{
+    if (s)
+        s->cpp.worker_begin_send_batch(worker_idx);
+}
+
+void ent_server_worker_flush_send_batch(ent_server_t *s, size_t worker_idx)
+{
+    if (s)
+        s->cpp.worker_flush_send_batch(worker_idx);
+}
+
 size_t ent_server_worker_index(const ent_server_t *s, ent_endpoint dest)
 {
     if (!s)

@@ -376,6 +376,12 @@ extern "C"
                                           uint8_t channel_id, ent_endpoint dest,
                                           uint8_t flags);
 
+    /* Begin sendmmsg batching on a worker's socket. Call before a burst of
+     * worker_send_to calls, then flush after. Reduces syscalls from N to N/256.
+     * SAFETY: workers MUST be paused. */
+    ENT_API void ent_server_worker_begin_send_batch(ent_server_t *s, size_t worker_idx);
+    ENT_API void ent_server_worker_flush_send_batch(ent_server_t *s, size_t worker_idx);
+
     /* Returns which worker index owns a given endpoint. */
     ENT_API size_t ent_server_worker_index(const ent_server_t *s, ent_endpoint dest);
 

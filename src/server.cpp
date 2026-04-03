@@ -476,6 +476,18 @@ namespace entanglement
         return m_workers[worker_idx]->send_to(data, size, channel_id, key, flags, nullptr);
     }
 
+    void server::worker_begin_send_batch(size_t worker_idx)
+    {
+        if (worker_idx < m_workers.size())
+            m_workers[worker_idx]->send_socket()->begin_send_batch();
+    }
+
+    void server::worker_flush_send_batch(size_t worker_idx)
+    {
+        if (worker_idx < m_workers.size())
+            m_workers[worker_idx]->send_socket()->flush_send_batch();
+    }
+
     // -----------------------------------------------------------------------
     // Packet processing (single-threaded mode — called from game loop)
     // -----------------------------------------------------------------------

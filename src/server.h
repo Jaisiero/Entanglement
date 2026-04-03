@@ -84,6 +84,12 @@ namespace entanglement
         int worker_send_to(size_t worker_idx, const void *data, size_t size,
                            uint8_t channel_id, const endpoint_key &key, uint8_t flags);
 
+        // Begin/flush sendmmsg batching on a specific worker's socket.
+        // Call begin before a burst of worker_send_to, flush after.
+        // SAFETY: same as worker_send_to — workers MUST be paused.
+        void worker_begin_send_batch(size_t worker_idx);
+        void worker_flush_send_batch(size_t worker_idx);
+
         // Expose worker routing: returns which worker owns a given endpoint.
         size_t get_worker_index(const endpoint_key &key) const { return worker_index(key); }
 
