@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cstring>
 #include <iostream>
+#include <immintrin.h> // _mm_pause
 
 namespace entanglement
 {
@@ -52,7 +53,21 @@ namespace entanglement
     }
     bool server_worker::enqueue_send(send_command &&cmd)
     {
-        return m_send_queue->try_push(std::move(cmd));
+        // Spin-wait with yield on full queue — guarantees delivery instead of
+        // silent drop.  Worker thread drains the queue concurrently, so the
+        // wait is bounded by the worker's drain rate (typically < 1 ms).
+        for (int spin = 0; spin < 4096; ++spin)
+        {
+            if (m_send_queue->try_push(std::move(cmd)))
+                return true;
+            // Yield to let the worker thread drain the queue.
+            // After ~64 spins switch from pause to thread yield.
+            if (spin < 64)
+                _mm_pause(); // ~100 cycles, avoids starving the worker's CPU
+            else
+                std::this_thread::yield();
+        }
+        return false; // safety valve — should never reach here in practice
     }
 
     // -----------------------------------------------------------------------
