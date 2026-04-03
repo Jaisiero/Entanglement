@@ -358,6 +358,30 @@ extern "C"
     ENT_API void ent_server_set_verbose(ent_server_t *s, int verbose);
     ENT_API uint16_t ent_server_port(const ent_server_t *s);
 
+    /* --- Worker direct-send API (bypass MPSC queue) --- */
+
+    /* Pause all worker threads.  Blocks until every worker has stopped.
+     * While paused, the caller may invoke ent_server_worker_send_to()
+     * with exclusive access per worker_idx. */
+    ENT_API void ent_server_pause_workers(ent_server_t *s);
+
+    /* Resume all worker threads after a pause. */
+    ENT_API void ent_server_resume_workers(ent_server_t *s);
+
+    /* Direct send through a specific worker — bypasses MPSC queue and send_pool.
+     * SAFETY: workers MUST be paused, and only ONE thread may call this per
+     * worker_idx at a time. */
+    ENT_API int ent_server_worker_send_to(ent_server_t *s, size_t worker_idx,
+                                          const void *data, size_t size,
+                                          uint8_t channel_id, ent_endpoint dest,
+                                          uint8_t flags);
+
+    /* Returns which worker index owns a given endpoint. */
+    ENT_API size_t ent_server_worker_index(const ent_server_t *s, ent_endpoint dest);
+
+    /* Returns the number of active workers. */
+    ENT_API int ent_server_worker_count(const ent_server_t *s);
+
     /* -----------------------------------------------------------------------
      * Constants (exposed for FFI consumers)
      * ----------------------------------------------------------------------- */
