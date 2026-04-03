@@ -10,12 +10,14 @@ namespace entanglement
     server_worker::server_worker() = default;
 
     void server_worker::init(size_t pool_capacity, udp_socket *socket, channel_manager *channels,
-                             const std::atomic<bool> *running_flag, int recv_queue_count)
+                             const std::atomic<bool> *running_flag, send_pool *spool,
+                             int recv_queue_count)
     {
         m_socket = socket;
         m_send_socket = socket; // default: shared socket for send + recv
         m_channels = channels;
         m_running = running_flag;
+        m_send_pool = spool;
         m_pool_capacity = pool_capacity;
 
         m_pool = std::make_unique<udp_connection[]>(pool_capacity);
@@ -389,19 +391,27 @@ namespace entanglement
         send_command cmd;
         while (m_send_queue->try_pop(cmd))
         {
+            // Resolve payload pointer from shared send_pool
+            const uint8_t *payload = (cmd.pool_offset != UINT32_MAX && m_send_pool)
+                                         ? m_send_pool->read(cmd.pool_offset)
+                                         : nullptr;
+
             switch (cmd.type)
             {
                 case send_command::kind::DATA:
-                    send_to(cmd.data, cmd.data_size, cmd.channel_id, cmd.dest, cmd.flags, nullptr);
+                    if (payload)
+                        send_to(payload, cmd.data_size, cmd.channel_id, cmd.dest, cmd.flags, nullptr);
                     break;
 
                 case send_command::kind::RAW:
-                    send_raw_to(cmd.raw_header, cmd.data, cmd.dest);
+                    if (payload)
+                        send_raw_to(cmd.raw_header, payload, cmd.dest);
                     break;
 
                 case send_command::kind::FRAGMENT:
-                    send_fragment_to(cmd.message_id, cmd.fragment_index, cmd.fragment_count, cmd.data,
-                                     cmd.data_size, cmd.flags, cmd.channel_id, cmd.dest, cmd.channel_sequence);
+                    if (payload)
+                        send_fragment_to(cmd.message_id, cmd.fragment_index, cmd.fragment_count, payload,
+                                         cmd.data_size, cmd.flags, cmd.channel_id, cmd.dest, cmd.channel_sequence);
                     break;
 
                 case send_command::kind::DISCONNECT:

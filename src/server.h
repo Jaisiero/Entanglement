@@ -1,5 +1,6 @@
 #pragma once
 
+#include "send_pool.h"
 #include "server_worker.h"
 #include <thread>
 #include <vector>
@@ -142,6 +143,13 @@ namespace entanglement
         channel_manager &channels() { return m_channels; }
         const channel_manager &channels() const { return m_channels; }
 
+        // Advance the double-buffered send pool. Call once per tick before
+        // any cross-thread sends (i.e. before the broadcast phase).
+        void advance_send_pool() { m_send_pool.advance(); }
+
+        // Access the send pool (used internally by send paths)
+        send_pool &get_send_pool() { return m_send_pool; }
+
     private:
         udp_socket m_socket;
         uint16_t m_port;
@@ -219,6 +227,9 @@ namespace entanglement
 
         // Worker thread loop (multi-threaded mode)
         void worker_loop(size_t worker_idx);
+
+        // Shared send data pool (cross-thread sends write payload here)
+        send_pool m_send_pool;
     };
 
 } // namespace entanglement

@@ -36,7 +36,7 @@ namespace entanglement
         for (int i = 0; i < actual; ++i)
         {
             auto w = std::make_unique<server_worker>();
-            w->init(pool_per_worker, &m_socket, &m_channels, &m_running, recv_queue_count);
+            w->init(pool_per_worker, &m_socket, &m_channels, &m_running, &m_send_pool, recv_queue_count);
             w->set_verbose(m_verbose);
             w->set_auto_retransmit(m_auto_retransmit);
             m_workers.push_back(std::move(w));
@@ -543,7 +543,7 @@ namespace entanglement
         cmd.dest = key;
         cmd.raw_header = header;
         cmd.data_size = static_cast<uint16_t>(header.payload_size);
-        std::memcpy(cmd.data, payload, cmd.data_size);
+        cmd.pool_offset = m_send_pool.write(payload, cmd.data_size);
         m_workers[w]->enqueue_send(std::move(cmd));
         return header.payload_size;
     }
@@ -573,7 +573,7 @@ namespace entanglement
         cmd.channel_id = channel_id;
         cmd.flags = flags;
         cmd.data_size = static_cast<uint16_t>(size);
-        std::memcpy(cmd.data, data, size);
+        cmd.pool_offset = m_send_pool.write(data, cmd.data_size);
         m_workers[w]->enqueue_send(std::move(cmd));
         return static_cast<int>(size);
     }
@@ -610,7 +610,7 @@ namespace entanglement
         cmd.fragment_count = fragment_count;
         cmd.channel_sequence = channel_sequence;
         cmd.data_size = static_cast<uint16_t>(size);
-        std::memcpy(cmd.data, data, size);
+        cmd.pool_offset = m_send_pool.write(data, cmd.data_size);
         m_workers[w]->enqueue_send(std::move(cmd));
         return static_cast<int>(size);
     }

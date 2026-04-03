@@ -3,6 +3,7 @@
 #include "channel_manager.h"
 #include "fragmentation.h"
 #include "mpsc_queue.h"
+#include "send_pool.h"
 #include "spsc_queue.h"
 #include "udp_connection.h"
 #include "udp_socket.h"
@@ -56,9 +57,9 @@ namespace entanglement
         // For RAW sends
         packet_header raw_header{};
 
-        // Payload data — fixed inline buffer, no heap allocation.
-        // All game sends fit within MAX_PACKET_SIZE (1200 bytes).
-        uint8_t  data[MAX_PACKET_SIZE]{};
+        // Payload reference into the shared send_pool (replaces inline buffer).
+        // Encoded offset: bit 31 = pool index, bits 0-30 = byte offset.
+        uint32_t pool_offset = UINT32_MAX;
         uint16_t data_size = 0;
     };
 
@@ -96,7 +97,8 @@ namespace entanglement
         // recv_queue_count: number of SPSC recv queues (one per receiver thread).
         // Default 1 for single-socket mode. Set > 1 for SO_REUSEPORT multi-socket.
         void init(size_t pool_capacity, udp_socket *socket, channel_manager *channels,
-                  const std::atomic<bool> *running_flag, int recv_queue_count = 1);
+                  const std::atomic<bool> *running_flag, send_pool *spool = nullptr,
+                  int recv_queue_count = 1);
 
         // --- Receive queue (receiver thread → this worker, zero-copy) ---
         // Acquires a pool slot, copies payload once from source, pushes slot index.
@@ -178,6 +180,7 @@ namespace entanglement
         udp_socket *m_send_socket = nullptr; // per-worker send socket (may == m_socket)
         channel_manager *m_channels = nullptr;
         const std::atomic<bool> *m_running = nullptr;
+        send_pool *m_send_pool = nullptr;    // shared send data pool (for cross-thread commands)
 
         // Per-worker connection pool
         std::unique_ptr<udp_connection[]> m_pool;

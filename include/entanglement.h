@@ -328,6 +328,10 @@ extern "C"
     ENT_API void ent_server_enable_auto_retransmit(ent_server_t *s);
     ENT_API int ent_server_auto_retransmit_enabled(const ent_server_t *s);
 
+    /* Advance the double-buffered send pool. Call once per game tick
+     * before any cross-thread sends (i.e. before the broadcast phase). */
+    ENT_API void ent_server_advance_send_pool(ent_server_t *s);
+
     /* Callbacks */
     ENT_API void ent_server_set_on_client_data(ent_server_t *s, ent_on_client_data_fn fn, void *user_data);
     ENT_API void ent_server_set_on_coalesced_data(ent_server_t *s, ent_on_coalesced_data_fn fn, void *user_data);

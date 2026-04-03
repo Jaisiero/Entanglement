@@ -585,6 +585,12 @@ int ent_server_auto_retransmit_enabled(const ent_server_t *s)
     return s ? s->cpp.auto_retransmit_enabled() : 0;
 }
 
+void ent_server_advance_send_pool(ent_server_t *s)
+{
+    if (s)
+        s->cpp.advance_send_pool();
+}
+
 void ent_server_flush_coalesce(ent_server_t *s, ent_endpoint dest)
 {
     if (s)
