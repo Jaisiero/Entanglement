@@ -393,18 +393,6 @@ extern "C"
     ENT_API void ent_server_worker_begin_send_batch(ent_server_t *s, size_t worker_idx);
     ENT_API void ent_server_worker_flush_send_batch(ent_server_t *s, size_t worker_idx);
 
-#ifdef ENTANGLEMENT_HAS_URING
-    /* Initialize io_uring batched GSO sends on a worker's send socket.
-     * Call once during server setup, after workers are started.
-     * If io_uring init fails, sends fall back to normal sendmsg. */
-    ENT_API void ent_server_worker_init_uring(ent_server_t *s, size_t worker_idx);
-
-    /* Flush all pending io_uring GSO sends on a worker's send socket.
-     * Call after a batch of worker_send_to_multi calls to submit all at once.
-     * SAFETY: workers MUST be paused. */
-    ENT_API int ent_server_worker_flush_uring(ent_server_t *s, size_t worker_idx);
-#endif
-
     /* Returns which worker index owns a given endpoint. */
     ENT_API size_t ent_server_worker_index(const ent_server_t *s, ent_endpoint dest);
 

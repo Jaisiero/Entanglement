@@ -95,14 +95,6 @@ namespace entanglement
         void worker_begin_send_batch(size_t worker_idx);
         void worker_flush_send_batch(size_t worker_idx);
 
-#ifdef ENTANGLEMENT_HAS_URING
-        // Initialize io_uring on a worker's send socket for batched GSO sends.
-        void worker_init_uring(size_t worker_idx);
-        
-        // Flush all pending io_uring GSO sends on a worker's send socket.
-        int worker_flush_uring(size_t worker_idx);
-#endif
-
         // Expose worker routing: returns which worker owns a given endpoint.
         size_t get_worker_index(const endpoint_key &key) const { return worker_index(key); }
 

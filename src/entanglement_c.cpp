@@ -669,21 +669,6 @@ void ent_server_worker_flush_send_batch(ent_server_t *s, size_t worker_idx)
         s->cpp.worker_flush_send_batch(worker_idx);
 }
 
-#ifdef ENTANGLEMENT_HAS_URING
-void ent_server_worker_init_uring(ent_server_t *s, size_t worker_idx)
-{
-    if (s)
-        s->cpp.worker_init_uring(worker_idx);
-}
-
-int ent_server_worker_flush_uring(ent_server_t *s, size_t worker_idx)
-{
-    if (!s)
-        return 0;
-    return s->cpp.worker_flush_uring(worker_idx);
-}
-#endif
-
 size_t ent_server_worker_index(const ent_server_t *s, ent_endpoint dest)
 {
     if (!s)
