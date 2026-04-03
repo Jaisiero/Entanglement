@@ -17,7 +17,7 @@ namespace entanglement
 
     // --- Threading constants ---
     constexpr size_t WORKER_RECV_QUEUE_SIZE = 8192; // Per-worker inbound datagram queue
-    constexpr size_t WORKER_SEND_QUEUE_SIZE = 1024; // Per-worker cross-thread send queue
+    constexpr size_t WORKER_SEND_QUEUE_SIZE = 4096; // Per-worker cross-thread send queue
 
     // --- Queued datagram (receiver thread → worker) ---
     struct queued_datagram

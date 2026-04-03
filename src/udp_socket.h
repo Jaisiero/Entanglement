@@ -198,7 +198,7 @@ namespace entanglement
         std::unique_ptr<struct mmsghdr[]> m_mmsg_hdrs;
 
         // --- sendmmsg batch send ---
-        static constexpr int SEND_BATCH_MAX = 64;
+        static constexpr int SEND_BATCH_MAX = 256;
 
         struct sendmmsg_slot
         {
