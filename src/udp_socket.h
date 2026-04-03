@@ -4,6 +4,7 @@
 #include "packet_header.h"
 #include "platform.h"
 #include <functional>
+#include <atomic>
 #include <memory>
 #include <string>
 
@@ -181,6 +182,10 @@ namespace entanglement
         int flush_uring();
         
         void shutdown_uring();
+    private:
+        // flush without acquiring spinlock (caller must hold m_uring_lock)
+        int flush_uring_locked();
+    public:
 #endif
 #endif
 
@@ -247,6 +252,7 @@ namespace entanglement
         // --- io_uring batched send state ---
         struct io_uring m_uring{};
         bool m_uring_enabled = false;
+        std::atomic_flag m_uring_lock = ATOMIC_FLAG_INIT; // spinlock for thread safety
         
         // Linear allocator pool for GSO buffers
         uint8_t* m_uring_pool = nullptr;

@@ -698,17 +698,23 @@ namespace entanglement
 #ifdef ENTANGLEMENT_HAS_URING
         if (m_uring_enabled)
         {
+            // Spinlock — io_uring ring is not thread-safe
+            while (m_uring_lock.test_and_set(std::memory_order_acquire)) { /* spin */ }
+
             // Copy to pool and queue io_uring SQE
             if (m_uring_pool_offset + total_size > m_uring_pool_size)
             {
                 // Pool exhausted — flush pending and retry
-                flush_uring();
+                flush_uring_locked();
                 if (m_uring_pool_offset + total_size > m_uring_pool_size)
+                {
+                    m_uring_lock.clear(std::memory_order_release);
                     goto fallback_sendmsg; // Single buffer too large for pool
+                }
             }
             if (m_uring_pending >= m_uring_max_sqes)
             {
-                flush_uring();
+                flush_uring_locked();
             }
 
             uint8_t *pool_buf = m_uring_pool + m_uring_pool_offset;
@@ -745,14 +751,18 @@ namespace entanglement
             struct io_uring_sqe *sqe = io_uring_get_sqe(&m_uring);
             if (!sqe)
             {
-                flush_uring();
+                flush_uring_locked();
                 sqe = io_uring_get_sqe(&m_uring);
                 if (!sqe)
+                {
+                    m_uring_lock.clear(std::memory_order_release);
                     goto fallback_sendmsg;
+                }
             }
 
             io_uring_prep_sendmsg(sqe, m_socket, &meta.msg, 0);
             ++m_uring_pending;
+            m_uring_lock.clear(std::memory_order_release);
             return static_cast<int>(total_size);
         }
         fallback_sendmsg:
@@ -814,7 +824,7 @@ namespace entanglement
         return error_code::ok;
     }
 
-    int udp_socket::flush_uring()
+    int udp_socket::flush_uring_locked()
     {
         if (m_uring_pending == 0)
             return 0;
@@ -843,6 +853,14 @@ namespace entanglement
 
         m_uring_pool_offset = 0;
         m_uring_pending = 0;
+        return completed;
+    }
+
+    int udp_socket::flush_uring()
+    {
+        while (m_uring_lock.test_and_set(std::memory_order_acquire)) { /* spin */ }
+        int completed = flush_uring_locked();
+        m_uring_lock.clear(std::memory_order_release);
         return completed;
     }
 
