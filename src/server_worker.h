@@ -56,8 +56,10 @@ namespace entanglement
         // For RAW sends
         packet_header raw_header{};
 
-        // Payload data (moved, not copied — handles both small and large messages)
-        std::vector<uint8_t> data;
+        // Payload data — fixed inline buffer, no heap allocation.
+        // All game sends fit within MAX_PACKET_SIZE (1200 bytes).
+        uint8_t  data[MAX_PACKET_SIZE]{};
+        uint16_t data_size = 0;
     };
 
     // Forward declarations for server callback types (duplicated from server.h to avoid circular include)

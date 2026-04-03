@@ -392,16 +392,16 @@ namespace entanglement
             switch (cmd.type)
             {
                 case send_command::kind::DATA:
-                    send_to(cmd.data.data(), cmd.data.size(), cmd.channel_id, cmd.dest, cmd.flags, nullptr);
+                    send_to(cmd.data, cmd.data_size, cmd.channel_id, cmd.dest, cmd.flags, nullptr);
                     break;
 
                 case send_command::kind::RAW:
-                    send_raw_to(cmd.raw_header, cmd.data.data(), cmd.dest);
+                    send_raw_to(cmd.raw_header, cmd.data, cmd.dest);
                     break;
 
                 case send_command::kind::FRAGMENT:
-                    send_fragment_to(cmd.message_id, cmd.fragment_index, cmd.fragment_count, cmd.data.data(),
-                                     cmd.data.size(), cmd.flags, cmd.channel_id, cmd.dest, cmd.channel_sequence);
+                    send_fragment_to(cmd.message_id, cmd.fragment_index, cmd.fragment_count, cmd.data,
+                                     cmd.data_size, cmd.flags, cmd.channel_id, cmd.dest, cmd.channel_sequence);
                     break;
 
                 case send_command::kind::DISCONNECT:

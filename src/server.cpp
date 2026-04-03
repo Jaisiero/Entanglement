@@ -542,8 +542,8 @@ namespace entanglement
         cmd.type = send_command::kind::RAW;
         cmd.dest = key;
         cmd.raw_header = header;
-        cmd.data.assign(static_cast<const uint8_t *>(payload),
-                        static_cast<const uint8_t *>(payload) + header.payload_size);
+        cmd.data_size = static_cast<uint16_t>(header.payload_size);
+        std::memcpy(cmd.data, payload, cmd.data_size);
         m_workers[w]->enqueue_send(std::move(cmd));
         return header.payload_size;
     }
@@ -572,7 +572,8 @@ namespace entanglement
         cmd.dest = key;
         cmd.channel_id = channel_id;
         cmd.flags = flags;
-        cmd.data.assign(static_cast<const uint8_t *>(data), static_cast<const uint8_t *>(data) + size);
+        cmd.data_size = static_cast<uint16_t>(size);
+        std::memcpy(cmd.data, data, size);
         m_workers[w]->enqueue_send(std::move(cmd));
         return static_cast<int>(size);
     }
@@ -608,7 +609,8 @@ namespace entanglement
         cmd.fragment_index = fragment_index;
         cmd.fragment_count = fragment_count;
         cmd.channel_sequence = channel_sequence;
-        cmd.data.assign(static_cast<const uint8_t *>(data), static_cast<const uint8_t *>(data) + size);
+        cmd.data_size = static_cast<uint16_t>(size);
+        std::memcpy(cmd.data, data, size);
         m_workers[w]->enqueue_send(std::move(cmd));
         return static_cast<int>(size);
     }
