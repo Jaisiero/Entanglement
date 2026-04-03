@@ -364,6 +364,15 @@ namespace entanglement
         return conn->send_payload(*m_send_socket, *m_channels, data, size, flags, channel_id, dest, out_message_id);
     }
 
+    int server_worker::send_to_multi(const void *const *payloads, const uint16_t *sizes,
+                                     uint32_t count, uint8_t channel_id, const endpoint_key &dest, uint8_t flags)
+    {
+        udp_connection *conn = find(dest);
+        if (!conn || conn->state() == connection_state::DISCONNECTED)
+            return static_cast<int>(error_code::not_connected);
+        return conn->send_payload_multi(*m_send_socket, *m_channels, payloads, sizes, count, flags, channel_id, dest);
+    }
+
     int server_worker::send_fragment_to(uint32_t message_id, uint8_t fragment_index, uint8_t fragment_count,
                                         const void *data, size_t size, uint8_t flags, uint8_t channel_id,
                                         const endpoint_key &dest, uint32_t channel_sequence)

@@ -84,6 +84,11 @@ namespace entanglement
         int worker_send_to(size_t worker_idx, const void *data, size_t size,
                            uint8_t channel_id, const endpoint_key &key, uint8_t flags);
 
+        // Send multiple payloads to the same destination via UDP GSO.
+        // SAFETY: same as worker_send_to — workers MUST be paused.
+        int worker_send_to_multi(size_t worker_idx, const void *const *payloads, const uint16_t *sizes,
+                                 uint32_t count, uint8_t channel_id, const endpoint_key &key, uint8_t flags);
+
         // Begin/flush sendmmsg batching on a specific worker's socket.
         // Call begin before a burst of worker_send_to, flush after.
         // SAFETY: same as worker_send_to — workers MUST be paused.

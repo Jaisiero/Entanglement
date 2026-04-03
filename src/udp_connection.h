@@ -311,6 +311,16 @@ namespace entanglement
                           uint8_t count, const void *data, size_t size, uint8_t flags, uint8_t channel_id,
                           const endpoint_key &dest, uint32_t channel_sequence = 0);
 
+        // Send multiple payloads to the same destination via UDP GSO (one sendmsg).
+        // Each payload must fit in a single packet (≤ MAX_PAYLOAD_SIZE).
+        // On Linux, builds a GSO buffer and sends with cmsg UDP_SEGMENT.
+        // On Windows/fallback, sends each payload individually.
+        // Returns total bytes sent, or a negative error_code.
+        int send_payload_multi(udp_socket &socket, const channel_manager &channels,
+                               const void *const *payloads, const uint16_t *payload_sizes,
+                               uint32_t count, uint8_t flags, uint8_t channel_id,
+                               const endpoint_key &dest);
+
         // --- Message coalescing ---
 
         // Flush all pending coalesce buffers for this connection.

@@ -125,6 +125,10 @@ namespace entanglement
         int send_to(const void *data, size_t size, uint8_t channel_id, const endpoint_key &dest, uint8_t flags = 0,
                     uint32_t *out_message_id = nullptr);
 
+        // Send multiple payloads to the same destination via UDP GSO.
+        int send_to_multi(const void *const *payloads, const uint16_t *sizes,
+                          uint32_t count, uint8_t channel_id, const endpoint_key &dest, uint8_t flags = 0);
+
         int send_fragment_to(uint32_t message_id, uint8_t fragment_index, uint8_t fragment_count, const void *data,
                              size_t size, uint8_t flags, uint8_t channel_id, const endpoint_key &dest,
                              uint32_t channel_sequence = 0);

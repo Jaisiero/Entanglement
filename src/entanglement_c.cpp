@@ -642,6 +642,21 @@ int ent_server_worker_send_to(ent_server_t *s, size_t worker_idx,
     return s->cpp.worker_send_to(worker_idx, data, size, channel_id, key, flags);
 }
 
+int ent_server_worker_send_to_multi(ent_server_t *s, size_t worker_idx,
+                                    const void *const *payloads,
+                                    const uint16_t *sizes,
+                                    uint32_t count,
+                                    uint8_t channel_id, ent_endpoint dest,
+                                    uint8_t flags)
+{
+    if (!s)
+        return ENT_ERROR_INVALID_ARGUMENT;
+    endpoint_key key{};
+    key.address = dest.address;
+    key.port = dest.port;
+    return s->cpp.worker_send_to_multi(worker_idx, payloads, sizes, count, channel_id, key, flags);
+}
+
 void ent_server_worker_begin_send_batch(ent_server_t *s, size_t worker_idx)
 {
     if (s)

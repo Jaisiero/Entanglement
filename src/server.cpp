@@ -476,6 +476,14 @@ namespace entanglement
         return m_workers[worker_idx]->send_to(data, size, channel_id, key, flags, nullptr);
     }
 
+    int server::worker_send_to_multi(size_t worker_idx, const void *const *payloads, const uint16_t *sizes,
+                                     uint32_t count, uint8_t channel_id, const endpoint_key &key, uint8_t flags)
+    {
+        if (worker_idx >= m_workers.size())
+            return static_cast<int>(error_code::not_connected);
+        return m_workers[worker_idx]->send_to_multi(payloads, sizes, count, channel_id, key, flags);
+    }
+
     void server::worker_begin_send_batch(size_t worker_idx)
     {
         if (worker_idx < m_workers.size())

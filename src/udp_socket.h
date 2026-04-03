@@ -153,6 +153,14 @@ namespace entanglement
         // Flush all buffered sends via sendmmsg. Returns number of packets sent.
         // Automatically exits batch mode.
         int flush_send_batch();
+
+        // --- UDP GSO (Generic Segmentation Offload) ---
+
+        // Send a pre-built GSO buffer as a single sendmsg with UDP_SEGMENT cmsg.
+        // The kernel splits it into datagrams of segment_size bytes (last may be shorter).
+        // Returns total bytes submitted, or -1 on error.
+        int send_gso(const void *buffer, size_t total_size, uint16_t segment_size,
+                     const endpoint_key &dest);
 #endif
 
 #ifdef ENTANGLEMENT_SIMULATE_LOSS

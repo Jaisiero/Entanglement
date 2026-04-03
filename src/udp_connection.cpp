@@ -773,6 +773,108 @@ namespace entanglement
         return socket.send_packet_gather(header, segments, seg_sizes, 2, dest);
     }
 
+    int udp_connection::send_payload_multi(udp_socket &socket, const channel_manager &channels,
+                                           const void *const *payloads, const uint16_t *payload_sizes,
+                                           uint32_t count, uint8_t flags, uint8_t channel_id,
+                                           const endpoint_key &dest)
+    {
+        if (count == 0)
+            return 0;
+
+        // Single payload — just use normal send path
+        if (count == 1)
+            return send_payload(socket, channels, payloads[0], payload_sizes[0], flags, channel_id, dest);
+
+#ifdef ENTANGLEMENT_PLATFORM_LINUX
+        // Build GSO buffer: [hdr0 + payload0][hdr1 + payload1]...[hdrN + payloadN]
+        // Find the maximum payload size (determines segment_size for GSO).
+        // All payloads except the last MUST be the same size for GSO to split correctly.
+        uint16_t max_payload = 0;
+        for (uint32_t i = 0; i < count - 1; ++i)
+        {
+            if (payload_sizes[i] > max_payload)
+                max_payload = payload_sizes[i];
+        }
+        if (count == 1 || max_payload == 0)
+            max_payload = payload_sizes[0];
+
+        uint16_t segment_size = static_cast<uint16_t>(sizeof(packet_header) + max_payload);
+        bool reliable = channels.is_reliable(channel_id);
+
+        // Stack buffer for GSO — 64KB max (covers ~55 segments)
+        constexpr size_t GSO_BUF_MAX = 65536;
+        uint8_t gso_buf[GSO_BUF_MAX];
+        size_t gso_pos = 0;
+
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            uint16_t psize = payload_sizes[i];
+            size_t seg_len = sizeof(packet_header) + psize;
+
+            // Pad non-last segments to segment_size so kernel splits correctly
+            size_t write_len = (i < count - 1) ? segment_size : seg_len;
+
+            if (gso_pos + write_len > GSO_BUF_MAX)
+            {
+                // Buffer full — flush what we have and start fresh
+                if (gso_pos > 0)
+                    socket.send_gso(gso_buf, gso_pos, segment_size, dest);
+                gso_pos = 0;
+            }
+
+            packet_header hdr{};
+            hdr.flags = flags;
+            hdr.channel_id = channel_id;
+            hdr.payload_size = psize;
+            prepare_header(hdr, reliable);
+
+            std::memcpy(gso_buf + gso_pos, &hdr, sizeof(packet_header));
+            gso_pos += sizeof(packet_header);
+            std::memcpy(gso_buf + gso_pos, payloads[i], psize);
+            gso_pos += psize;
+
+            // Pad to segment_size for non-last segments
+            if (i < count - 1 && seg_len < segment_size)
+            {
+                size_t pad = segment_size - seg_len;
+                std::memset(gso_buf + gso_pos, 0, pad);
+                gso_pos += pad;
+            }
+        }
+
+        if (gso_pos > 0)
+        {
+            int ret = socket.send_gso(gso_buf, gso_pos, segment_size, dest);
+            if (ret < 0)
+            {
+                // GSO failed — fall back to individual sends
+                int total = 0;
+                for (uint32_t i = 0; i < count; ++i)
+                {
+                    int r = send_payload(socket, channels, payloads[i], payload_sizes[i],
+                                         flags, channel_id, dest);
+                    if (r > 0)
+                        total += r;
+                }
+                return total;
+            }
+            return ret;
+        }
+        return 0;
+#else
+        // Windows fallback: send each payload individually
+        int total = 0;
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            int r = send_payload(socket, channels, payloads[i], payload_sizes[i],
+                                 flags, channel_id, dest);
+            if (r > 0)
+                total += r;
+        }
+        return total;
+#endif
+    }
+
     // --- Ordered stall detection ---
 
     void udp_connection::check_ordered_stalls(const channel_manager &channels,

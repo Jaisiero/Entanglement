@@ -6,6 +6,7 @@
 #include <io.h>
 #else
 #include <fcntl.h>
+#include <netinet/udp.h> // UDP_SEGMENT, SOL_UDP
 #endif
 
 namespace entanglement
@@ -679,6 +680,42 @@ namespace entanglement
 
         m_send_batch_count = 0;
         return total_sent;
+    }
+
+    int udp_socket::send_gso(const void *buffer, size_t total_size, uint16_t segment_size,
+                             const endpoint_key &dest)
+    {
+        if (!buffer || total_size == 0 || segment_size == 0)
+            return -1;
+
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(dest.port);
+        addr.sin_addr.s_addr = dest.address;
+
+        struct iovec iov{};
+        iov.iov_base = const_cast<void *>(buffer);
+        iov.iov_len = total_size;
+
+        // cmsg buffer for UDP_SEGMENT
+        alignas(struct cmsghdr) char cmsg_buf[CMSG_SPACE(sizeof(uint16_t))]{};
+
+        struct msghdr msg{};
+        msg.msg_name = &addr;
+        msg.msg_namelen = sizeof(addr);
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cmsg_buf;
+        msg.msg_controllen = sizeof(cmsg_buf);
+
+        struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+        cmsg->cmsg_level = SOL_UDP;
+        cmsg->cmsg_type = UDP_SEGMENT;
+        cmsg->cmsg_len = CMSG_LEN(sizeof(uint16_t));
+        *reinterpret_cast<uint16_t *>(CMSG_DATA(cmsg)) = segment_size;
+
+        ssize_t ret = sendmsg(m_socket, &msg, 0);
+        return static_cast<int>(ret);
     }
 
 #endif // ENTANGLEMENT_PLATFORM_LINUX

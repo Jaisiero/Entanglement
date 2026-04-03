@@ -376,6 +376,17 @@ extern "C"
                                           uint8_t channel_id, ent_endpoint dest,
                                           uint8_t flags);
 
+    /* Send multiple payloads to the same destination via UDP GSO (one syscall).
+     * payloads: array of `count` payload pointers.
+     * sizes:    array of `count` payload sizes (uint16_t each).
+     * SAFETY: workers MUST be paused. */
+    ENT_API int ent_server_worker_send_to_multi(ent_server_t *s, size_t worker_idx,
+                                                const void *const *payloads,
+                                                const uint16_t *sizes,
+                                                uint32_t count,
+                                                uint8_t channel_id, ent_endpoint dest,
+                                                uint8_t flags);
+
     /* Begin sendmmsg batching on a worker's socket. Call before a burst of
      * worker_send_to calls, then flush after. Reduces syscalls from N to N/256.
      * SAFETY: workers MUST be paused. */
