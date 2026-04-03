@@ -194,6 +194,23 @@ namespace entanglement
         // --- Linux: batch-mode or immediate sendmsg ---
         if (m_send_batch_mode)
         {
+            // Flush if batch is full BEFORE accessing the slot array
+            if (m_send_batch_count >= SEND_BATCH_MAX)
+            {
+                // Inline flush that preserves batch mode
+                int remaining = m_send_batch_count;
+                int offset = 0;
+                while (remaining > 0)
+                {
+                    int sent = sendmmsg(m_socket, &m_send_mmsg[offset], remaining, 0);
+                    if (sent <= 0)
+                        break;
+                    offset += sent;
+                    remaining -= sent;
+                }
+                m_send_batch_count = 0;
+            }
+
             // Linearise header + payload into the current batch slot
             auto &slot = m_send_slots[m_send_batch_count];
             slot.dest = addr;
@@ -219,8 +236,6 @@ namespace entanglement
             mh.msg_hdr.msg_iovlen = 1;
 
             ++m_send_batch_count;
-            if (m_send_batch_count >= SEND_BATCH_MAX)
-                flush_send_batch();
 
             return static_cast<int>(total);
         }
