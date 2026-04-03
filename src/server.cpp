@@ -427,16 +427,53 @@ namespace entanglement
 
         while (m_running.load(std::memory_order_relaxed))
         {
-            // Outer batch scope: poll_local + update share a single sendmmsg flush.
-            // Inner begin/flush in poll_local and update become re-entrant no-ops.
-            worker.send_socket()->begin_send_batch();
+            // Check pause request — spin until resumed
+            if (m_paused.load(std::memory_order_acquire))
+            {
+                m_workers_paused.fetch_add(1, std::memory_order_release);
+                while (m_paused.load(std::memory_order_acquire))
+                    std::this_thread::yield();
+                m_workers_paused.fetch_sub(1, std::memory_order_release);
+                continue;
+            }
+
             int processed = worker.poll_local();
             worker.update();
-            worker.send_socket()->flush_send_batch();
 
             if (processed == 0)
                 std::this_thread::yield();
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Worker direct-send API (bypass MPSC queue)
+    // -----------------------------------------------------------------------
+
+    void server::pause_workers()
+    {
+        if (!m_threaded || m_workers.empty())
+            return;
+        m_paused.store(true, std::memory_order_release);
+        const int total = static_cast<int>(m_workers.size());
+        while (m_workers_paused.load(std::memory_order_acquire) < total)
+            std::this_thread::yield();
+    }
+
+    void server::resume_workers()
+    {
+        if (!m_threaded)
+            return;
+        m_paused.store(false, std::memory_order_release);
+        while (m_workers_paused.load(std::memory_order_acquire) > 0)
+            std::this_thread::yield();
+    }
+
+    int server::worker_send_to(size_t worker_idx, const void *data, size_t size,
+                               uint8_t channel_id, const endpoint_key &key, uint8_t flags)
+    {
+        if (worker_idx >= m_workers.size())
+            return static_cast<int>(error_code::not_connected);
+        return m_workers[worker_idx]->send_to(data, size, channel_id, key, flags, nullptr);
     }
 
     // -----------------------------------------------------------------------

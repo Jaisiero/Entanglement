@@ -614,6 +614,50 @@ uint16_t ent_server_port(const ent_server_t *s)
 }
 
 /* -----------------------------------------------------------------------
+ * Server: worker direct-send API
+ * ----------------------------------------------------------------------- */
+
+void ent_server_pause_workers(ent_server_t *s)
+{
+    if (s)
+        s->cpp.pause_workers();
+}
+
+void ent_server_resume_workers(ent_server_t *s)
+{
+    if (s)
+        s->cpp.resume_workers();
+}
+
+int ent_server_worker_send_to(ent_server_t *s, size_t worker_idx,
+                              const void *data, size_t size,
+                              uint8_t channel_id, ent_endpoint dest,
+                              uint8_t flags)
+{
+    if (!s)
+        return ENT_ERROR_INVALID_ARGUMENT;
+    endpoint_key key{};
+    key.address = dest.address;
+    key.port = dest.port;
+    return s->cpp.worker_send_to(worker_idx, data, size, channel_id, key, flags);
+}
+
+size_t ent_server_worker_index(const ent_server_t *s, ent_endpoint dest)
+{
+    if (!s)
+        return 0;
+    endpoint_key key{};
+    key.address = dest.address;
+    key.port = dest.port;
+    return s->cpp.get_worker_index(key);
+}
+
+int ent_server_worker_count(const ent_server_t *s)
+{
+    return s ? s->cpp.get_worker_count() : 0;
+}
+
+/* -----------------------------------------------------------------------
  * Server: callbacks
  * ----------------------------------------------------------------------- */
 

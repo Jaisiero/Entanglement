@@ -70,6 +70,26 @@ namespace entanglement
         // Flush coalesced message buffers for a specific client.
         void flush_coalesce(const endpoint_key &dest);
 
+        // --- Worker direct-send API (bypass MPSC queue) ---
+        // Pause all worker threads (spin-wait until all have paused).
+        // While paused, caller may safely invoke worker_send_to().
+        void pause_workers();
+
+        // Resume all worker threads after a pause.
+        void resume_workers();
+
+        // Direct send through a specific worker — bypasses MPSC queue and send_pool.
+        // SAFETY: caller MUST ensure exclusive access to worker_idx (no concurrent
+        // calls with the same worker_idx, and workers MUST be paused).
+        int worker_send_to(size_t worker_idx, const void *data, size_t size,
+                           uint8_t channel_id, const endpoint_key &key, uint8_t flags);
+
+        // Expose worker routing: returns which worker owns a given endpoint.
+        size_t get_worker_index(const endpoint_key &key) const { return worker_index(key); }
+
+        // Number of active workers.
+        int get_worker_count() const { return static_cast<int>(m_workers.size()); }
+
         uint16_t port() const { return m_port; }
 
         size_t connection_count() const
@@ -227,6 +247,10 @@ namespace entanglement
 
         // Worker thread loop (multi-threaded mode)
         void worker_loop(size_t worker_idx);
+
+        // Worker pause/resume synchronisation
+        std::atomic<bool> m_paused{false};
+        std::atomic<int> m_workers_paused{0};
 
         // Shared send data pool (cross-thread sends write payload here)
         send_pool m_send_pool;
