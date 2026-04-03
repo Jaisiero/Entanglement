@@ -31,6 +31,13 @@ elseif(UNIX)
     # _GNU_SOURCE needed for recvmmsg / mmsghdr on Linux
     if(NOT APPLE)
         target_compile_definitions(entanglement_core PUBLIC _GNU_SOURCE)
+
+        # io_uring for batched GSO sends
+        find_library(LIBURING uring)
+        if(LIBURING)
+            target_link_libraries(entanglement_core PUBLIC ${LIBURING})
+            target_compile_definitions(entanglement_core PUBLIC ENTANGLEMENT_HAS_URING)
+        endif()
     endif()
 endif()
 

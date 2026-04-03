@@ -496,6 +496,21 @@ namespace entanglement
             m_workers[worker_idx]->send_socket()->flush_send_batch();
     }
 
+#ifdef ENTANGLEMENT_HAS_URING
+    void server::worker_init_uring(size_t worker_idx)
+    {
+        if (worker_idx < m_workers.size())
+            m_workers[worker_idx]->send_socket()->init_uring();
+    }
+
+    int server::worker_flush_uring(size_t worker_idx)
+    {
+        if (worker_idx < m_workers.size())
+            return m_workers[worker_idx]->send_socket()->flush_uring();
+        return 0;
+    }
+#endif
+
     // -----------------------------------------------------------------------
     // Packet processing (single-threaded mode — called from game loop)
     // -----------------------------------------------------------------------

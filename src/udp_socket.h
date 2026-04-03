@@ -7,6 +7,10 @@
 #include <memory>
 #include <string>
 
+#ifdef ENTANGLEMENT_HAS_URING
+#include <liburing.h>
+#endif
+
 #ifdef ENTANGLEMENT_SIMULATE_LOSS
 #include <random>
 #endif
@@ -161,6 +165,23 @@ namespace entanglement
         // Returns total bytes submitted, or -1 on error.
         int send_gso(const void *buffer, size_t total_size, uint16_t segment_size,
                      const endpoint_key &dest);
+
+#ifdef ENTANGLEMENT_HAS_URING
+        // --- io_uring batched GSO send ---
+        
+        // Initialize io_uring ring and send buffer pool.
+        // pool_size: total bytes for the send buffer pool (default 2MB).
+        // max_sqes: maximum outstanding SQEs (default 512).
+        error_code init_uring(size_t pool_size = 2 * 1024 * 1024, uint32_t max_sqes = 512);
+        
+        bool uring_enabled() const { return m_uring_enabled; }
+        
+        // Submit all queued GSO sends via io_uring and wait for completion.
+        // Resets the pool for the next batch. Returns number of completed sends.
+        int flush_uring();
+        
+        void shutdown_uring();
+#endif
 #endif
 
 #ifdef ENTANGLEMENT_SIMULATE_LOSS
@@ -221,6 +242,28 @@ namespace entanglement
         int m_send_batch_nesting = 0; // >0 means nested begin — flush is a no-op
         std::unique_ptr<sendmmsg_slot[]> m_send_slots;
         std::unique_ptr<struct mmsghdr[]> m_send_mmsg;
+
+#ifdef ENTANGLEMENT_HAS_URING
+        // --- io_uring batched send state ---
+        struct io_uring m_uring{};
+        bool m_uring_enabled = false;
+        
+        // Linear allocator pool for GSO buffers
+        uint8_t* m_uring_pool = nullptr;
+        size_t m_uring_pool_size = 0;
+        size_t m_uring_pool_offset = 0;
+        
+        // Per-send metadata must persist until flush (msghdr points into these)
+        struct uring_send_meta {
+            struct msghdr msg{};
+            struct iovec iov{};
+            struct sockaddr_in addr{};
+            alignas(struct cmsghdr) char cmsg[CMSG_SPACE(sizeof(uint16_t))]{};
+        };
+        std::unique_ptr<uring_send_meta[]> m_uring_metas;
+        uint32_t m_uring_max_sqes = 0;
+        uint32_t m_uring_pending = 0;
+#endif
 #endif
 
 #ifdef ENTANGLEMENT_SIMULATE_LOSS

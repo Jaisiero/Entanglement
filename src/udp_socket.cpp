@@ -9,11 +9,18 @@
 #include <netinet/udp.h> // UDP_SEGMENT, SOL_UDP
 #endif
 
+#ifdef ENTANGLEMENT_HAS_URING
+#include <liburing.h>
+#endif
+
 namespace entanglement
 {
 
     udp_socket::~udp_socket()
     {
+#ifdef ENTANGLEMENT_HAS_URING
+        shutdown_uring();
+#endif
         close();
     }
 
@@ -688,6 +695,69 @@ namespace entanglement
         if (!buffer || total_size == 0 || segment_size == 0)
             return -1;
 
+#ifdef ENTANGLEMENT_HAS_URING
+        if (m_uring_enabled)
+        {
+            // Copy to pool and queue io_uring SQE
+            if (m_uring_pool_offset + total_size > m_uring_pool_size)
+            {
+                // Pool exhausted — flush pending and retry
+                flush_uring();
+                if (m_uring_pool_offset + total_size > m_uring_pool_size)
+                    goto fallback_sendmsg; // Single buffer too large for pool
+            }
+            if (m_uring_pending >= m_uring_max_sqes)
+            {
+                flush_uring();
+            }
+
+            uint8_t *pool_buf = m_uring_pool + m_uring_pool_offset;
+            std::memcpy(pool_buf, buffer, total_size);
+            m_uring_pool_offset += total_size;
+
+            uint32_t idx = m_uring_pending;
+            auto &meta = m_uring_metas[idx];
+
+            meta.addr = {};
+            meta.addr.sin_family = AF_INET;
+            meta.addr.sin_port = htons(dest.port);
+            meta.addr.sin_addr.s_addr = dest.address;
+
+            meta.iov.iov_base = pool_buf;
+            meta.iov.iov_len = total_size;
+
+            std::memset(meta.cmsg, 0, sizeof(meta.cmsg));
+
+            meta.msg = {};
+            meta.msg.msg_name = &meta.addr;
+            meta.msg.msg_namelen = sizeof(meta.addr);
+            meta.msg.msg_iov = &meta.iov;
+            meta.msg.msg_iovlen = 1;
+            meta.msg.msg_control = meta.cmsg;
+            meta.msg.msg_controllen = sizeof(meta.cmsg);
+
+            struct cmsghdr *cmsg = CMSG_FIRSTHDR(&meta.msg);
+            cmsg->cmsg_level = SOL_UDP;
+            cmsg->cmsg_type = UDP_SEGMENT;
+            cmsg->cmsg_len = CMSG_LEN(sizeof(uint16_t));
+            *reinterpret_cast<uint16_t *>(CMSG_DATA(cmsg)) = segment_size;
+
+            struct io_uring_sqe *sqe = io_uring_get_sqe(&m_uring);
+            if (!sqe)
+            {
+                flush_uring();
+                sqe = io_uring_get_sqe(&m_uring);
+                if (!sqe)
+                    goto fallback_sendmsg;
+            }
+
+            io_uring_prep_sendmsg(sqe, m_socket, &meta.msg, 0);
+            ++m_uring_pending;
+            return static_cast<int>(total_size);
+        }
+        fallback_sendmsg:
+#endif
+
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_port = htons(dest.port);
@@ -717,6 +787,82 @@ namespace entanglement
         ssize_t ret = sendmsg(m_socket, &msg, 0);
         return static_cast<int>(ret);
     }
+
+#ifdef ENTANGLEMENT_HAS_URING
+    error_code udp_socket::init_uring(size_t pool_size, uint32_t max_sqes)
+    {
+        if (m_uring_enabled)
+            return error_code::success;
+
+        int ret = io_uring_queue_init(max_sqes, &m_uring, 0);
+        if (ret < 0)
+            return error_code::socket_error;
+
+        m_uring_pool = new (std::nothrow) uint8_t[pool_size];
+        if (!m_uring_pool)
+        {
+            io_uring_queue_exit(&m_uring);
+            return error_code::socket_error;
+        }
+        m_uring_pool_size = pool_size;
+        m_uring_pool_offset = 0;
+
+        m_uring_metas = std::make_unique<uring_send_meta[]>(max_sqes);
+        m_uring_max_sqes = max_sqes;
+        m_uring_pending = 0;
+        m_uring_enabled = true;
+        return error_code::success;
+    }
+
+    int udp_socket::flush_uring()
+    {
+        if (m_uring_pending == 0)
+            return 0;
+
+        int submitted = io_uring_submit(&m_uring);
+        if (submitted < 0)
+        {
+            m_uring_pool_offset = 0;
+            m_uring_pending = 0;
+            return 0;
+        }
+
+        // Wait for all completions
+        uint32_t remaining = m_uring_pending;
+        int completed = 0;
+        while (remaining > 0)
+        {
+            struct io_uring_cqe *cqe = nullptr;
+            int ret = io_uring_wait_cqe(&m_uring, &cqe);
+            if (ret < 0)
+                break;
+            io_uring_cqe_seen(&m_uring, cqe);
+            ++completed;
+            --remaining;
+        }
+
+        m_uring_pool_offset = 0;
+        m_uring_pending = 0;
+        return completed;
+    }
+
+    void udp_socket::shutdown_uring()
+    {
+        if (!m_uring_enabled)
+            return;
+
+        flush_uring();
+        io_uring_queue_exit(&m_uring);
+
+        delete[] m_uring_pool;
+        m_uring_pool = nullptr;
+        m_uring_pool_size = 0;
+        m_uring_pool_offset = 0;
+        m_uring_metas.reset();
+        m_uring_pending = 0;
+        m_uring_enabled = false;
+    }
+#endif
 
 #endif // ENTANGLEMENT_PLATFORM_LINUX
 
