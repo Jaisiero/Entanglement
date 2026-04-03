@@ -792,7 +792,7 @@ namespace entanglement
     error_code udp_socket::init_uring(size_t pool_size, uint32_t max_sqes)
     {
         if (m_uring_enabled)
-            return error_code::success;
+            return error_code::ok;
 
         int ret = io_uring_queue_init(max_sqes, &m_uring, 0);
         if (ret < 0)
@@ -811,7 +811,7 @@ namespace entanglement
         m_uring_max_sqes = max_sqes;
         m_uring_pending = 0;
         m_uring_enabled = true;
-        return error_code::success;
+        return error_code::ok;
     }
 
     int udp_socket::flush_uring()
