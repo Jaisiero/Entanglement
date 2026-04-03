@@ -97,8 +97,7 @@ namespace entanglement
         // recv_queue_count: number of SPSC recv queues (one per receiver thread).
         // Default 1 for single-socket mode. Set > 1 for SO_REUSEPORT multi-socket.
         void init(size_t pool_capacity, udp_socket *socket, channel_manager *channels,
-                  const std::atomic<bool> *running_flag, send_pool *spool = nullptr,
-                  int recv_queue_count = 1);
+                  const std::atomic<bool> *running_flag, send_pool *spool = nullptr, int recv_queue_count = 1);
 
         // --- Receive queue (receiver thread → this worker, zero-copy) ---
         // Acquires a pool slot, copies payload once from source, pushes slot index.
@@ -173,6 +172,7 @@ namespace entanglement
         // contention when multiple workers send concurrently).  When not set,
         // the shared receive socket is used for both send and receive.
         void set_send_socket(udp_socket *s) { m_send_socket = s ? s : m_socket; }
+        udp_socket *send_socket() const { return m_send_socket; }
 
     private:
         // Shared resources (not owned)
@@ -180,7 +180,7 @@ namespace entanglement
         udp_socket *m_send_socket = nullptr; // per-worker send socket (may == m_socket)
         channel_manager *m_channels = nullptr;
         const std::atomic<bool> *m_running = nullptr;
-        send_pool *m_send_pool = nullptr;    // shared send data pool (for cross-thread commands)
+        send_pool *m_send_pool = nullptr; // shared send data pool (for cross-thread commands)
 
         // Per-worker connection pool
         std::unique_ptr<udp_connection[]> m_pool;

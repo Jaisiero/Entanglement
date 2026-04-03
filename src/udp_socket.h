@@ -121,6 +121,7 @@ namespace entanglement
         bool iocp_enabled() const { return m_iocp_enabled; }
 
         // No-op batch send on Windows – individual WSASendTo is already efficient.
+        // Re-entrant: nested begin/flush pairs are harmless no-ops.
         void begin_send_batch() {}
         int flush_send_batch() { return 0; }
 #endif
@@ -209,6 +210,7 @@ namespace entanglement
 
         bool m_send_batch_mode = false;
         int m_send_batch_count = 0;
+        int m_send_batch_nesting = 0; // >0 means nested begin — flush is a no-op
         std::unique_ptr<sendmmsg_slot[]> m_send_slots;
         std::unique_ptr<struct mmsghdr[]> m_send_mmsg;
 #endif

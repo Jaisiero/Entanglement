@@ -427,8 +427,12 @@ namespace entanglement
 
         while (m_running.load(std::memory_order_relaxed))
         {
+            // Outer batch scope: poll_local + update share a single sendmmsg flush.
+            // Inner begin/flush in poll_local and update become re-entrant no-ops.
+            worker.send_socket()->begin_send_batch();
             int processed = worker.poll_local();
             worker.update();
+            worker.send_socket()->flush_send_batch();
 
             if (processed == 0)
                 std::this_thread::yield();

@@ -631,6 +631,13 @@ namespace entanglement
 
     void udp_socket::begin_send_batch()
     {
+        // Re-entrant: if already in batch mode, just bump nesting counter.
+        if (m_send_batch_mode)
+        {
+            ++m_send_batch_nesting;
+            return;
+        }
+
         // Lazily allocate on first call
         if (!m_send_slots)
         {
@@ -639,10 +646,18 @@ namespace entanglement
         }
         m_send_batch_mode = true;
         m_send_batch_count = 0;
+        m_send_batch_nesting = 0;
     }
 
     int udp_socket::flush_send_batch()
     {
+        // Re-entrant: inner flush is a no-op, only outermost caller actually sends.
+        if (m_send_batch_nesting > 0)
+        {
+            --m_send_batch_nesting;
+            return 0;
+        }
+
         m_send_batch_mode = false;
 
         if (m_send_batch_count == 0)
