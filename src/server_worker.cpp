@@ -30,7 +30,7 @@ namespace entanglement
         for (int i = 0; i < recv_queue_count; ++i)
             m_recv_queues.push_back(std::make_unique<recv_queue_t>());
 
-        m_send_queue = std::make_unique<spsc_queue<send_command, WORKER_SEND_QUEUE_SIZE>>();
+        m_send_queue = std::make_unique<mpsc_queue<send_command, WORKER_SEND_QUEUE_SIZE>>();
     }
 
     // -----------------------------------------------------------------------

@@ -2,6 +2,7 @@
 
 #include "channel_manager.h"
 #include "fragmentation.h"
+#include "mpsc_queue.h"
 #include "spsc_queue.h"
 #include "udp_connection.h"
 #include "udp_socket.h"
@@ -100,7 +101,7 @@ namespace entanglement
         bool enqueue_packet(const packet_header &hdr, const uint8_t *payload, uint16_t payload_size,
                             const endpoint_key &sender, int queue_id = 0);
 
-        // --- Send command queue (any thread → this worker) ---
+        // --- Send command queue (any thread → this worker, multi-producer safe) ---
         bool enqueue_send(send_command &&cmd);
 
         // --- Processing (called from owning thread) ---
@@ -192,7 +193,9 @@ namespace entanglement
         // One recv queue per receiver thread (size 1 in single-socket mode).
         // Uses write_slot/read_slot zero-copy API (no full-struct copies).
         std::vector<std::unique_ptr<recv_queue_t>> m_recv_queues;
-        std::unique_ptr<spsc_queue<send_command, WORKER_SEND_QUEUE_SIZE>> m_send_queue;
+        // MPSC send queue (multi-producer safe — game threads enqueue concurrently,
+        // single worker thread drains in flush_send_queue).
+        std::unique_ptr<mpsc_queue<send_command, WORKER_SEND_QUEUE_SIZE>> m_send_queue;
 
         // Flush pending send commands from the cross-thread queue
         void flush_send_queue();
