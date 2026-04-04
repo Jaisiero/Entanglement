@@ -499,6 +499,19 @@ namespace entanglement
         return m_workers[worker_idx]->gso_send(count, payload_sizes, max_payload, channel_id, key, flags);
     }
 
+    void server::gso_batch_begin(size_t worker_idx)
+    {
+        if (worker_idx < m_workers.size())
+            m_workers[worker_idx]->gso_batch_begin();
+    }
+
+    int server::gso_batch_flush(size_t worker_idx)
+    {
+        if (worker_idx >= m_workers.size())
+            return 0;
+        return m_workers[worker_idx]->gso_batch_flush();
+    }
+
     void server::worker_begin_send_batch(size_t worker_idx)
     {
         if (worker_idx < m_workers.size())

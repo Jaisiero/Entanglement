@@ -131,12 +131,20 @@ namespace entanglement
 
         // Zero-copy GSO builder: returns writable buffer for direct payload writes.
         // Layout: seg N payload starts at N * (sizeof(packet_header) + max_payload) + sizeof(packet_header).
-        uint8_t *gso_buf() { return m_gso_buf; }
+        // In batch mode, returns the current (un-queued) slot.
+        uint8_t *gso_buf();
 
         // Flush GSO builder: fill headers in-place, pad segments, send via GSO.
         // Payloads must already be written at correct offsets in gso_buf().
+        // In batch mode: queues instead of sending; call gso_batch_flush() later.
         int gso_send(uint32_t count, const uint16_t *payload_sizes, uint16_t max_payload,
                      uint8_t channel_id, const endpoint_key &dest, uint8_t flags);
+
+        // --- GSO sendmmsg batching ---
+        // Begin batch mode: subsequent gso_send() calls queue instead of sending.
+        void gso_batch_begin();
+        // Flush all queued GSO sends via a single sendmmsg() syscall.
+        int gso_batch_flush();
 
         int send_fragment_to(uint32_t message_id, uint8_t fragment_index, uint8_t fragment_count, const void *data,
                              size_t size, uint8_t flags, uint8_t channel_id, const endpoint_key &dest,
@@ -244,10 +252,17 @@ namespace entanglement
         // to avoid redundant steady_clock::now() calls.
         std::chrono::steady_clock::time_point m_cached_now{};
 
-        // Per-worker GSO builder buffer — persistent across calls to avoid
-        // stack allocation and reduce cache pressure vs Rust intermediate buffer.
+        // Per-worker GSO pool — heap-allocated to support sendmmsg batching.
+        // In non-batch mode, only slot 0 is used (same as before).
+        // In batch mode, each gso_send() advances to the next slot.
         static constexpr size_t GSO_BUF_SIZE = 32768;
-        uint8_t m_gso_buf[GSO_BUF_SIZE]{};
+        static constexpr int GSO_POOL_SLOTS = 128;
+        std::unique_ptr<uint8_t[]> m_gso_pool;
+
+        // GSO batch state
+        bool m_gso_batch_mode = false;
+        int m_gso_batch_count = 0;
+        std::unique_ptr<udp_socket::gso_batch_entry[]> m_gso_entries;
 
         // --- Internal helpers ---
         void handle_control(const endpoint_key &key, const packet_header &header, const uint8_t *payload,

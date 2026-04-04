@@ -403,6 +403,11 @@ extern "C"
                                      uint8_t channel_id, ent_endpoint dest,
                                      uint8_t flags);
 
+    /* GSO sendmmsg batching: queue gso_send calls, flush all via single sendmmsg.
+     * SAFETY: workers MUST be paused. */
+    ENT_API void ent_server_gso_batch_begin(ent_server_t *s, size_t worker_idx);
+    ENT_API int ent_server_gso_batch_flush(ent_server_t *s, size_t worker_idx);
+
     /* Begin sendmmsg batching on a worker's socket. Call before a burst of
      * worker_send_to calls, then flush after. Reduces syscalls from N to N/256.
      * SAFETY: workers MUST be paused. */

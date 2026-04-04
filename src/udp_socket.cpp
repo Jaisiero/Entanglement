@@ -718,6 +718,68 @@ namespace entanglement
         return static_cast<int>(ret);
     }
 
+    int udp_socket::send_gso_batch(const gso_batch_entry *entries, int count)
+    {
+        if (!entries || count <= 0)
+            return 0;
+
+        // Stack-allocate metadata arrays (count is bounded by GSO_POOL_SLOTS ≤ 128).
+        // Each message needs: iovec, sockaddr_in, cmsg buffer, mmsghdr.
+        static constexpr int MAX_GSO_BATCH = 128;
+        if (count > MAX_GSO_BATCH)
+            count = MAX_GSO_BATCH;
+
+        struct iovec iovs[MAX_GSO_BATCH];
+        sockaddr_in addrs[MAX_GSO_BATCH];
+        alignas(struct cmsghdr) char cmsg_bufs[MAX_GSO_BATCH][CMSG_SPACE(sizeof(uint16_t))];
+        struct mmsghdr msgs[MAX_GSO_BATCH];
+
+        std::memset(msgs, 0, sizeof(mmsghdr) * count);
+        std::memset(cmsg_bufs, 0, sizeof(cmsg_bufs[0]) * count);
+
+        for (int i = 0; i < count; i++)
+        {
+            const auto &e = entries[i];
+
+            addrs[i] = {};
+            addrs[i].sin_family = AF_INET;
+            addrs[i].sin_port = htons(e.dest.port);
+            addrs[i].sin_addr.s_addr = e.dest.address;
+
+            iovs[i].iov_base = const_cast<uint8_t *>(e.buffer);
+            iovs[i].iov_len = e.total_bytes;
+
+            auto *cmsg = reinterpret_cast<struct cmsghdr *>(cmsg_bufs[i]);
+            cmsg->cmsg_level = SOL_UDP;
+            cmsg->cmsg_type = UDP_SEGMENT;
+            cmsg->cmsg_len = CMSG_LEN(sizeof(uint16_t));
+            *reinterpret_cast<uint16_t *>(CMSG_DATA(cmsg)) = e.segment_size;
+
+            msgs[i].msg_hdr.msg_name = &addrs[i];
+            msgs[i].msg_hdr.msg_namelen = sizeof(sockaddr_in);
+            msgs[i].msg_hdr.msg_iov = &iovs[i];
+            msgs[i].msg_hdr.msg_iovlen = 1;
+            msgs[i].msg_hdr.msg_control = cmsg_bufs[i];
+            msgs[i].msg_hdr.msg_controllen = CMSG_SPACE(sizeof(uint16_t));
+        }
+
+        int total_sent = 0;
+        int remaining = count;
+        int offset = 0;
+
+        while (remaining > 0)
+        {
+            int sent = sendmmsg(m_socket, &msgs[offset], remaining, 0);
+            if (sent <= 0)
+                break;
+            total_sent += sent;
+            offset += sent;
+            remaining -= sent;
+        }
+
+        return total_sent;
+    }
+
 #endif // ENTANGLEMENT_PLATFORM_LINUX
 
 #ifdef ENTANGLEMENT_SIMULATE_LOSS

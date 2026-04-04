@@ -34,6 +34,11 @@ namespace entanglement
             m_recv_queues.push_back(std::make_unique<recv_queue_t>());
 
         m_send_queue = std::make_unique<mpsc_queue<send_command, WORKER_SEND_QUEUE_SIZE>>();
+
+        // Allocate GSO buffer pool (slot 0 used in non-batch mode, all slots in batch mode)
+        m_gso_pool = std::make_unique<uint8_t[]>(static_cast<size_t>(GSO_POOL_SLOTS) * GSO_BUF_SIZE);
+        std::memset(m_gso_pool.get(), 0, static_cast<size_t>(GSO_POOL_SLOTS) * GSO_BUF_SIZE);
+        m_gso_entries = std::make_unique<udp_socket::gso_batch_entry[]>(GSO_POOL_SLOTS);
     }
 
     // -----------------------------------------------------------------------
@@ -373,11 +378,54 @@ namespace entanglement
         return conn->send_payload_multi(*m_send_socket, *m_channels, payloads, sizes, count, flags, channel_id, dest);
     }
 
+    uint8_t *server_worker::gso_buf()
+    {
+        if (m_gso_batch_mode)
+            return m_gso_pool.get() + static_cast<size_t>(m_gso_batch_count) * GSO_BUF_SIZE;
+        return m_gso_pool.get(); // slot 0
+    }
+
+    void server_worker::gso_batch_begin()
+    {
+        m_gso_batch_mode = true;
+        m_gso_batch_count = 0;
+    }
+
+    int server_worker::gso_batch_flush()
+    {
+        m_gso_batch_mode = false;
+        if (m_gso_batch_count == 0)
+            return 0;
+
+        int count = m_gso_batch_count;
+        m_gso_batch_count = 0;
+
+#ifdef __linux__
+        return m_send_socket->send_gso_batch(m_gso_entries.get(), count);
+#else
+        // Non-Linux: fall back to individual send_gso calls
+        int total = 0;
+        for (int i = 0; i < count; i++)
+        {
+            const auto &e = m_gso_entries[i];
+            int r = m_send_socket->send_gso(e.buffer, e.total_bytes, e.segment_size, e.dest);
+            if (r > 0)
+                total += r;
+        }
+        return total;
+#endif
+    }
+
     int server_worker::gso_send(uint32_t count, const uint16_t *payload_sizes, uint16_t max_payload,
                                 uint8_t channel_id, const endpoint_key &dest, uint8_t flags)
     {
         if (count == 0)
             return 0;
+
+        // In batch mode, use the current batch slot buffer
+        uint8_t *buf = m_gso_batch_mode
+            ? m_gso_pool.get() + static_cast<size_t>(m_gso_batch_count) * GSO_BUF_SIZE
+            : m_gso_pool.get();
 
         udp_connection *conn = find(dest);
         if (!conn || conn->state() == connection_state::DISCONNECTED)
@@ -390,7 +438,7 @@ namespace entanglement
         if (count == 1)
         {
             return conn->send_payload(*m_send_socket, *m_channels,
-                                       m_gso_buf + sizeof(packet_header), payload_sizes[0],
+                                       buf + sizeof(packet_header), payload_sizes[0],
                                        flags, channel_id, dest);
         }
 
@@ -409,15 +457,36 @@ namespace entanglement
             hdr.payload_size = payload_sizes[i];
             conn->prepare_header(hdr, reliable);
 
-            std::memcpy(m_gso_buf + seg_offset, &hdr, sizeof(packet_header));
+            std::memcpy(buf + seg_offset, &hdr, sizeof(packet_header));
 
             size_t seg_len = sizeof(packet_header) + payload_sizes[i];
             if (i < count - 1 && seg_len < stride)
-                std::memset(m_gso_buf + seg_offset + seg_len, 0, stride - seg_len);
+                std::memset(buf + seg_offset + seg_len, 0, stride - seg_len);
         }
 
         size_t total = (count - 1) * stride + sizeof(packet_header) + payload_sizes[count - 1];
-        int ret = m_send_socket->send_gso(m_gso_buf, total, segment_size, dest);
+
+        // Batch mode: queue for sendmmsg, advance slot
+        if (m_gso_batch_mode)
+        {
+            auto &entry = m_gso_entries[m_gso_batch_count];
+            entry.buffer = buf;
+            entry.total_bytes = total;
+            entry.segment_size = segment_size;
+            entry.dest = dest;
+            m_gso_batch_count++;
+
+            // Safety valve: flush if pool is full
+            if (m_gso_batch_count >= GSO_POOL_SLOTS)
+            {
+                m_send_socket->send_gso_batch(m_gso_entries.get(), m_gso_batch_count);
+                m_gso_batch_count = 0;
+            }
+
+            return static_cast<int>(total);
+        }
+
+        int ret = m_send_socket->send_gso(buf, total, segment_size, dest);
         if (ret >= 0)
             return ret;
 
@@ -428,7 +497,7 @@ namespace entanglement
         {
             size_t payload_off = i * stride + sizeof(packet_header);
             int r = conn->send_payload(*m_send_socket, *m_channels,
-                                        m_gso_buf + payload_off, payload_sizes[i],
+                                        buf + payload_off, payload_sizes[i],
                                         flags, channel_id, dest);
             if (r > 0)
                 total_sent += r;

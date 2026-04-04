@@ -678,6 +678,19 @@ int ent_server_gso_send(ent_server_t *s, size_t worker_idx,
     return s->cpp.gso_send(worker_idx, count, payload_sizes, max_payload, channel_id, key, flags);
 }
 
+void ent_server_gso_batch_begin(ent_server_t *s, size_t worker_idx)
+{
+    if (s)
+        s->cpp.gso_batch_begin(worker_idx);
+}
+
+int ent_server_gso_batch_flush(ent_server_t *s, size_t worker_idx)
+{
+    if (!s)
+        return 0;
+    return s->cpp.gso_batch_flush(worker_idx);
+}
+
 void ent_server_worker_begin_send_batch(ent_server_t *s, size_t worker_idx)
 {
     if (s)

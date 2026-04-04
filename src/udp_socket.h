@@ -161,6 +161,22 @@ namespace entanglement
         // Returns total bytes submitted, or -1 on error.
         int send_gso(const void *buffer, size_t total_size, uint16_t segment_size,
                      const endpoint_key &dest);
+
+        // --- sendmmsg + GSO batch ---
+
+        // Metadata for one queued GSO message in a batch.
+        struct gso_batch_entry
+        {
+            const uint8_t *buffer;  // pointer into GSO pool slot
+            size_t total_bytes;
+            uint16_t segment_size;
+            endpoint_key dest;
+        };
+
+        // Send multiple GSO messages in a single sendmmsg() syscall.
+        // Each entry is a complete GSO buffer (headers already filled).
+        // Returns total messages submitted, or -1 on error.
+        int send_gso_batch(const gso_batch_entry *entries, int count);
 #endif
 
 #ifdef ENTANGLEMENT_SIMULATE_LOSS
