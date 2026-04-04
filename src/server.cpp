@@ -484,6 +484,21 @@ namespace entanglement
         return m_workers[worker_idx]->send_to_multi(payloads, sizes, count, channel_id, key, flags);
     }
 
+    uint8_t *server::gso_buf(size_t worker_idx)
+    {
+        if (worker_idx >= m_workers.size())
+            return nullptr;
+        return m_workers[worker_idx]->gso_buf();
+    }
+
+    int server::gso_send(size_t worker_idx, uint32_t count, const uint16_t *payload_sizes,
+                         uint16_t max_payload, uint8_t channel_id, const endpoint_key &key, uint8_t flags)
+    {
+        if (worker_idx >= m_workers.size())
+            return static_cast<int>(error_code::not_connected);
+        return m_workers[worker_idx]->gso_send(count, payload_sizes, max_payload, channel_id, key, flags);
+    }
+
     void server::worker_begin_send_batch(size_t worker_idx)
     {
         if (worker_idx < m_workers.size())

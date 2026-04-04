@@ -373,6 +373,69 @@ namespace entanglement
         return conn->send_payload_multi(*m_send_socket, *m_channels, payloads, sizes, count, flags, channel_id, dest);
     }
 
+    int server_worker::gso_send(uint32_t count, const uint16_t *payload_sizes, uint16_t max_payload,
+                                uint8_t channel_id, const endpoint_key &dest, uint8_t flags)
+    {
+        if (count == 0)
+            return 0;
+
+        udp_connection *conn = find(dest);
+        if (!conn || conn->state() == connection_state::DISCONNECTED)
+            return static_cast<int>(error_code::not_connected);
+
+        uint16_t segment_size = static_cast<uint16_t>(sizeof(packet_header) + max_payload);
+        size_t stride = static_cast<size_t>(segment_size);
+
+        // Single segment — avoid GSO overhead
+        if (count == 1)
+        {
+            return conn->send_payload(*m_send_socket, *m_channels,
+                                       m_gso_buf + sizeof(packet_header), payload_sizes[0],
+                                       flags, channel_id, dest);
+        }
+
+#ifdef __linux__
+        bool reliable = m_channels->is_reliable(channel_id);
+
+        // Fill headers in-place and pad non-last segments.
+        // Payloads were already written by Rust at seg_idx * stride + sizeof(packet_header).
+        for (uint32_t i = 0; i < count; i++)
+        {
+            size_t seg_offset = i * stride;
+
+            packet_header hdr{};
+            hdr.flags = flags;
+            hdr.channel_id = channel_id;
+            hdr.payload_size = payload_sizes[i];
+            conn->prepare_header(hdr, reliable);
+
+            std::memcpy(m_gso_buf + seg_offset, &hdr, sizeof(packet_header));
+
+            size_t seg_len = sizeof(packet_header) + payload_sizes[i];
+            if (i < count - 1 && seg_len < stride)
+                std::memset(m_gso_buf + seg_offset + seg_len, 0, stride - seg_len);
+        }
+
+        size_t total = (count - 1) * stride + sizeof(packet_header) + payload_sizes[count - 1];
+        int ret = m_send_socket->send_gso(m_gso_buf, total, segment_size, dest);
+        if (ret >= 0)
+            return ret;
+
+        // GSO failed — fall back to individual sends (re-creates headers)
+#endif
+        int total_sent = 0;
+        for (uint32_t i = 0; i < count; i++)
+        {
+            size_t payload_off = i * stride + sizeof(packet_header);
+            int r = conn->send_payload(*m_send_socket, *m_channels,
+                                        m_gso_buf + payload_off, payload_sizes[i],
+                                        flags, channel_id, dest);
+            if (r > 0)
+                total_sent += r;
+        }
+        return total_sent;
+    }
+
     int server_worker::send_fragment_to(uint32_t message_id, uint8_t fragment_index, uint8_t fragment_count,
                                         const void *data, size_t size, uint8_t flags, uint8_t channel_id,
                                         const endpoint_key &dest, uint32_t channel_sequence)

@@ -387,6 +387,22 @@ extern "C"
                                                 uint8_t channel_id, ent_endpoint dest,
                                                 uint8_t flags);
 
+    /* Zero-copy GSO builder: returns pointer to per-worker GSO buffer.
+     * Layout: segment N payload at N * (ENT_PACKET_HEADER_SIZE + max_payload) + ENT_PACKET_HEADER_SIZE.
+     * Write payload data directly, then call ent_server_gso_send to flush.
+     * SAFETY: workers MUST be paused. */
+    ENT_API uint8_t *ent_server_gso_buf(ent_server_t *s, size_t worker_idx);
+
+    /* Flush the GSO builder: fill packet headers in-place, pad segments, send via GSO.
+     * payload_sizes: per-segment payload byte counts (array of `count` entries).
+     * max_payload: the stride used when writing — segment_size = header + max_payload.
+     * SAFETY: workers MUST be paused. */
+    ENT_API int ent_server_gso_send(ent_server_t *s, size_t worker_idx,
+                                     uint32_t count, const uint16_t *payload_sizes,
+                                     uint16_t max_payload,
+                                     uint8_t channel_id, ent_endpoint dest,
+                                     uint8_t flags);
+
     /* Begin sendmmsg batching on a worker's socket. Call before a burst of
      * worker_send_to calls, then flush after. Reduces syscalls from N to N/256.
      * SAFETY: workers MUST be paused. */

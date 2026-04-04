@@ -129,6 +129,15 @@ namespace entanglement
         int send_to_multi(const void *const *payloads, const uint16_t *sizes,
                           uint32_t count, uint8_t channel_id, const endpoint_key &dest, uint8_t flags = 0);
 
+        // Zero-copy GSO builder: returns writable buffer for direct payload writes.
+        // Layout: seg N payload starts at N * (sizeof(packet_header) + max_payload) + sizeof(packet_header).
+        uint8_t *gso_buf() { return m_gso_buf; }
+
+        // Flush GSO builder: fill headers in-place, pad segments, send via GSO.
+        // Payloads must already be written at correct offsets in gso_buf().
+        int gso_send(uint32_t count, const uint16_t *payload_sizes, uint16_t max_payload,
+                     uint8_t channel_id, const endpoint_key &dest, uint8_t flags);
+
         int send_fragment_to(uint32_t message_id, uint8_t fragment_index, uint8_t fragment_count, const void *data,
                              size_t size, uint8_t flags, uint8_t channel_id, const endpoint_key &dest,
                              uint32_t channel_sequence = 0);
@@ -234,6 +243,11 @@ namespace entanglement
         // Cached timestamp — set once per poll_local/update batch, used in send paths
         // to avoid redundant steady_clock::now() calls.
         std::chrono::steady_clock::time_point m_cached_now{};
+
+        // Per-worker GSO builder buffer — persistent across calls to avoid
+        // stack allocation and reduce cache pressure vs Rust intermediate buffer.
+        static constexpr size_t GSO_BUF_SIZE = 32768;
+        uint8_t m_gso_buf[GSO_BUF_SIZE]{};
 
         // --- Internal helpers ---
         void handle_control(const endpoint_key &key, const packet_header &header, const uint8_t *payload,
