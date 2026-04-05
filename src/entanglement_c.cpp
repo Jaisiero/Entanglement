@@ -691,9 +691,30 @@ int ent_server_gso_batch_flush(ent_server_t *s, size_t worker_idx)
         return 0;
     return s->cpp.gso_batch_flush(worker_idx);
 }
+
+int ent_server_xdp_tx_init(ent_server_t *s, const char *iface)
+{
+    if (!s || !iface) return -1;
+    return s->cpp.init_xdp_tx(iface);
+}
+
+void ent_server_xdp_tx_flush(ent_server_t *s, size_t worker_idx)
+{
+    if (s)
+        s->cpp.flush_xdp_tx(worker_idx);
+}
+
+void ent_server_xdp_tx_cleanup(ent_server_t *s)
+{
+    if (s)
+        s->cpp.cleanup_xdp_tx();
+}
 #else
 void ent_server_gso_batch_begin(ent_server_t *, size_t) {}
 int ent_server_gso_batch_flush(ent_server_t *, size_t) { return 0; }
+int ent_server_xdp_tx_init(ent_server_t *, const char *) { return -1; }
+void ent_server_xdp_tx_flush(ent_server_t *, size_t) {}
+void ent_server_xdp_tx_cleanup(ent_server_t *) {}
 #endif
 
 void ent_server_worker_begin_send_batch(ent_server_t *s, size_t worker_idx)

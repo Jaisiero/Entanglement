@@ -205,6 +205,10 @@ namespace entanglement
         }
         udp_socket *send_socket() const { return m_send_socket; }
 
+        // AF_XDP worker index (set by server after xdp_tx_init)
+        void set_xdp_worker_idx(int idx) { m_xdp_worker_idx = idx; }
+        int  xdp_worker_idx() const { return m_xdp_worker_idx; }
+
     private:
         // Shared resources (not owned)
         udp_socket *m_socket = nullptr;      // receive (and default send) socket
@@ -213,6 +217,7 @@ namespace entanglement
         channel_manager *m_channels = nullptr;
         const std::atomic<bool> *m_running = nullptr;
         send_pool *m_send_pool = nullptr; // shared send data pool (for cross-thread commands)
+        int m_xdp_worker_idx = -1;        // AF_XDP worker index (-1 = not using XDP)
 
         // Per-worker connection pool
         std::unique_ptr<udp_connection[]> m_pool;

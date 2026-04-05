@@ -1,7 +1,15 @@
 #include "server.h"
+#include "xdp_tx.h"
 #include <algorithm>
 #include <cstring>
 #include <iostream>
+
+#ifdef __linux__
+#include <arpa/inet.h>
+#include <net/if.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+#endif
 
 namespace entanglement
 {
@@ -294,6 +302,12 @@ namespace entanglement
             return;
         m_running = false;
 
+#ifdef __linux__
+        // Clean up AF_XDP before destroying workers
+        if (xdp_tx_available())
+            cleanup_xdp_tx();
+#endif
+
         // Join threads (multi-threaded mode)
         if (m_receiver_thread.joinable())
             m_receiver_thread.join();
@@ -513,6 +527,70 @@ namespace entanglement
         if (worker_idx >= m_workers.size())
             return 0;
         return m_workers[worker_idx]->gso_batch_flush();
+    }
+
+    int server::init_xdp_tx(const char *iface)
+    {
+        if (m_workers.empty())
+            return -1;
+
+        // Determine our source IP from the bind address
+        uint32_t src_ip = 0;
+        if (m_bind_address == "0.0.0.0")
+        {
+            // Resolve from interface
+            int fd = socket(AF_INET, SOCK_DGRAM, 0);
+            if (fd >= 0)
+            {
+                struct ifreq ifr{};
+                std::strncpy(ifr.ifr_name, iface, IFNAMSIZ - 1);
+                if (ioctl(fd, SIOCGIFADDR, &ifr) == 0)
+                    src_ip = reinterpret_cast<struct sockaddr_in *>(&ifr.ifr_addr)->sin_addr.s_addr;
+                ::close(fd);
+            }
+        }
+        else
+        {
+            struct in_addr addr{};
+            inet_pton(AF_INET, m_bind_address.c_str(), &addr);
+            src_ip = addr.s_addr;
+        }
+
+        if (src_ip == 0)
+        {
+            std::cerr << "[server] Cannot determine source IP for XDP TX" << std::endl;
+            return -1;
+        }
+
+        int num_workers = static_cast<int>(m_workers.size());
+        int ret = xdp_tx_init(iface, num_workers, src_ip, m_port);
+        if (ret < 0)
+        {
+            if (m_verbose)
+                std::cerr << "[server] AF_XDP init failed (err=" << ret << "), using sendmsg fallback" << std::endl;
+            return ret;
+        }
+
+        // Assign XDP worker indices
+        for (int i = 0; i < num_workers; i++)
+            m_workers[static_cast<size_t>(i)]->set_xdp_worker_idx(i);
+
+        if (m_verbose)
+            std::cout << "[server] AF_XDP TX enabled (" << num_workers << " workers)" << std::endl;
+        return 0;
+    }
+
+    void server::flush_xdp_tx(size_t worker_idx)
+    {
+        if (worker_idx < m_workers.size() && m_workers[worker_idx]->xdp_worker_idx() >= 0)
+            xdp_tx_flush(m_workers[worker_idx]->xdp_worker_idx());
+    }
+
+    void server::cleanup_xdp_tx()
+    {
+        xdp_tx_cleanup();
+        for (auto &w : m_workers)
+            w->set_xdp_worker_idx(-1);
     }
 #endif
 

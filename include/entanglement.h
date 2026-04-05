@@ -412,6 +412,14 @@ extern "C"
     ENT_API void ent_server_gso_batch_begin(ent_server_t *s, size_t worker_idx);
     ENT_API int ent_server_gso_batch_flush(ent_server_t *s, size_t worker_idx);
 
+    /* AF_XDP TX kernel bypass (Linux only).
+     * init: loads XDP program and creates per-worker sockets. Returns 0 on success.
+     * flush: kicks TX ring for a worker — call after all sends in a tick.
+     * cleanup: destroys XDP resources (also called by stop). */
+    ENT_API int  ent_server_xdp_tx_init(ent_server_t *s, const char *iface);
+    ENT_API void ent_server_xdp_tx_flush(ent_server_t *s, size_t worker_idx);
+    ENT_API void ent_server_xdp_tx_cleanup(ent_server_t *s);
+
     /* Begin sendmmsg batching on a worker's socket. Call before a burst of
      * worker_send_to calls, then flush after. Reduces syscalls from N to N/256.
      * SAFETY: workers MUST be paused. */

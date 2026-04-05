@@ -100,6 +100,17 @@ namespace entanglement
 #ifdef __linux__
         void gso_batch_begin(size_t worker_idx);
         int gso_batch_flush(size_t worker_idx);
+
+        // AF_XDP TX kernel bypass: replace sendmsg with ring-buffer writes.
+        // init_xdp_tx: loads XDP program, creates per-worker sockets. Returns 0 on success.
+        // On failure, sendmsg is used automatically (no action needed).
+        int init_xdp_tx(const char *iface);
+
+        // Flush AF_XDP TX ring for a worker (call after all sends for this worker in a tick).
+        void flush_xdp_tx(size_t worker_idx);
+
+        // Cleanup AF_XDP resources (called automatically on stop()).
+        void cleanup_xdp_tx();
 #endif
 
         // Begin/flush sendmmsg batching on a specific worker's socket.

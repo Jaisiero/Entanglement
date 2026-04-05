@@ -1,4 +1,5 @@
 #include "server_worker.h"
+#include "xdp_tx.h"
 #include <algorithm>
 #include <cstring>
 #include <iostream>
@@ -500,6 +501,16 @@ namespace entanglement
             }
 
             return static_cast<int>(total);
+        }
+
+        // AF_XDP TX path: write individual frames to TX ring (no syscall per packet)
+        if (m_xdp_worker_idx >= 0 && xdp_tx_available())
+        {
+            int ret = xdp_tx_send_gso(m_xdp_worker_idx, dest.address, dest.port,
+                                       buf, total, segment_size);
+            if (ret >= 0)
+                return ret;
+            // XDP send failed — fall through to regular sendmsg
         }
 
         int ret = m_send_socket->send_gso(buf, total, segment_size, dest);
