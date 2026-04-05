@@ -87,9 +87,12 @@ namespace entanglement
         // per-packet steady_clock::now() calls.
         m_cached_now = std::chrono::steady_clock::now();
 
-        // Enter batch send mode – all send_packet calls inside
-        // poll_local will be buffered and flushed in a single sendmmsg.
-        m_send_socket->begin_send_batch();
+        // Enter batch send mode only when this worker has an exclusive send
+        // socket.  When all workers share the same socket, the sendmmsg batch
+        // state (m_send_slots, m_send_batch_count) is not thread-safe and
+        // concurrent access causes a heap-buffer-overflow.
+        if (m_exclusive_send_socket)
+            m_send_socket->begin_send_batch();
 
         // 1. Process cross-thread send commands first
         flush_send_queue();
@@ -132,7 +135,8 @@ namespace entanglement
                 }
             }
         }
-        m_send_socket->flush_send_batch();
+        if (m_exclusive_send_socket)
+            m_send_socket->flush_send_batch();
         return count;
     }
 
@@ -254,8 +258,10 @@ namespace entanglement
         endpoint_key timed_out[MAX_TIMEOUTS_PER_UPDATE];
         int timeout_count = 0;
 
-        // Batch all sends in update() into a single sendmmsg call.
-        m_send_socket->begin_send_batch();
+        // Batch all sends in update() into a single sendmmsg call
+        // (only safe when this worker has an exclusive send socket).
+        if (m_exclusive_send_socket)
+            m_send_socket->begin_send_batch();
 
         for (auto &[key, idx] : m_index)
         {
@@ -337,7 +343,8 @@ namespace entanglement
             disconnect_client(timed_out[i]);
         }
 
-        m_send_socket->flush_send_batch();
+        if (m_exclusive_send_socket)
+            m_send_socket->flush_send_batch();
         return timeout_count;
     }
 

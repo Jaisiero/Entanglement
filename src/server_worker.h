@@ -192,13 +192,20 @@ namespace entanglement
         // Assign a dedicated send socket for this worker (eliminates socket-lock
         // contention when multiple workers send concurrently).  When not set,
         // the shared receive socket is used for both send and receive.
-        void set_send_socket(udp_socket *s) { m_send_socket = s ? s : m_socket; }
+        void set_send_socket(udp_socket *s) {
+            m_send_socket = s ? s : m_socket;
+            // Batch mode is only safe when the worker has an exclusive send socket.
+            // When all workers share m_socket, concurrent begin/flush_send_batch
+            // races on the sendmmsg batch buffers (heap-buffer-overflow).
+            m_exclusive_send_socket = (m_send_socket != m_socket);
+        }
         udp_socket *send_socket() const { return m_send_socket; }
 
     private:
         // Shared resources (not owned)
         udp_socket *m_socket = nullptr;      // receive (and default send) socket
         udp_socket *m_send_socket = nullptr; // per-worker send socket (may == m_socket)
+        bool m_exclusive_send_socket = false; // true when m_send_socket != m_socket
         channel_manager *m_channels = nullptr;
         const std::atomic<bool> *m_running = nullptr;
         send_pool *m_send_pool = nullptr; // shared send data pool (for cross-thread commands)
