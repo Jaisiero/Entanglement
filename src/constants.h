@@ -136,6 +136,12 @@ namespace entanglement
     constexpr size_t MAX_INCOMING_FRAGMENTED_MESSAGES = 64;          // receiver: per-connection concurrent reassemblies
     constexpr int64_t REASSEMBLY_TIMEOUT_US = 15'000'000;            // 15 s — accommodate fragment retransmissions
 
+    // --- Loss detection throttle ---
+    // How often collect_losses() scans the send buffer per connection.
+    // Workers busy-poll at ~100 kHz but loss detection only needs tick-rate
+    // frequency.  RTO floor is 50 ms so 8 ms (125 Hz) is more than enough.
+    constexpr int64_t DEFAULT_LOSS_SCAN_INTERVAL_US = 8'000;        // 8 ms → ~125 Hz
+
     // --- Ordered delivery (receive-side hold-back for RELIABLE_ORDERED) ---
     constexpr size_t ORDERED_BUFFER_SIZE = 32; // Per-connection buffered out-of-order packets
     constexpr size_t MAX_ORDERED_PAYLOAD = MAX_PACKET_SIZE - PACKET_HEADER_SIZE; // Max storable payload (~1166 bytes)

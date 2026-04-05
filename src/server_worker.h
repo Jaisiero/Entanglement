@@ -180,6 +180,8 @@ namespace entanglement
         void set_on_message_failed(on_message_failed cb);
         void set_reassembly_timeout(int64_t timeout_us);
 
+        void set_loss_scan_interval(int64_t interval_us);
+
         // --- Configuration ---
         void set_auto_retransmit(bool enabled) { m_auto_retransmit = enabled; }
         bool auto_retransmit_enabled() const { return m_auto_retransmit; }
@@ -248,6 +250,7 @@ namespace entanglement
         on_message_complete m_app_on_message_complete;
         on_message_failed m_frag_failed_cb;
         int64_t m_reassembly_timeout_us = REASSEMBLY_TIMEOUT_US;
+        int64_t m_loss_scan_interval_us = DEFAULT_LOSS_SCAN_INTERVAL_US;
 
         bool m_auto_retransmit = false;
         bool m_verbose = true;
@@ -256,6 +259,10 @@ namespace entanglement
 
         // Tick counter for staggering expensive per-connection operations
         uint32_t m_tick_counter = 0;
+
+        // Throttle timestamp for collect_losses — shared across all connections
+        // in this worker so the scan runs at m_loss_scan_interval_us cadence.
+        std::chrono::steady_clock::time_point m_last_loss_scan_time{};
 
         // Cached timestamp — set once per poll_local/update batch, used in send paths
         // to avoid redundant steady_clock::now() calls.

@@ -349,6 +349,10 @@ extern "C"
     /* Reassembly timeout override */
     ENT_API void ent_server_set_reassembly_timeout(ent_server_t *s, int64_t timeout_us);
 
+    /* Loss-scan interval override (microseconds).  Controls how often
+       collect_losses() runs in the worker busy-loop.  Default 8 000 µs. */
+    ENT_API void ent_server_set_loss_scan_interval(ent_server_t *s, int64_t interval_us);
+
     /* Fragment flow control */
     ENT_API int ent_server_is_fragment_throttled(const ent_server_t *s, ent_endpoint dest);
 

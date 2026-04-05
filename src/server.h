@@ -179,6 +179,10 @@ namespace entanglement
         // Override the reassembly timeout (default: REASSEMBLY_TIMEOUT_US).
         void set_reassembly_timeout(int64_t timeout_us);
 
+        // Override the loss-scan interval (default: DEFAULT_LOSS_SCAN_INTERVAL_US).
+        // Controls how often collect_losses() runs in the worker busy-loop.
+        void set_loss_scan_interval(int64_t interval_us);
+
         // Fragment flow control: check if a specific client asked us to stop sending fragments
         bool is_fragment_throttled(const endpoint_key &dest) const;
         bool is_fragment_throttled(const std::string &address, uint16_t port) const;
@@ -202,6 +206,7 @@ namespace entanglement
         bool m_verbose = true;
         channel_manager m_channels;
         int64_t m_reassembly_timeout_us = REASSEMBLY_TIMEOUT_US;
+        int64_t m_loss_scan_interval_us = DEFAULT_LOSS_SCAN_INTERVAL_US;
 
         // Stored callback templates (applied to each worker/connection)
         on_allocate_message m_frag_alloc_cb;

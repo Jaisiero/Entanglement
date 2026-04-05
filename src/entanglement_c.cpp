@@ -906,6 +906,12 @@ void ent_server_set_reassembly_timeout(ent_server_t *s, int64_t timeout_us)
         s->cpp.set_reassembly_timeout(timeout_us);
 }
 
+void ent_server_set_loss_scan_interval(ent_server_t *s, int64_t interval_us)
+{
+    if (s)
+        s->cpp.set_loss_scan_interval(interval_us);
+}
+
 int ent_server_is_fragment_throttled(const ent_server_t *s, ent_endpoint dest)
 {
     return s ? s->cpp.is_fragment_throttled(to_cpp(dest)) : 0;

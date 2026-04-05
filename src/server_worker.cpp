@@ -265,6 +265,13 @@ namespace entanglement
         if (m_exclusive_send_socket)
             m_send_socket->begin_send_batch();
 
+        // Throttle loss detection to m_loss_scan_interval_us cadence.
+        const bool run_loss_scan =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                now - m_last_loss_scan_time).count() >= m_loss_scan_interval_us;
+        if (run_loss_scan)
+            m_last_loss_scan_time = now;
+
         for (auto &[key, idx] : m_index)
         {
             auto &conn = m_pool[idx];
@@ -287,28 +294,33 @@ namespace entanglement
             // Flush coalesced message buffers at end of tick
             conn.flush_all_coalesce(*m_send_socket, *m_channels, key);
 
-            // Loss detection
-            if (loss_callback || m_on_packet_lost)
+            // Loss detection — throttled to m_loss_scan_interval_us cadence.
+            // Workers busy-poll at ~100 kHz but loss detection only needs ~125 Hz;
+            // RTO floor is 50 ms so scanning more often is pure waste.
+            if (run_loss_scan)
             {
-                auto &cb = loss_callback ? loss_callback : m_on_packet_lost;
-                lost_packet_info lost[MAX_LOSSES_PER_UPDATE];
-                int loss_count = conn.collect_losses(now, lost, MAX_LOSSES_PER_UPDATE);
-                for (int l = 0; l < loss_count; ++l)
+                if (loss_callback || m_on_packet_lost)
                 {
-                    if (conn.auto_retransmit_enabled() &&
-                        conn.try_auto_retransmit(lost[l], *m_send_socket, *m_channels, key))
-                        continue;
-                    cb(lost[l], key);
-                }
-            }
-            else
-            {
-                lost_packet_info lost[MAX_LOSSES_PER_UPDATE];
-                int loss_count = conn.collect_losses(now, lost, MAX_LOSSES_PER_UPDATE);
-                if (conn.auto_retransmit_enabled())
-                {
+                    auto &cb = loss_callback ? loss_callback : m_on_packet_lost;
+                    lost_packet_info lost[MAX_LOSSES_PER_UPDATE];
+                    int loss_count = conn.collect_losses(now, lost, MAX_LOSSES_PER_UPDATE);
                     for (int l = 0; l < loss_count; ++l)
-                        conn.try_auto_retransmit(lost[l], *m_send_socket, *m_channels, key);
+                    {
+                        if (conn.auto_retransmit_enabled() &&
+                            conn.try_auto_retransmit(lost[l], *m_send_socket, *m_channels, key))
+                            continue;
+                        cb(lost[l], key);
+                    }
+                }
+                else
+                {
+                    lost_packet_info lost[MAX_LOSSES_PER_UPDATE];
+                    int loss_count = conn.collect_losses(now, lost, MAX_LOSSES_PER_UPDATE);
+                    if (conn.auto_retransmit_enabled())
+                    {
+                        for (int l = 0; l < loss_count; ++l)
+                            conn.try_auto_retransmit(lost[l], *m_send_socket, *m_channels, key);
+                    }
                 }
             }
 
@@ -715,6 +727,11 @@ namespace entanglement
         m_reassembly_timeout_us = timeout_us;
         for (auto &[key, idx] : m_index)
             m_pool[idx].reassembler().set_reassembly_timeout(timeout_us);
+    }
+
+    void server_worker::set_loss_scan_interval(int64_t interval_us)
+    {
+        m_loss_scan_interval_us = interval_us;
     }
 
     // -----------------------------------------------------------------------

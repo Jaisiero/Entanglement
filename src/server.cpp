@@ -128,6 +128,8 @@ namespace entanglement
                 w->set_on_message_failed(m_frag_failed_cb);
             if (m_reassembly_timeout_us != REASSEMBLY_TIMEOUT_US)
                 w->set_reassembly_timeout(m_reassembly_timeout_us);
+            if (m_loss_scan_interval_us != DEFAULT_LOSS_SCAN_INTERVAL_US)
+                w->set_loss_scan_interval(m_loss_scan_interval_us);
         }
     }
 
@@ -786,6 +788,13 @@ namespace entanglement
         m_reassembly_timeout_us = timeout_us;
         for (auto &w : m_workers)
             w->set_reassembly_timeout(timeout_us);
+    }
+
+    void server::set_loss_scan_interval(int64_t interval_us)
+    {
+        m_loss_scan_interval_us = interval_us;
+        for (auto &w : m_workers)
+            w->set_loss_scan_interval(interval_us);
     }
 
     bool server::is_fragment_throttled(const endpoint_key &key) const
