@@ -678,6 +678,7 @@ int ent_server_gso_send(ent_server_t *s, size_t worker_idx,
     return s->cpp.gso_send(worker_idx, count, payload_sizes, max_payload, channel_id, key, flags);
 }
 
+#ifdef __linux__
 void ent_server_gso_batch_begin(ent_server_t *s, size_t worker_idx)
 {
     if (s)
@@ -690,6 +691,10 @@ int ent_server_gso_batch_flush(ent_server_t *s, size_t worker_idx)
         return 0;
     return s->cpp.gso_batch_flush(worker_idx);
 }
+#else
+void ent_server_gso_batch_begin(ent_server_t *, size_t) {}
+int ent_server_gso_batch_flush(ent_server_t *, size_t) { return 0; }
+#endif
 
 void ent_server_worker_begin_send_batch(ent_server_t *s, size_t worker_idx)
 {

@@ -38,7 +38,9 @@ namespace entanglement
         // Allocate GSO buffer pool (slot 0 used in non-batch mode, all slots in batch mode)
         m_gso_pool = std::make_unique<uint8_t[]>(static_cast<size_t>(GSO_POOL_SLOTS) * GSO_BUF_SIZE);
         std::memset(m_gso_pool.get(), 0, static_cast<size_t>(GSO_POOL_SLOTS) * GSO_BUF_SIZE);
+#ifdef __linux__
         m_gso_entries = std::make_unique<udp_socket::gso_batch_entry[]>(GSO_POOL_SLOTS);
+#endif
     }
 
     // -----------------------------------------------------------------------
@@ -387,11 +389,14 @@ namespace entanglement
 
     uint8_t *server_worker::gso_buf()
     {
+#ifdef __linux__
         if (m_gso_batch_mode)
             return m_gso_pool.get() + static_cast<size_t>(m_gso_batch_count) * GSO_BUF_SIZE;
+#endif
         return m_gso_pool.get(); // slot 0
     }
 
+#ifdef __linux__
     void server_worker::gso_batch_begin()
     {
         m_gso_batch_mode = true;
@@ -407,21 +412,9 @@ namespace entanglement
         int count = m_gso_batch_count;
         m_gso_batch_count = 0;
 
-#ifdef __linux__
         return m_send_socket->send_gso_batch(m_gso_entries.get(), count);
-#else
-        // Non-Linux: fall back to individual send_gso calls
-        int total = 0;
-        for (int i = 0; i < count; i++)
-        {
-            const auto &e = m_gso_entries[i];
-            int r = m_send_socket->send_gso(e.buffer, e.total_bytes, e.segment_size, e.dest);
-            if (r > 0)
-                total += r;
-        }
-        return total;
-#endif
     }
+#endif
 
     int server_worker::gso_send(uint32_t count, const uint16_t *payload_sizes, uint16_t max_payload,
                                 uint8_t channel_id, const endpoint_key &dest, uint8_t flags)
@@ -429,10 +422,14 @@ namespace entanglement
         if (count == 0)
             return 0;
 
-        // In batch mode, use the current batch slot buffer
+        // In batch mode (Linux), use the current batch slot buffer
+#ifdef __linux__
         uint8_t *buf = m_gso_batch_mode
             ? m_gso_pool.get() + static_cast<size_t>(m_gso_batch_count) * GSO_BUF_SIZE
             : m_gso_pool.get();
+#else
+        uint8_t *buf = m_gso_pool.get();
+#endif
 
         udp_connection *conn = find(dest);
         if (!conn || conn->state() == connection_state::DISCONNECTED)

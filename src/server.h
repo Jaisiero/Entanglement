@@ -97,8 +97,10 @@ namespace entanglement
                      uint16_t max_payload, uint8_t channel_id, const endpoint_key &key, uint8_t flags);
 
         // GSO sendmmsg batching: queue gso_send calls, flush via single sendmmsg.
+#ifdef __linux__
         void gso_batch_begin(size_t worker_idx);
         int gso_batch_flush(size_t worker_idx);
+#endif
 
         // Begin/flush sendmmsg batching on a specific worker's socket.
         // Call begin before a burst of worker_send_to, flush after.

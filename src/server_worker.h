@@ -140,11 +140,13 @@ namespace entanglement
         int gso_send(uint32_t count, const uint16_t *payload_sizes, uint16_t max_payload,
                      uint8_t channel_id, const endpoint_key &dest, uint8_t flags);
 
-        // --- GSO sendmmsg batching ---
+#ifdef __linux__
+        // --- GSO sendmmsg batching (Linux only — requires sendmmsg + GSO) ---
         // Begin batch mode: subsequent gso_send() calls queue instead of sending.
         void gso_batch_begin();
         // Flush all queued GSO sends via a single sendmmsg() syscall.
         int gso_batch_flush();
+#endif
 
         int send_fragment_to(uint32_t message_id, uint8_t fragment_index, uint8_t fragment_count, const void *data,
                              size_t size, uint8_t flags, uint8_t channel_id, const endpoint_key &dest,
@@ -266,10 +268,12 @@ namespace entanglement
         static constexpr int GSO_POOL_SLOTS = 128;
         std::unique_ptr<uint8_t[]> m_gso_pool;
 
-        // GSO batch state
+#ifdef __linux__
+        // GSO batch state (Linux only — requires sendmmsg + GSO)
         bool m_gso_batch_mode = false;
         int m_gso_batch_count = 0;
         std::unique_ptr<udp_socket::gso_batch_entry[]> m_gso_entries;
+#endif
 
         // --- Internal helpers ---
         void handle_control(const endpoint_key &key, const packet_header &header, const uint8_t *payload,
