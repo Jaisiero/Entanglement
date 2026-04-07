@@ -37,7 +37,7 @@ namespace entanglement
 {
 
 // ── Constants ──────────────────────────────────────────────────────────
-static constexpr int    NUM_FRAMES   = 8192;
+static constexpr int    NUM_FRAMES   = 32768;
 static constexpr int    FRAME_SIZE   = 2048;  // fits ETH+IP+UDP+34+1154 = 1230
 static constexpr size_t UMEM_SIZE    = NUM_FRAMES * FRAME_SIZE;
 static constexpr int    FQ_SIZE      = 256;   // fill queue (RX, minimal)
@@ -45,6 +45,12 @@ static constexpr int    ETH_HLEN_V   = 14;
 static constexpr int    IP_HLEN_V    = 20;
 static constexpr int    UDP_HLEN_V   = 8;
 static constexpr int    L234_OVERHEAD = ETH_HLEN_V + IP_HLEN_V + UDP_HLEN_V; // 42
+
+// ── Staged TX descriptor (built in UMEM but not yet in TX ring) ────────
+struct tx_staged_desc {
+    uint32_t addr;   // UMEM frame address
+    uint32_t len;    // total frame length (ETH+IP+UDP+payload)
+};
 
 // ── Per-worker context ─────────────────────────────────────────────────
 struct xdp_worker_ctx
@@ -60,6 +66,11 @@ struct xdp_worker_ctx
     // Frame allocator (stack-based, lock-free within a single worker)
     uint32_t frame_free[NUM_FRAMES];
     int      free_count = 0;
+
+    // Staging buffer: frames built in UMEM, flushed to TX ring in one batch.
+    // Eliminates per-player reserve+submit atomics (250/tick → 2/tick).
+    tx_staged_desc staged[NUM_FRAMES];
+    int            staged_count = 0;
 
     uint32_t alloc_frame()
     {
@@ -195,12 +206,12 @@ static bool resolve_mac(uint32_t dst_ip_net, uint8_t mac[6])
     sa->sin_family = AF_INET;
     sa->sin_addr.s_addr = dst_ip_net;
 
-    // Use the interface name from init
     char iface_name[IFNAMSIZ] = {};
     if_indextoname(g_ifindex, iface_name);
     std::strncpy(arp.arp_dev, iface_name, IFNAMSIZ - 1);
 
-    bool ok = ioctl(fd, SIOCGARP, &arp) == 0 && (arp.arp_flags & ATF_COM);
+    int ioctl_ret = ioctl(fd, SIOCGARP, &arp);
+    bool ok = ioctl_ret == 0 && (arp.arp_flags & ATF_COM);
     close(fd);
 
     if (ok)
@@ -336,24 +347,33 @@ static int setup_worker(xdp_worker_ctx &ctx, int queue_id)
     xsk_cfg.tx_size      = static_cast<__u32>(NUM_FRAMES);
     xsk_cfg.libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD;
     xsk_cfg.xdp_flags    = 0;  // program already attached
-    xsk_cfg.bind_flags   = XDP_COPY | XDP_USE_NEED_WAKEUP;
 
     char iface_name[IFNAMSIZ] = {};
     if_indextoname(g_ifindex, iface_name);
 
+    // Try zero-copy first (ixgbe/ice/mlx5 support native ZC)
+    xsk_cfg.bind_flags = XDP_ZEROCOPY | XDP_USE_NEED_WAKEUP;
     ret = xsk_socket__create(&ctx.xsk, iface_name, queue_id,
                               ctx.umem, &ctx.rx, &ctx.tx, &xsk_cfg);
-    if (ret)
+    if (ret == 0)
     {
-        fprintf(stderr, "[xdp_tx] xsk_socket__create (q%d, COPY): %s\n",
+        fprintf(stderr, "[xdp_tx] Worker %d: ZERO-COPY mode\n", queue_id);
+    }
+    else
+    {
+        fprintf(stderr, "[xdp_tx] xsk_socket__create (q%d, ZC): %s — falling back to COPY\n",
                 queue_id, strerror(-ret));
-        // Try without XDP_COPY
-        xsk_cfg.bind_flags = XDP_USE_NEED_WAKEUP;
+        // Fall back to COPY mode
+        xsk_cfg.bind_flags = XDP_COPY | XDP_USE_NEED_WAKEUP;
         ret = xsk_socket__create(&ctx.xsk, iface_name, queue_id,
                                   ctx.umem, &ctx.rx, &ctx.tx, &xsk_cfg);
-        if (ret)
+        if (ret == 0)
         {
-            fprintf(stderr, "[xdp_tx] xsk_socket__create (q%d, ZC): %s\n",
+            fprintf(stderr, "[xdp_tx] Worker %d: COPY mode (fallback)\n", queue_id);
+        }
+        else
+        {
+            fprintf(stderr, "[xdp_tx] xsk_socket__create (q%d, COPY): %s\n",
                     queue_id, strerror(-ret));
             xsk_umem__delete(ctx.umem);
             ctx.umem = nullptr;
@@ -450,94 +470,80 @@ int xdp_tx_send_gso(int worker_idx,
 
     auto &ctx = g_workers[worker_idx];
 
-    // Resolve destination MAC
+    // Resolve destination MAC (cached after first ARP lookup)
     uint8_t dst_mac[6];
     if (!resolve_mac(dst_ip_net, dst_mac))
-    {
-        // Can't resolve — caller should fall back to sendmsg for this dest
         return -EHOSTUNREACH;
-    }
 
-    // Calculate number of segments (same logic as kernel GSO)
     int num_segments = static_cast<int>((total_size + segment_size - 1) / segment_size);
     auto *src = static_cast<const uint8_t *>(buffer);
 
-    // Reserve TX ring slots in one batch
-    uint32_t tx_idx = 0;
-    unsigned int reserved = xsk_ring_prod__reserve(&ctx.tx, num_segments, &tx_idx);
-    if (reserved == 0)
-    {
-        // TX ring full — try to flush and reclaim
-        sendto(xsk_socket__fd(ctx.xsk), nullptr, 0, MSG_DONTWAIT, nullptr, 0);
+    // Proactive reclaim when UMEM frames drop below 25%
+    if (ctx.free_count < NUM_FRAMES / 4)
         reclaim_frames(ctx);
-        reserved = xsk_ring_prod__reserve(&ctx.tx, num_segments, &tx_idx);
-        if (reserved == 0)
-            return -ENOBUFS;
+
+    // Pre-build L2+L3+L4 header template on stack (42 bytes)
+    uint8_t hdr_tpl[L234_OVERHEAD];
+    {
+        int off = 0;
+        std::memcpy(hdr_tpl + off, dst_mac, 6);   off += 6;
+        std::memcpy(hdr_tpl + off, g_src_mac, 6);  off += 6;
+        hdr_tpl[off++] = 0x08;
+        hdr_tpl[off++] = 0x00;
+        auto *iph = reinterpret_cast<struct iphdr *>(hdr_tpl + off);
+        std::memset(iph, 0, IP_HLEN_V);
+        iph->ihl      = 5;
+        iph->version  = 4;
+        iph->ttl      = 64;
+        iph->protocol = IPPROTO_UDP;
+        iph->saddr    = g_src_ip;
+        iph->daddr    = dst_ip_net;
+        off += IP_HLEN_V;
+        auto *udph = reinterpret_cast<struct udphdr *>(hdr_tpl + off);
+        udph->source = htons(g_src_port);
+        udph->dest   = htons(dst_port_host);
+        udph->check  = 0;
     }
 
     int total_enqueued = 0;
 
-    for (unsigned int i = 0; i < reserved; i++)
+    for (int i = 0; i < num_segments; i++)
     {
-        // Determine segment bounds
         size_t seg_offset = static_cast<size_t>(i) * segment_size;
-        size_t seg_len = (i < static_cast<unsigned>(num_segments - 1))
-                             ? segment_size
-                             : (total_size - seg_offset);
+        size_t seg_len = (i < num_segments - 1) ? segment_size
+                                                  : (total_size - seg_offset);
 
-        // Allocate UMEM frame
         uint32_t addr = ctx.alloc_frame();
         if (addr == UINT32_MAX)
         {
-            // Out of frames — submit what we have so far
-            xsk_ring_prod__submit(&ctx.tx, i);
-            return total_enqueued > 0 ? total_enqueued : -ENOMEM;
+            reclaim_frames(ctx);
+            addr = ctx.alloc_frame();
         }
+        if (addr == UINT32_MAX)
+            return total_enqueued > 0 ? total_enqueued : -ENOMEM;
 
         uint8_t *frame = static_cast<uint8_t *>(ctx.umem_area) + addr;
-        int offset = 0;
 
-        // ── Ethernet header (14 bytes) ──
-        std::memcpy(frame + offset, dst_mac, 6);  offset += 6;
-        std::memcpy(frame + offset, g_src_mac, 6); offset += 6;
-        frame[offset++] = 0x08;
-        frame[offset++] = 0x00; // EtherType = IPv4
+        // Stamp header template then patch variable fields
+        std::memcpy(frame, hdr_tpl, L234_OVERHEAD);
 
-        // ── IP header (20 bytes) ──
+        auto *iph = reinterpret_cast<struct iphdr *>(frame + ETH_HLEN_V);
         uint16_t ip_total = static_cast<uint16_t>(IP_HLEN_V + UDP_HLEN_V + seg_len);
-        auto *iph = reinterpret_cast<struct iphdr *>(frame + offset);
-        std::memset(iph, 0, IP_HLEN_V);
-        iph->ihl     = 5;
-        iph->version = 4;
         iph->tot_len = htons(ip_total);
-        iph->ttl     = 64;
-        iph->protocol = IPPROTO_UDP;
-        iph->saddr   = g_src_ip;
-        iph->daddr   = dst_ip_net;
         iph->check   = ip_checksum(iph, IP_HLEN_V);
-        offset += IP_HLEN_V;
 
-        // ── UDP header (8 bytes) ──
-        auto *udph = reinterpret_cast<struct udphdr *>(frame + offset);
-        udph->source = htons(g_src_port);
-        udph->dest   = htons(dst_port_host);
-        udph->len    = htons(static_cast<uint16_t>(UDP_HLEN_V + seg_len));
-        udph->check  = 0; // Valid for IPv4
-        offset += UDP_HLEN_V;
+        auto *udph = reinterpret_cast<struct udphdr *>(frame + ETH_HLEN_V + IP_HLEN_V);
+        udph->len = htons(static_cast<uint16_t>(UDP_HLEN_V + seg_len));
 
-        // ── Payload (Entanglement segment data) ──
-        std::memcpy(frame + offset, src + seg_offset, seg_len);
-        offset += static_cast<int>(seg_len);
+        std::memcpy(frame + L234_OVERHEAD, src + seg_offset, seg_len);
 
-        // Fill TX descriptor
-        auto *desc = xsk_ring_prod__tx_desc(&ctx.tx, tx_idx + i);
-        desc->addr = addr;
-        desc->len  = static_cast<uint32_t>(offset);
+        // Stage frame — NO ring operations here.
+        // All staged frames are batch-reserved+submitted in xdp_tx_flush().
+        ctx.staged[ctx.staged_count++] = {addr, static_cast<uint32_t>(L234_OVERHEAD + seg_len)};
 
         total_enqueued += static_cast<int>(seg_len);
     }
 
-    xsk_ring_prod__submit(&ctx.tx, reserved);
     return total_enqueued;
 }
 
@@ -548,12 +554,56 @@ void xdp_tx_flush(int worker_idx)
 
     auto &ctx = g_workers[worker_idx];
 
-    // Kick the TX ring
-    if (xsk_ring_prod__needs_wakeup(&ctx.tx))
-        sendto(xsk_socket__fd(ctx.xsk), nullptr, 0, MSG_DONTWAIT, nullptr, 0);
+    if (ctx.staged_count == 0)
+    {
+        // Nothing staged — just reclaim any completed frames
+        reclaim_frames(ctx);
+        return;
+    }
 
-    // Reclaim completed frames
+    // Batch reserve ALL staged frames in one atomic ring operation
+    uint32_t tx_idx = 0;
+    int to_send = ctx.staged_count;
+    unsigned int reserved = xsk_ring_prod__reserve(&ctx.tx, to_send, &tx_idx);
+    if (reserved < static_cast<unsigned>(to_send))
+    {
+        // Ring didn't have enough space — kick NIC to drain, reclaim, retry
+        sendto(xsk_socket__fd(ctx.xsk), nullptr, 0, MSG_DONTWAIT, nullptr, 0);
+        reclaim_frames(ctx);
+        if (reserved == 0)
+            reserved = xsk_ring_prod__reserve(&ctx.tx, to_send, &tx_idx);
+    }
+
+    if (reserved == 0)
+    {
+        // Total failure — free all staged UMEM frames
+        for (int i = 0; i < to_send; i++)
+            ctx.release_frame(ctx.staged[i].addr);
+        ctx.staged_count = 0;
+        return;
+    }
+
+    // Fill TX descriptors from staged buffer
+    unsigned int count = (reserved < static_cast<unsigned>(to_send))
+                             ? reserved : static_cast<unsigned>(to_send);
+    for (unsigned int i = 0; i < count; i++)
+    {
+        auto *desc = xsk_ring_prod__tx_desc(&ctx.tx, tx_idx + i);
+        desc->addr = ctx.staged[i].addr;
+        desc->len  = ctx.staged[i].len;
+    }
+
+    // Free any excess staged frames that didn't fit
+    for (unsigned int i = count; i < static_cast<unsigned>(to_send); i++)
+        ctx.release_frame(ctx.staged[i].addr);
+
+    // One submit + one kick for the entire tick
+    xsk_ring_prod__submit(&ctx.tx, count);
+    sendto(xsk_socket__fd(ctx.xsk), nullptr, 0, MSG_DONTWAIT, nullptr, 0);
+
+    // Reclaim completed frames for next tick
     reclaim_frames(ctx);
+    ctx.staged_count = 0;
 }
 
 void xdp_tx_cleanup()
