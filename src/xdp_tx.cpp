@@ -25,6 +25,8 @@
 #include <netinet/ip.h>
 #include <netinet/udp.h>
 #include <net/if_arp.h>
+#include <csignal>
+#include <cstdlib>
 
 // libbpf / libxdp
 #include <bpf/bpf.h>
@@ -84,6 +86,51 @@ static uint16_t                     g_src_port   = 0;  // host order
 // ARP cache: dst_ip (network order) → MAC address
 static std::unordered_map<uint32_t, std::array<uint8_t, 6>> g_arp_cache;
 static std::mutex g_arp_mutex;
+
+// ── Signal-safe XDP detach (best-effort on SIGTERM/SIGINT) ─────────────
+// Only detaches the BPF program from the NIC — no heap ops, async-safe.
+static struct sigaction g_prev_sigterm{};
+static struct sigaction g_prev_sigint{};
+static volatile sig_atomic_t g_signal_cleanup_done = 0;
+
+static void xdp_signal_handler(int sig)
+{
+    if (!g_signal_cleanup_done && g_xdp_prog_fd >= 0 && g_ifindex > 0)
+    {
+        g_signal_cleanup_done = 1;
+        // bpf_xdp_detach is a single syscall — safe in signal context
+        LIBBPF_OPTS(bpf_xdp_attach_opts, opts);
+        bpf_xdp_detach(g_ifindex, 0, &opts);
+        close(g_xdp_prog_fd);
+        g_xdp_prog_fd = -1;
+    }
+
+    // Re-raise with original handler so the process terminates normally
+    struct sigaction *prev = (sig == SIGTERM) ? &g_prev_sigterm : &g_prev_sigint;
+    sigaction(sig, prev, nullptr);
+    raise(sig);
+}
+
+static void install_signal_handlers()
+{
+    struct sigaction sa{};
+    sa.sa_handler = xdp_signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESETHAND; // one-shot
+
+    sigaction(SIGTERM, &sa, &g_prev_sigterm);
+    sigaction(SIGINT,  &sa, &g_prev_sigint);
+}
+
+// atexit callback — normal exit path
+static void xdp_atexit_cleanup()
+{
+    if (g_active)
+    {
+        // Full cleanup only if signal handler didn't already detach
+        xdp_tx_cleanup();
+    }
+}
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
@@ -361,6 +408,12 @@ int xdp_tx_init(const char *iface, int num_workers,
     }
 
     g_active = true;
+
+    // Register cleanup for SIGTERM/SIGINT and normal process exit
+    install_signal_handlers();
+    static bool atexit_registered = false;
+    if (!atexit_registered) { std::atexit(xdp_atexit_cleanup); atexit_registered = true; }
+
     printf("[xdp_tx] Initialized successfully (%d workers)\n", num_workers);
     return 0;
 }
@@ -509,6 +562,7 @@ void xdp_tx_cleanup()
     g_arp_cache.clear();
     g_active = false;
     g_num_workers = 0;
+    g_signal_cleanup_done = 1; // prevent signal handler from double-detaching
     printf("[xdp_tx] Cleaned up\n");
 }
 
