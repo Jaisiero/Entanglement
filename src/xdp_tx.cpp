@@ -78,6 +78,7 @@ static bool                         g_active     = false;
 static int                          g_num_workers = 0;
 static int                          g_ifindex    = 0;
 static int                          g_xdp_prog_fd = -1;
+static uint32_t                     g_xdp_flags  = 0;   // flags used for attach (DRV/SKB)
 static std::vector<xdp_worker_ctx>  g_workers;
 static uint8_t                      g_src_mac[6] = {};
 static uint32_t                     g_src_ip     = 0;  // network order
@@ -95,14 +96,26 @@ static volatile sig_atomic_t g_signal_cleanup_done = 0;
 
 static void xdp_signal_handler(int sig)
 {
+    // write() is async-signal-safe — use it for diagnostics
+    static const char msg_enter[] = "[xdp_tx] Signal handler: detaching BPF\n";
+    static const char msg_done[]  = "[xdp_tx] Signal handler: BPF detached OK\n";
+    static const char msg_skip[]  = "[xdp_tx] Signal handler: already cleaned\n";
+
     if (!g_signal_cleanup_done && g_xdp_prog_fd >= 0 && g_ifindex > 0)
     {
+        (void)write(STDERR_FILENO, msg_enter, sizeof(msg_enter) - 1);
         g_signal_cleanup_done = 1;
         // bpf_xdp_detach is a single syscall — safe in signal context
+        // Must use same flags (DRV/SKB) that were used for attach
         LIBBPF_OPTS(bpf_xdp_attach_opts, opts);
-        bpf_xdp_detach(g_ifindex, 0, &opts);
+        bpf_xdp_detach(g_ifindex, g_xdp_flags, &opts);
         close(g_xdp_prog_fd);
         g_xdp_prog_fd = -1;
+        (void)write(STDERR_FILENO, msg_done, sizeof(msg_done) - 1);
+    }
+    else
+    {
+        (void)write(STDERR_FILENO, msg_skip, sizeof(msg_skip) - 1);
     }
 
     // Re-raise with original handler so the process terminates normally
@@ -273,10 +286,12 @@ static int load_xdp_pass(const char *iface)
             g_xdp_prog_fd = -1;
             return ret;
         }
+        g_xdp_flags = XDP_FLAGS_SKB_MODE;
         printf("[xdp_tx] XDP_PASS attached (SKB/generic mode)\n");
     }
     else
     {
+        g_xdp_flags = XDP_FLAGS_DRV_MODE;
         printf("[xdp_tx] XDP_PASS attached (native/DRV mode)\n");
     }
 
@@ -554,7 +569,7 @@ void xdp_tx_cleanup()
     if (g_xdp_prog_fd >= 0 && g_ifindex > 0)
     {
         LIBBPF_OPTS(bpf_xdp_attach_opts, opts);
-        bpf_xdp_detach(g_ifindex, 0, &opts);
+        bpf_xdp_detach(g_ifindex, g_xdp_flags, &opts);
         close(g_xdp_prog_fd);
         g_xdp_prog_fd = -1;
     }
