@@ -451,8 +451,8 @@ namespace entanglement
         uint16_t segment_size = static_cast<uint16_t>(sizeof(packet_header) + max_payload);
         size_t stride = static_cast<size_t>(segment_size);
 
-        // Single segment — avoid GSO overhead
-        if (count == 1)
+        // Single segment — avoid GSO overhead (skip if XDP active — use XDP for all sends)
+        if (count == 1 && !(m_xdp_worker_idx >= 0 && xdp_tx_available()))
         {
             return conn->send_payload(*m_send_socket, *m_channels,
                                        buf + sizeof(packet_header), payload_sizes[0],
