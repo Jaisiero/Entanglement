@@ -165,6 +165,13 @@ static void xdp_atexit_cleanup()
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
+// One's-complement helpers for incremental checksum adjustment
+static inline uint16_t csum_add(uint16_t a, uint16_t b)
+{
+    uint32_t s = static_cast<uint32_t>(a) + b;
+    return static_cast<uint16_t>(s + (s >> 16));
+}
+
 static uint16_t ip_checksum(const void *data, int len)
 {
     auto *p = static_cast<const uint16_t *>(data);
@@ -490,6 +497,7 @@ int xdp_tx_send_gso(int worker_idx,
 
     // Pre-build L2+L3+L4 header template on stack (42 bytes)
     uint8_t hdr_tpl[L234_OVERHEAD];
+    uint16_t base_csum;  // checksum of template with tot_len=0
     {
         int off = 0;
         std::memcpy(hdr_tpl + off, dst_mac, 6);   off += 6;
@@ -504,6 +512,10 @@ int xdp_tx_send_gso(int worker_idx,
         iph->protocol = IPPROTO_UDP;
         iph->saddr    = g_src_ip;
         iph->daddr    = dst_ip_net;
+        iph->tot_len  = 0;   // will be patched per-segment
+        iph->check    = 0;
+        // Compute base checksum with tot_len=0 — only tot_len changes per segment
+        base_csum = ip_checksum(iph, IP_HLEN_V);
         off += IP_HLEN_V;
         auto *udph = reinterpret_cast<struct udphdr *>(hdr_tpl + off);
         udph->source = htons(g_src_port);
@@ -535,8 +547,11 @@ int xdp_tx_send_gso(int worker_idx,
 
         auto *iph = reinterpret_cast<struct iphdr *>(frame + ETH_HLEN_V);
         uint16_t ip_total = static_cast<uint16_t>(IP_HLEN_V + UDP_HLEN_V + seg_len);
-        iph->tot_len = htons(ip_total);
-        iph->check   = ip_checksum(iph, IP_HLEN_V);
+        uint16_t ip_total_net = htons(ip_total);
+        iph->tot_len = ip_total_net;
+        // Incremental checksum: adjust base for the new tot_len value
+        iph->check   = static_cast<uint16_t>(
+            ~csum_add(static_cast<uint16_t>(~base_csum), ip_total_net));
 
         auto *udph = reinterpret_cast<struct udphdr *>(frame + ETH_HLEN_V + IP_HLEN_V);
         udph->len = htons(static_cast<uint16_t>(UDP_HLEN_V + seg_len));
