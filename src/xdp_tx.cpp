@@ -244,13 +244,12 @@ static void reclaim_frames(xdp_worker_ctx &ctx)
 {
     uint32_t idx = 0;
     unsigned int completed = xsk_ring_cons__peek(&ctx.cq, NUM_FRAMES, &idx);
-    for (unsigned int i = 0; i < completed; i++)
-    {
-        uint64_t addr = *xsk_ring_cons__comp_addr(&ctx.cq, idx + i);
-        ctx.release_frame(static_cast<uint32_t>(addr));
-    }
     if (completed > 0)
+    {
+        // Bump allocator: frames complete in FIFO order, no need to read addresses
+        ctx.free_count += completed;
         xsk_ring_cons__release(&ctx.cq, completed);
+    }
 }
 
 // ── XDP program loading ────────────────────────────────────────────────
