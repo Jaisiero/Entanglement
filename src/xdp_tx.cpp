@@ -490,8 +490,10 @@ int xdp_tx_send_gso(int worker_idx,
     int num_segments = static_cast<int>((total_size + segment_size - 1) / segment_size);
     auto *src = static_cast<const uint8_t *>(buffer);
 
-    // Proactive reclaim when UMEM frames drop below 25%
-    if (ctx.free_count < NUM_FRAMES / 4)
+    // Reclaim completed frames at start of each tick (staged_count==0 means first call)
+    // and reactively when frames drop below 25%.  Early reclaim maximizes available
+    // UMEM frames and avoids mid-build stalls waiting for NIC DMA completions.
+    if (ctx.staged_count == 0 || ctx.free_count < NUM_FRAMES / 4)
         reclaim_frames(ctx);
 
     // Pre-build L2+L3+L4 header template on stack (42 bytes)
