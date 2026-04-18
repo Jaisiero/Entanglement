@@ -277,7 +277,7 @@ namespace entanglement
         // In non-batch mode, only slot 0 is used (same as before).
         // In batch mode, each gso_send() advances to the next slot.
         static constexpr size_t GSO_BUF_SIZE = 32768;
-        static constexpr int GSO_POOL_SLOTS = 128;
+        static constexpr int GSO_POOL_SLOTS = 256;
         std::unique_ptr<uint8_t[]> m_gso_pool;
 
 #ifdef __linux__
