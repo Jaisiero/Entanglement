@@ -617,6 +617,14 @@ uint16_t ent_server_port(const ent_server_t *s)
  * Server: worker direct-send API
  * ----------------------------------------------------------------------- */
 
+void ent_server_dispatch_to_workers(ent_server_t *s,
+                                     ent_worker_task_fn fn,
+                                     void **contexts)
+{
+    if (s)
+        s->cpp.dispatch_to_workers(fn, contexts);
+}
+
 void ent_server_pause_workers(ent_server_t *s)
 {
     if (s)

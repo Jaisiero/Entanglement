@@ -292,6 +292,17 @@ namespace entanglement
         std::atomic<bool> m_paused{false};
         std::atomic<int> m_workers_paused{0};
 
+        // --- Worker task dispatch (thread fusion) ---
+    public:
+        using worker_task_fn = void (*)(void *context, int worker_idx);
+        void dispatch_to_workers(worker_task_fn fn, void **contexts);
+
+    private:
+        std::atomic<bool> m_dispatch_pending{false};
+        worker_task_fn m_dispatch_fn = nullptr;
+        void *m_dispatch_contexts[64] = {};
+        std::atomic<int> m_dispatch_done{0};
+
         // Shared send data pool (cross-thread sends write payload here)
         send_pool m_send_pool;
     };

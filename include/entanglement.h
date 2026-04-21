@@ -364,6 +364,15 @@ extern "C"
 
     /* --- Worker direct-send API (bypass MPSC queue) --- */
 
+    /* Dispatch a task to all worker threads (thread fusion).
+     * Each worker calls fn(contexts[worker_idx], worker_idx).
+     * Blocks until all workers complete. Workers have native access
+     * to their own GSO buffers and send sockets — no pause needed. */
+    typedef void (*ent_worker_task_fn)(void *context, int worker_idx);
+    ENT_API void ent_server_dispatch_to_workers(ent_server_t *s,
+                                                 ent_worker_task_fn fn,
+                                                 void **contexts);
+
     /* Pause all worker threads.  Blocks until every worker has stopped.
      * While paused, the caller may invoke ent_server_worker_send_to()
      * with exclusive access per worker_idx. */

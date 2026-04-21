@@ -4,6 +4,13 @@
 #include <cstring>
 #include <iostream>
 
+#ifdef _MSC_VER
+#include <intrin.h>
+#define CPU_PAUSE() _mm_pause()
+#else
+#define CPU_PAUSE() __builtin_ia32_pause()
+#endif
+
 #ifdef __linux__
 #include <arpa/inet.h>
 #include <net/if.h>
@@ -443,7 +450,27 @@ namespace entanglement
 
         while (m_running.load(std::memory_order_relaxed))
         {
-            // Check pause request — spin until resumed
+            // Highest priority: dispatched task (thread fusion)
+            if (m_dispatch_pending.load(std::memory_order_acquire))
+            {
+                auto fn = m_dispatch_fn;
+                auto ctx = m_dispatch_contexts[worker_idx];
+                if (fn)
+                    fn(ctx, static_cast<int>(worker_idx));
+                m_dispatch_done.fetch_add(1, std::memory_order_release);
+                // Spin until main thread clears the dispatch flag
+                while (m_dispatch_pending.load(std::memory_order_acquire))
+                {
+#if defined(__x86_64__) || defined(_M_X64)
+                    CPU_PAUSE();
+#else
+                    std::this_thread::yield();
+#endif
+                }
+                continue;
+            }
+
+            // Check pause request — spin until resumed (legacy path)
             if (m_paused.load(std::memory_order_acquire))
             {
                 m_workers_paused.fetch_add(1, std::memory_order_release);
@@ -482,6 +509,35 @@ namespace entanglement
         m_paused.store(false, std::memory_order_release);
         while (m_workers_paused.load(std::memory_order_acquire) > 0)
             std::this_thread::yield();
+    }
+
+    void server::dispatch_to_workers(worker_task_fn fn, void **contexts)
+    {
+        if (!m_threaded || m_workers.empty())
+            return;
+
+        const int count = static_cast<int>(m_workers.size());
+        m_dispatch_done.store(0, std::memory_order_relaxed);
+        m_dispatch_fn = fn;
+        for (int i = 0; i < count; ++i)
+            m_dispatch_contexts[i] = contexts[i];
+
+        // Publish task — workers will pick it up on next loop iteration
+        m_dispatch_pending.store(true, std::memory_order_release);
+
+        // Wait for all workers to complete
+        while (m_dispatch_done.load(std::memory_order_acquire) < count)
+        {
+#if defined(__x86_64__) || defined(_M_X64)
+            CPU_PAUSE();
+#else
+            std::this_thread::yield();
+#endif
+        }
+
+        // Clear dispatch state; workers will see this and resume normal loop
+        m_dispatch_fn = nullptr;
+        m_dispatch_pending.store(false, std::memory_order_release);
     }
 
     int server::worker_send_to(size_t worker_idx, const void *data, size_t size,
