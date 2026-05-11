@@ -101,6 +101,24 @@ namespace entanglement
         flush_send_queue();
 
         // 2. Dequeue and process received datagrams (drain all recv queues round-robin)
+        //
+        // INTERLEAVE_FLUSH_PERIOD (Opción A, 2026-05-11): the worker
+        // alternates between processing inbound datagrams and dispatching
+        // outbound sends from the cross-thread MPSC queue. Without
+        // interleaved flushes, a burst of expensive recvs (e.g. 60
+        // HANDOFF_AUTHs each invoking auth_session + try_send +
+        // send_session_open in their callbacks) could keep this loop busy
+        // for several ms before flush_send_queue runs again — the game
+        // thread's SessionOpen sends pile up in the MPSC and Δ23 (server
+        // replies) blows up. Flushing every N packets bounds that wait to
+        // at most N × ~120 μs ≈ 4 ms. Predicted Δ23 p99 reduction:
+        // 1100 ms → ~150-300 ms in bench-D worst case.
+        //
+        // Cost: flush_send_queue() on an empty MPSC is ~10 ns
+        // (single load on the consumer head pointer). With max_packets
+        // = 256 and N = 32 we add 8 calls per poll = ~80 ns of overhead
+        // when idle, negligible.
+        constexpr int INTERLEAVE_FLUSH_PERIOD = 32;
         int count = 0;
         if (m_recv_queues.size() == 1)
         {
@@ -114,6 +132,8 @@ namespace entanglement
                 process_datagram(slot->header, slot->payload, slot->sender);
                 q.commit_read();
                 ++count;
+                if ((count & (INTERLEAVE_FLUSH_PERIOD - 1)) == 0)
+                    flush_send_queue();
             }
         }
         else
@@ -134,10 +154,16 @@ namespace entanglement
                         qp->commit_read();
                         ++count;
                         any = true;
+                        if ((count & (INTERLEAVE_FLUSH_PERIOD - 1)) == 0)
+                            flush_send_queue();
                     }
                 }
             }
         }
+        // Final flush so any sends queued during the last (count % N) iterations
+        // also leave this poll cycle. Without this, up to N-1 sends could wait
+        // for the next poll_local invocation.
+        flush_send_queue();
         if (m_exclusive_send_socket)
             m_send_socket->flush_send_batch();
         return count;
