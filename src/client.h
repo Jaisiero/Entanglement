@@ -61,6 +61,21 @@ namespace entanglement
                  uint32_t *out_message_id = nullptr, uint64_t *out_sequence = nullptr, uint32_t channel_sequence = 0,
                  uint32_t *out_channel_sequence = nullptr);
 
+        // Send a message tagged with FLAG_RESET (2026-05-12). Wipes
+        // this client's outbound + inbound connection state before
+        // building the packet, so the wire sequence resets to 1. The
+        // FLAG_RESET bit in the header tells the server to mirror the
+        // wipe, allowing both ends to recover a clean session-state
+        // boundary in the middle of a long-lived UDP connection.
+        //
+        // Use case: bot keeps a UDP socket alive to a previously-used
+        // shard via heartbeats; when SHARD_HANDOFF brings it back, the
+        // bot reuses the socket and sends its first new-session
+        // packet (HANDOFF_AUTH) via this API to avoid stale-state
+        // mismatch on the SessionOpen reply.
+        int send_with_reset(const void *data, size_t size, uint8_t channel_id = 0, uint8_t flags = 0,
+                            uint32_t *out_message_id = nullptr, uint64_t *out_sequence = nullptr);
+
         // Retransmit a single fragment of a previously started fragmented message.
         // For manual loss recovery only — prefer enable_auto_retransmit() instead.
         int send_fragment(uint32_t message_id, uint8_t fragment_index, uint8_t fragment_count, const void *data,

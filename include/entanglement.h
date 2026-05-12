@@ -222,6 +222,14 @@ extern "C"
                                 uint32_t *out_message_id, uint64_t *out_sequence, uint32_t channel_sequence,
                                 uint32_t *out_channel_sequence);
 
+    /* Reset-aware send (FLAG_RESET, 2026-05-12). Wipes the client's local
+     * udp_connection state (sequences, ack bitmap, RTT, etc.) and tags the
+     * packet with FLAG_RESET so the server wipes its end too. Used to
+     * promote a pre-warmed UDP socket as the live primary session
+     * without paying the cost of disconnect+reconnect+handshake. */
+    ENT_API int ent_client_send_with_reset(ent_client_t *c, const void *data, size_t size, uint8_t channel_id,
+                                           uint8_t flags, uint32_t *out_message_id, uint64_t *out_sequence);
+
     /* Send pre-built header (low-level). Returns bytes sent or negative ent_error.
      * NOTE: `header` is an in/out parameter — the library fills internal fields
      * (sequence, ack_sequence, ack_bits, etc.) before sending.  The caller's
@@ -302,6 +310,14 @@ extern "C"
      * bypass the regular send queue's tail under a recv burst. */
     ENT_API int ent_server_send_to_priority(ent_server_t *s, const void *data, size_t size, uint8_t channel_id,
                                             ent_endpoint dest, uint8_t flags, uint32_t *out_message_id);
+
+    /* Reset-aware send (FLAG_RESET, 2026-05-12). Wipes the server's udp_connection
+     * state for `dest` and tags the packet with FLAG_RESET so the client wipes its
+     * end too. Used to revive a stale endpoint binding when the client reuses a
+     * pre-warmed socket. See packet_flags::FLAG_RESET in packet_header.h for the
+     * full protocol semantics. */
+    ENT_API int ent_server_send_to_with_reset(ent_server_t *s, const void *data, size_t size, uint8_t channel_id,
+                                              ent_endpoint dest, uint8_t flags, uint32_t *out_message_id);
 
     /* Send pre-built header (low-level).
      * NOTE: `header` is an in/out parameter — the library fills internal fields

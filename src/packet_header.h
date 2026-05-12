@@ -13,7 +13,28 @@ namespace entanglement
         FLAG_COMPRESSED = 1 << 2,  // Payload is compressed
         FLAG_SHARD_RELAY = 1 << 3, // Cross-shard relay (halo region forwarding)
         FLAG_COALESCED = 1 << 4,   // Payload contains multiple length-prefixed sub-messages
-        // Bits 5–7 reserved for future use.
+        // FLAG_RESET (2026-05-12): "session-reset" marker. The receiver
+        // resets its `udp_connection` state (local_sequence,
+        // remote_sequence, channel sequences, ack bitmap, fragmentation
+        // state, RTT, congestion) IMMEDIATELY upon receipt — before the
+        // sequence check that would otherwise drop this packet as
+        // out-of-order. The sender must reset its own outbound state
+        // BEFORE emitting (so the packet itself is seq=1).
+        //
+        // Use case: socket pre-warm / backup-handle promotion in the
+        // client. The bot keeps a UDP socket alive to a previously-used
+        // shard via heartbeats; when a later SHARD_HANDOFF brings it
+        // back, the bot reuses that socket instead of paying the ~500 ms
+        // setup of a fresh connection. Without FLAG_RESET, the
+        // application-layer HANDOFF_AUTH/SessionOpen reply pair race
+        // against stale sequence state on either side and the session
+        // never activates (server's "stale Pending" watchdog observed
+        // 2026-05-12). With FLAG_RESET on both directions of the
+        // HANDOFF_AUTH/SessionOpen exchange, both endpoints converge
+        // on a clean (seq=1, ack=0, bitmap=0) state and the bind
+        // succeeds within RTT (~1-5 ms LAN).
+        FLAG_RESET = 1 << 5,
+        // Bits 6–7 reserved for future use.
         // Reliability, ordering, and priority are determined by channel_config,
         // not by per-packet flags.
     };

@@ -131,6 +131,19 @@ namespace entanglement
                                          out_message_id, out_sequence, channel_sequence, out_channel_sequence);
     }
 
+    int client::send_with_reset(const void *data, size_t size, uint8_t channel_id, uint8_t flags,
+                                uint32_t *out_message_id, uint64_t *out_sequence)
+    {
+        // Mirror of server::send_to_with_reset on the client. Wipes the
+        // single connection's outbound + inbound state and tags the
+        // packet with FLAG_RESET so the server wipes too. Used to
+        // promote a pre-warmed UDP socket as the live primary session
+        // without paying the ~500 ms cost of a fresh client + handshake.
+        return m_connection.send_payload_with_reset(m_socket, m_channels, data, size,
+                                                    flags, channel_id, m_server_endpoint,
+                                                    out_message_id, out_sequence);
+    }
+
     int client::send_fragment(uint32_t message_id, uint8_t fragment_index, uint8_t fragment_count, const void *data,
                               size_t size, uint8_t flags, uint8_t channel_id)
     {

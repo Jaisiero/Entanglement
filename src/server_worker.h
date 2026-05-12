@@ -142,6 +142,18 @@ namespace entanglement
         int send_to(const void *data, size_t size, uint8_t channel_id, const endpoint_key &dest, uint8_t flags = 0,
                     uint32_t *out_message_id = nullptr);
 
+        // Send a message tagged with FLAG_RESET: wipes this worker's
+        // udp_connection state for `dest` before building the packet,
+        // and appends FLAG_RESET so the receiver mirrors the wipe.
+        // Used by the application layer (mmo-shard) to reply to a
+        // HANDOFF_AUTH that arrived on a pre-warmed socket — without
+        // the reset, the client's stale sequence state would drop the
+        // SessionOpen reply. Accepts DISCONNECTED connections (the
+        // reset path forces them back to CONNECTED before sending).
+        int send_to_with_reset(const void *data, size_t size, uint8_t channel_id,
+                               const endpoint_key &dest, uint8_t flags = 0,
+                               uint32_t *out_message_id = nullptr);
+
         // Send multiple payloads to the same destination via UDP GSO.
         int send_to_multi(const void *const *payloads, const uint16_t *sizes,
                           uint32_t count, uint8_t channel_id, const endpoint_key &dest, uint8_t flags = 0);

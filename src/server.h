@@ -63,6 +63,18 @@ namespace entanglement
         int send_to_priority(const void *data, size_t size, uint8_t channel_id, const endpoint_key &dest,
                              uint8_t flags = 0, uint32_t *out_message_id = nullptr);
 
+        // Reset-aware send (FLAG_RESET, 2026-05-12). Wipes our outbound
+        // udp_connection state for `dest` and appends FLAG_RESET so the
+        // receiver wipes its inbound state too. Cross-thread calls
+        // synchronously dispatch through the owning worker's exclusive
+        // send path; concurrent regular sends on the same connection
+        // would race with the wipe and produce mis-sequenced packets,
+        // so RESET must run on the worker's thread. See
+        // server_worker::send_to_with_reset and udp_connection::
+        // send_payload_with_reset for the per-connection mechanics.
+        int send_to_with_reset(const void *data, size_t size, uint8_t channel_id, const endpoint_key &dest,
+                               uint8_t flags = 0, uint32_t *out_message_id = nullptr);
+
         // Retransmit a single fragment to a specific client.
         // For manual loss recovery only — prefer enable_auto_retransmit() instead.
         int send_fragment_to(uint32_t message_id, uint8_t fragment_index, uint8_t fragment_count, const void *data,

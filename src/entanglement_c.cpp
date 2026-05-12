@@ -175,6 +175,14 @@ int ent_client_send(ent_client_t *c, const void *data, size_t size, uint8_t chan
                        out_channel_sequence);
 }
 
+int ent_client_send_with_reset(ent_client_t *c, const void *data, size_t size, uint8_t channel_id,
+                               uint8_t flags, uint32_t *out_message_id, uint64_t *out_sequence)
+{
+    if (!c)
+        return ENT_ERROR_INVALID_ARGUMENT;
+    return c->cpp.send_with_reset(data, size, channel_id, flags, out_message_id, out_sequence);
+}
+
 int ent_client_send_raw(ent_client_t *c, ent_packet_header *header, const void *payload)
 {
     if (!c || !header)
@@ -495,6 +503,14 @@ int ent_server_send_to_priority(ent_server_t *s, const void *data, size_t size, 
     if (!s)
         return ENT_ERROR_INVALID_ARGUMENT;
     return s->cpp.send_to_priority(data, size, channel_id, to_cpp(dest), flags, out_message_id);
+}
+
+int ent_server_send_to_with_reset(ent_server_t *s, const void *data, size_t size, uint8_t channel_id,
+                                  ent_endpoint dest, uint8_t flags, uint32_t *out_message_id)
+{
+    if (!s)
+        return ENT_ERROR_INVALID_ARGUMENT;
+    return s->cpp.send_to_with_reset(data, size, channel_id, to_cpp(dest), flags, out_message_id);
 }
 
 int ent_server_send_raw_to(ent_server_t *s, ent_packet_header *header, const void *payload, ent_endpoint dest)

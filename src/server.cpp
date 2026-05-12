@@ -811,6 +811,39 @@ namespace entanglement
         return send_to(data, size, channel_id, endpoint_from_string(address, port), flags, out_message_id);
     }
 
+    int server::send_to_with_reset(const void *data, size_t size, uint8_t channel_id,
+                                   const endpoint_key &key, uint8_t flags, uint32_t *out_message_id)
+    {
+        // Routes identically to send_to. The reset is in-band: we tag
+        // the send_command with FLAG_RESET and the worker's dispatcher
+        // dispatches it through send_to_with_reset (which calls
+        // udp_connection::send_payload_with_reset). For same-thread
+        // fast path we call the worker directly.
+        if (m_workers.empty())
+            return static_cast<int>(error_code::not_connected);
+
+        if (!m_threaded)
+            return m_workers[0]->send_to_with_reset(data, size, channel_id, key, flags, out_message_id);
+
+        size_t w = worker_index(key);
+        if (std::this_thread::get_id() == m_workers[w]->thread_id())
+            return m_workers[w]->send_to_with_reset(data, size, channel_id, key, flags, out_message_id);
+
+        send_command cmd;
+        cmd.type = send_command::kind::DATA;
+        cmd.dest = key;
+        cmd.channel_id = channel_id;
+        cmd.flags = flags | FLAG_RESET; // dispatcher checks this bit to route through send_to_with_reset
+        cmd.data_size = static_cast<uint16_t>(size);
+        cmd.pool_offset = m_send_pool.write(data, cmd.data_size);
+        // Use priority queue so RESET sends jump ahead of any regular
+        // sends queued before them — preserves the intended ordering
+        // semantic: the reset wipe should land on the wire ASAP, not
+        // queue behind a backlog of unrelated app traffic.
+        m_workers[w]->enqueue_send_priority(std::move(cmd));
+        return static_cast<int>(size);
+    }
+
     int server::send_to_priority(const void *data, size_t size, uint8_t channel_id, const endpoint_key &key,
                                  uint8_t flags, uint32_t *out_message_id)
     {

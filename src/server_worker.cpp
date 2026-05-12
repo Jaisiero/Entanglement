@@ -445,6 +445,21 @@ namespace entanglement
         return m_send_socket->send_packet(header, payload, dest);
     }
 
+    int server_worker::send_to_with_reset(const void *data, size_t size, uint8_t channel_id,
+                                          const endpoint_key &dest, uint8_t flags,
+                                          uint32_t *out_message_id)
+    {
+        udp_connection *conn = find(dest);
+        // Allow DISCONNECTED here: send_payload_with_reset() forces the
+        // connection back to CONNECTED before sending. This is the whole
+        // point of the reset path — used to revive a stale endpoint
+        // entry without going through the handshake again.
+        if (!conn)
+            return static_cast<int>(error_code::not_connected);
+        return conn->send_payload_with_reset(*m_send_socket, *m_channels, data, size,
+                                             flags, channel_id, dest, out_message_id);
+    }
+
     int server_worker::send_to(const void *data, size_t size, uint8_t channel_id, const endpoint_key &dest,
                                uint8_t flags, uint32_t *out_message_id)
     {
@@ -620,6 +635,13 @@ namespace entanglement
     // Helper that dispatches a single send_command to the right send path.
     // Shared by flush_send_queue and flush_priority_send_queue so the two
     // drainers cannot drift out of sync as new send_command kinds are added.
+    //
+    // FLAG_RESET routing (2026-05-12): when the application enqueues a
+    // DATA send with FLAG_RESET set, the dispatcher routes through
+    // send_to_with_reset() instead of send_to(). The flag is stripped
+    // from cmd.flags before forwarding — send_payload_with_reset()
+    // re-applies it internally — so the application doesn't have to
+    // think about the dual side-effect (wipe + tag).
     static inline void dispatch_send_cmd(server_worker &self, send_pool *pool, send_command &cmd)
     {
         const uint8_t *payload = (cmd.pool_offset != UINT32_MAX && pool)
@@ -629,7 +651,17 @@ namespace entanglement
         {
             case send_command::kind::DATA:
                 if (payload)
-                    self.send_to(payload, cmd.data_size, cmd.channel_id, cmd.dest, cmd.flags, nullptr);
+                {
+                    if (cmd.flags & FLAG_RESET)
+                    {
+                        self.send_to_with_reset(payload, cmd.data_size, cmd.channel_id, cmd.dest,
+                                                cmd.flags & ~FLAG_RESET, nullptr);
+                    }
+                    else
+                    {
+                        self.send_to(payload, cmd.data_size, cmd.channel_id, cmd.dest, cmd.flags, nullptr);
+                    }
+                }
                 break;
             case send_command::kind::RAW:
                 if (payload)

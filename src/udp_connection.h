@@ -306,6 +306,27 @@ namespace entanglement
                          uint32_t *out_message_id = nullptr, uint64_t *out_sequence = nullptr,
                          uint32_t channel_sequence = 0, uint32_t *out_channel_sequence = nullptr);
 
+        // Send a user message tagged with FLAG_RESET. Wipes this
+        // connection's outbound + inbound state (sequences, ack bitmap,
+        // RTT, congestion, fragmentation, coalesce buffers) before
+        // building the packet so the wire sequence starts at 1, and
+        // appends FLAG_RESET to the header so the receiver mirrors the
+        // wipe before processing. Use for socket pre-warm / handle-
+        // promote scenarios where both endpoints must agree on a clean
+        // session-state boundary in the middle of a long-lived UDP
+        // connection. See packet_flags::FLAG_RESET docs for the full
+        // motivation.
+        //
+        // Bypasses the coalesce path (a RESET marker should always go
+        // out as its own packet — coalescing it with unrelated app
+        // messages would force a same-packet implicit reset on data
+        // that the application didn't intend to mark).
+        int send_payload_with_reset(udp_socket &socket, const channel_manager &channels,
+                                    const void *data, size_t size,
+                                    uint8_t flags, uint8_t channel_id, const endpoint_key &dest,
+                                    uint32_t *out_message_id = nullptr,
+                                    uint64_t *out_sequence = nullptr);
+
         // Send a single fragment (internal — used by send_payload and auto-retransmit).
         int send_fragment(udp_socket &socket, const channel_manager &channels, uint32_t message_id, uint8_t index,
                           uint8_t count, const void *data, size_t size, uint8_t flags, uint8_t channel_id,

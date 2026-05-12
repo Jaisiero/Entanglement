@@ -147,6 +147,29 @@ namespace entanglement
 
     bool udp_connection::process_incoming(const packet_header &header, std::chrono::steady_clock::time_point recv_time)
     {
+        // FLAG_RESET handling (2026-05-12). The remote is telling us it
+        // just wiped its outgoing state and emitted seq=1; we must
+        // do the same to our incoming state before running any of the
+        // ACK / sequence-tracking / duplicate-detection logic below,
+        // otherwise stale m_remote_sequence / m_recv_bitmap from a
+        // prior session at this endpoint would (a) trip the duplicate
+        // check and drop the packet, or (b) leave dangling ack
+        // metadata that mis-acks unrelated old packets.
+        //
+        // Order matters: we preserve the endpoint and restore CONNECTED
+        // state after reset() because reset() blanks them both. The
+        // callbacks (ordered-deliver, reassembler) are owned by find_or_
+        // create / the server worker's propagate_callbacks; reset()
+        // doesn't touch those, so the connection remains app-wired.
+        if (header.flags & FLAG_RESET)
+        {
+            auto saved_endpoint = m_endpoint;
+            reset();
+            m_endpoint = saved_endpoint;
+            m_state = connection_state::CONNECTED;
+            m_active = true;
+        }
+
         // 1. Process piggybacked ACKs from the remote side
         //    The remote is telling us which of OUR packets it received
         if (header.ack > 0)
@@ -626,6 +649,35 @@ namespace entanglement
 
     // --- Unified send (shared by client and server) ---
 
+    int udp_connection::send_payload_with_reset(udp_socket &socket, const channel_manager &channels,
+                                                const void *data, size_t size,
+                                                uint8_t flags, uint8_t channel_id, const endpoint_key &dest,
+                                                uint32_t *out_message_id, uint64_t *out_sequence)
+    {
+        // Preserve the endpoint + connected state across the reset.
+        // reset() blanks both: endpoint to {} and state to DISCONNECTED.
+        // We need them back after because (a) the send path checks state
+        // and (b) downstream of this call the worker / app expects the
+        // endpoint binding to still hold.
+        auto saved_endpoint = m_endpoint;
+        reset();
+        m_endpoint = saved_endpoint;
+        m_state = connection_state::CONNECTED;
+        m_active = true;
+
+        // OR-in FLAG_RESET so the receiver mirrors the wipe before
+        // running its sequence / duplicate / ack-window logic.
+        // Bypass the coalesce path explicitly: a coalesced RESET packet
+        // would carry unrelated app data that didn't intend the
+        // session-state side effect.
+        return send_payload(socket, channels, data, size,
+                            flags | FLAG_RESET,
+                            channel_id, dest,
+                            out_message_id, out_sequence,
+                            /*channel_sequence=*/0,
+                            /*out_channel_sequence=*/nullptr);
+    }
+
     int udp_connection::send_payload(udp_socket &socket, const channel_manager &channels, const void *data, size_t size,
                                      uint8_t flags, uint8_t channel_id, const endpoint_key &dest,
                                      uint32_t *out_message_id, uint64_t *out_sequence, uint32_t channel_sequence,
@@ -635,7 +687,12 @@ namespace entanglement
         // For coalesced channels, append the message to a per-channel buffer.
         // The buffer is flushed when full or at the end of update().
         // Only applies to single-packet-sized messages (not fragmented).
-        if (channels.is_coalesced(channel_id) && size <= MAX_PAYLOAD_SIZE &&
+        // FLAG_RESET messages always go out as their own packet — see
+        // send_payload_with_reset() docs: a coalesced RESET would
+        // implicitly mark unrelated app messages with the session-state
+        // wipe side effect.
+        if (!(flags & FLAG_RESET) &&
+            channels.is_coalesced(channel_id) && size <= MAX_PAYLOAD_SIZE &&
             size + COALESCE_FRAMING_SIZE <= MAX_COALESCE_PAYLOAD)
         {
             auto &buf = ensure_coalesce(channel_id);
