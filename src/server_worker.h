@@ -107,6 +107,23 @@ namespace entanglement
         // --- Send command queue (any thread → this worker, multi-producer safe) ---
         bool enqueue_send(send_command &&cmd);
 
+        // --- Priority send command queue (Option B, 2026-05-11) ---
+        // Critical replies (HANDOFF_AUTH ack → SessionOpen, SHARD_HANDOFF
+        // redirect, INTERSHARD acknowledgements) enqueue here. The priority
+        // queue is drained at the start of every poll_local AND every
+        // PRIORITY_FLUSH_PERIOD recv packets (twice as often as the regular
+        // queue, see poll_local). This keeps the SessionOpen reply window
+        // bounded by ~16 × ~120 us = ~2 ms even under a burst that would
+        // otherwise saturate the worker with recv work.
+        //
+        // Semantics: same MPSC contract as the regular queue. The spin-wait
+        // on full has the same 4096-spin cap. Drop-only-on-overrun in
+        // bounded-time, no silent reorder against the regular queue. The
+        // two queues are independent — priority never blocks regular and
+        // vice-versa — but the worker drains priority FIRST in each flush
+        // pass to honour the ordering intent (priority before regular).
+        bool enqueue_send_priority(send_command &&cmd);
+
         // --- Processing (called from owning thread) ---
 
         // Dequeue and process up to max_packets from the recv queue.
@@ -239,8 +256,17 @@ namespace entanglement
         // single worker thread drains in flush_send_queue).
         std::unique_ptr<mpsc_queue<send_command, WORKER_SEND_QUEUE_SIZE>> m_send_queue;
 
+        // Option B (2026-05-11): priority MPSC send queue. Drained more
+        // frequently than the regular queue inside poll_local (see comment
+        // on enqueue_send_priority in the public section).
+        std::unique_ptr<mpsc_queue<send_command, WORKER_SEND_QUEUE_SIZE>> m_send_queue_priority;
+
         // Flush pending send commands from the cross-thread queue
         void flush_send_queue();
+
+        // Flush pending priority send commands (called more often than
+        // flush_send_queue inside poll_local).
+        void flush_priority_send_queue();
 
         // Callbacks (copies — each worker invokes from its own thread)
         on_client_data_received m_on_client_data_received;

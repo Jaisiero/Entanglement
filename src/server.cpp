@@ -811,6 +811,34 @@ namespace entanglement
         return send_to(data, size, channel_id, endpoint_from_string(address, port), flags, out_message_id);
     }
 
+    int server::send_to_priority(const void *data, size_t size, uint8_t channel_id, const endpoint_key &key,
+                                 uint8_t flags, uint32_t *out_message_id)
+    {
+        // Same routing as send_to, but cross-thread enqueues go to the
+        // priority MPSC. Single-threaded and same-worker-thread paths
+        // are unchanged (no queue involved, send is direct).
+        if (m_workers.empty())
+            return static_cast<int>(error_code::not_connected);
+
+        if (!m_threaded)
+            return m_workers[0]->send_to(data, size, channel_id, key, flags, out_message_id);
+
+        size_t w = worker_index(key);
+        if (std::this_thread::get_id() == m_workers[w]->thread_id())
+            return m_workers[w]->send_to(data, size, channel_id, key, flags, out_message_id);
+
+        // Cross-thread: enqueue priority (out_message_id cannot be set asynchronously)
+        send_command cmd;
+        cmd.type = send_command::kind::DATA;
+        cmd.dest = key;
+        cmd.channel_id = channel_id;
+        cmd.flags = flags;
+        cmd.data_size = static_cast<uint16_t>(size);
+        cmd.pool_offset = m_send_pool.write(data, cmd.data_size);
+        m_workers[w]->enqueue_send_priority(std::move(cmd));
+        return static_cast<int>(size);
+    }
+
     int server::send_fragment_to(uint32_t message_id, uint8_t fragment_index, uint8_t fragment_count, const void *data,
                                  size_t size, uint8_t flags, uint8_t channel_id, const endpoint_key &key,
                                  uint32_t channel_sequence)

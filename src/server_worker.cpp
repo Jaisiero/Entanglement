@@ -35,6 +35,7 @@ namespace entanglement
             m_recv_queues.push_back(std::make_unique<recv_queue_t>());
 
         m_send_queue = std::make_unique<mpsc_queue<send_command, WORKER_SEND_QUEUE_SIZE>>();
+        m_send_queue_priority = std::make_unique<mpsc_queue<send_command, WORKER_SEND_QUEUE_SIZE>>();
 
         // Allocate GSO buffer pool (slot 0 used in non-batch mode, all slots in batch mode)
         m_gso_pool = std::make_unique<uint8_t[]>(static_cast<size_t>(GSO_POOL_SLOTS) * GSO_BUF_SIZE);
@@ -80,6 +81,28 @@ namespace entanglement
         return false; // safety valve — should never reach here in practice
     }
 
+    bool server_worker::enqueue_send_priority(send_command &&cmd)
+    {
+        // Identical contract to enqueue_send, but pushes to the priority
+        // MPSC. The worker drains this queue at twice the cadence of the
+        // regular queue inside poll_local, so latency-sensitive replies
+        // (HANDOFF_AUTH→SessionOpen, INTERSHARD_*) get through within a
+        // ~2 ms window even when the worker is busy processing recv
+        // datagrams. Saturation behaviour matches the regular queue —
+        // 4096-spin cap with pause/yield, returning false only as a
+        // safety valve that should never trigger under normal load.
+        for (int spin = 0; spin < 4096; ++spin)
+        {
+            if (m_send_queue_priority->try_push(std::move(cmd)))
+                return true;
+            if (spin < 64)
+                _mm_pause();
+            else
+                std::this_thread::yield();
+        }
+        return false;
+    }
+
     // -----------------------------------------------------------------------
     // Polling / processing
     // -----------------------------------------------------------------------
@@ -97,27 +120,35 @@ namespace entanglement
         if (m_exclusive_send_socket)
             m_send_socket->begin_send_batch();
 
-        // 1. Process cross-thread send commands first
+        // 1. Process cross-thread send commands (priority first, then regular)
+        flush_priority_send_queue();
         flush_send_queue();
 
         // 2. Dequeue and process received datagrams (drain all recv queues round-robin)
         //
-        // INTERLEAVE_FLUSH_PERIOD (Opción A, 2026-05-11): the worker
+        // INTERLEAVE_FLUSH_PERIOD (Option A, 2026-05-11): the worker
         // alternates between processing inbound datagrams and dispatching
-        // outbound sends from the cross-thread MPSC queue. Without
-        // interleaved flushes, a burst of expensive recvs (e.g. 60
-        // HANDOFF_AUTHs each invoking auth_session + try_send +
-        // send_session_open in their callbacks) could keep this loop busy
-        // for several ms before flush_send_queue runs again — the game
-        // thread's SessionOpen sends pile up in the MPSC and Δ23 (server
-        // replies) blows up. Flushing every N packets bounds that wait to
-        // at most N × ~120 μs ≈ 4 ms. Predicted Δ23 p99 reduction:
-        // 1100 ms → ~150-300 ms in bench-D worst case.
+        // outbound sends. Without interleaved flushes, a burst of
+        // expensive recvs (e.g. 60 HANDOFF_AUTHs each invoking
+        // auth_session + try_send + send_session_open in their
+        // callbacks) could keep this loop busy for several ms before
+        // flush_send_queue runs again — the game thread's SessionOpen
+        // sends pile up in the MPSC and Δ23 (server replies) blows up.
+        // Flushing every N packets bounds that wait to ~N × ~120 us.
         //
-        // Cost: flush_send_queue() on an empty MPSC is ~10 ns
-        // (single load on the consumer head pointer). With max_packets
-        // = 256 and N = 32 we add 8 calls per poll = ~80 ns of overhead
-        // when idle, negligible.
+        // PRIORITY_FLUSH_PERIOD (Option B, 2026-05-11): the priority
+        // queue is drained at twice the cadence of the regular queue.
+        // SessionOpen/INTERSHARD replies enqueued via
+        // enqueue_send_priority therefore wait at most ~16 × ~120 us =
+        // ~2 ms inside a recv batch. Both periods must be powers of 2
+        // so the `count & (PERIOD - 1)` test compiles to an `and`
+        // instead of an idiv.
+        //
+        // Cost: flush_*_send_queue() on an empty MPSC is ~10 ns
+        // (single load on the consumer head pointer). With max_packets=256
+        // we add 16+8 = 24 calls per poll = ~240 ns of overhead when idle,
+        // negligible.
+        constexpr int PRIORITY_FLUSH_PERIOD = 16;
         constexpr int INTERLEAVE_FLUSH_PERIOD = 32;
         int count = 0;
         if (m_recv_queues.size() == 1)
@@ -132,6 +163,8 @@ namespace entanglement
                 process_datagram(slot->header, slot->payload, slot->sender);
                 q.commit_read();
                 ++count;
+                if ((count & (PRIORITY_FLUSH_PERIOD - 1)) == 0)
+                    flush_priority_send_queue();
                 if ((count & (INTERLEAVE_FLUSH_PERIOD - 1)) == 0)
                     flush_send_queue();
             }
@@ -154,6 +187,8 @@ namespace entanglement
                         qp->commit_read();
                         ++count;
                         any = true;
+                        if ((count & (PRIORITY_FLUSH_PERIOD - 1)) == 0)
+                            flush_priority_send_queue();
                         if ((count & (INTERLEAVE_FLUSH_PERIOD - 1)) == 0)
                             flush_send_queue();
                     }
@@ -162,7 +197,9 @@ namespace entanglement
         }
         // Final flush so any sends queued during the last (count % N) iterations
         // also leave this poll cycle. Without this, up to N-1 sends could wait
-        // for the next poll_local invocation.
+        // for the next poll_local invocation. Priority flushed first so any
+        // last-second critical replies still beat the regular queue.
+        flush_priority_send_queue();
         flush_send_queue();
         if (m_exclusive_send_socket)
             m_send_socket->flush_send_batch();
@@ -580,39 +617,47 @@ namespace entanglement
     // Cross-thread send queue processing
     // -----------------------------------------------------------------------
 
+    // Helper that dispatches a single send_command to the right send path.
+    // Shared by flush_send_queue and flush_priority_send_queue so the two
+    // drainers cannot drift out of sync as new send_command kinds are added.
+    static inline void dispatch_send_cmd(server_worker &self, send_pool *pool, send_command &cmd)
+    {
+        const uint8_t *payload = (cmd.pool_offset != UINT32_MAX && pool)
+                                     ? pool->read(cmd.pool_offset)
+                                     : nullptr;
+        switch (cmd.type)
+        {
+            case send_command::kind::DATA:
+                if (payload)
+                    self.send_to(payload, cmd.data_size, cmd.channel_id, cmd.dest, cmd.flags, nullptr);
+                break;
+            case send_command::kind::RAW:
+                if (payload)
+                    self.send_raw_to(cmd.raw_header, payload, cmd.dest);
+                break;
+            case send_command::kind::FRAGMENT:
+                if (payload)
+                    self.send_fragment_to(cmd.message_id, cmd.fragment_index, cmd.fragment_count, payload,
+                                          cmd.data_size, cmd.flags, cmd.channel_id, cmd.dest, cmd.channel_sequence);
+                break;
+            case send_command::kind::DISCONNECT:
+                self.disconnect_client(cmd.dest);
+                break;
+        }
+    }
+
     void server_worker::flush_send_queue()
     {
         send_command cmd;
         while (m_send_queue->try_pop(cmd))
-        {
-            // Resolve payload pointer from shared send_pool
-            const uint8_t *payload = (cmd.pool_offset != UINT32_MAX && m_send_pool)
-                                         ? m_send_pool->read(cmd.pool_offset)
-                                         : nullptr;
+            dispatch_send_cmd(*this, m_send_pool, cmd);
+    }
 
-            switch (cmd.type)
-            {
-                case send_command::kind::DATA:
-                    if (payload)
-                        send_to(payload, cmd.data_size, cmd.channel_id, cmd.dest, cmd.flags, nullptr);
-                    break;
-
-                case send_command::kind::RAW:
-                    if (payload)
-                        send_raw_to(cmd.raw_header, payload, cmd.dest);
-                    break;
-
-                case send_command::kind::FRAGMENT:
-                    if (payload)
-                        send_fragment_to(cmd.message_id, cmd.fragment_index, cmd.fragment_count, payload,
-                                         cmd.data_size, cmd.flags, cmd.channel_id, cmd.dest, cmd.channel_sequence);
-                    break;
-
-                case send_command::kind::DISCONNECT:
-                    disconnect_client(cmd.dest);
-                    break;
-            }
-        }
+    void server_worker::flush_priority_send_queue()
+    {
+        send_command cmd;
+        while (m_send_queue_priority->try_pop(cmd))
+            dispatch_send_cmd(*this, m_send_pool, cmd);
     }
 
     // -----------------------------------------------------------------------

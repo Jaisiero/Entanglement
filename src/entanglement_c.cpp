@@ -489,6 +489,14 @@ int ent_server_send_to(ent_server_t *s, const void *data, size_t size, uint8_t c
     return s->cpp.send_to(data, size, channel_id, to_cpp(dest), flags, out_message_id);
 }
 
+int ent_server_send_to_priority(ent_server_t *s, const void *data, size_t size, uint8_t channel_id, ent_endpoint dest,
+                                uint8_t flags, uint32_t *out_message_id)
+{
+    if (!s)
+        return ENT_ERROR_INVALID_ARGUMENT;
+    return s->cpp.send_to_priority(data, size, channel_id, to_cpp(dest), flags, out_message_id);
+}
+
 int ent_server_send_raw_to(ent_server_t *s, ent_packet_header *header, const void *payload, ent_endpoint dest)
 {
     if (!s || !header)

@@ -295,6 +295,14 @@ extern "C"
     ENT_API int ent_server_send_to(ent_server_t *s, const void *data, size_t size, uint8_t channel_id,
                                    ent_endpoint dest, uint8_t flags, uint32_t *out_message_id);
 
+    /* Priority send (Option B, 2026-05-11). Same semantics as ent_server_send_to but
+     * the cross-thread path enqueues to the worker's priority MPSC queue. The priority
+     * queue is drained at twice the cadence of the regular queue in poll_local, so
+     * latency-sensitive replies (HANDOFF_AUTH→SessionOpen, INTERSHARD acknowledgements)
+     * bypass the regular send queue's tail under a recv burst. */
+    ENT_API int ent_server_send_to_priority(ent_server_t *s, const void *data, size_t size, uint8_t channel_id,
+                                            ent_endpoint dest, uint8_t flags, uint32_t *out_message_id);
+
     /* Send pre-built header (low-level).
      * NOTE: `header` is an in/out parameter — the library fills internal fields
      * (sequence, ack_sequence, ack_bits, etc.) before sending.  The caller's

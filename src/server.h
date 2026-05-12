@@ -52,6 +52,17 @@ namespace entanglement
         int send_to(const void *data, size_t size, uint8_t channel_id, const std::string &address, uint16_t port,
                     uint8_t flags = 0, uint32_t *out_message_id = nullptr);
 
+        // Priority send (Option B, 2026-05-11). Same semantics as send_to
+        // but enqueues to the worker's priority MPSC queue when the call
+        // is cross-thread. Use for latency-sensitive replies
+        // (HANDOFF_AUTH→SessionOpen, INTERSHARD acknowledgements) so they
+        // bypass the regular send queue's tail under a recv burst.
+        //
+        // If invoked from the worker thread (same-thread fast path) it
+        // sends directly, identical to send_to — no queue involved.
+        int send_to_priority(const void *data, size_t size, uint8_t channel_id, const endpoint_key &dest,
+                             uint8_t flags = 0, uint32_t *out_message_id = nullptr);
+
         // Retransmit a single fragment to a specific client.
         // For manual loss recovery only — prefer enable_auto_retransmit() instead.
         int send_fragment_to(uint32_t message_id, uint8_t fragment_index, uint8_t fragment_count, const void *data,
