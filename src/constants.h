@@ -14,18 +14,19 @@ namespace entanglement
     constexpr size_t MAX_PACKET_SIZE = 1200; // Safe MTU minus IP/UDP headers
     constexpr uint16_t DEFAULT_PORT = 9876;
     constexpr size_t MAX_CONNECTIONS = 4096;
-    constexpr int SOCKET_RECV_BUFFER_SIZE = 16 * 1024 * 1024; // 16 MB SO_RCVBUF
-                                                              // (bumped from 4 MB on 2026-05-14
-                                                              // — bench-d33 client-side counters
-                                                              // confirmed 5-9s d34 outliers were
-                                                              // bot receiving only 1-2 packets in
-                                                              // 9s while server emitted ~1080.
-                                                              // Windows OS-level UDP Receive
-                                                              // Errors=0, adapter discards=0;
-                                                              // suspect per-socket recv buffer
-                                                              // silent overflow during post-split
-                                                              // burst. 4× headroom matches the
-                                                              // intershard buffer override.)
+    constexpr int SOCKET_RECV_BUFFER_SIZE = 4 * 1024 * 1024; // 4 MB SO_RCVBUF
+                                                             // (reverted to 4MB on 2026-05-14 —
+                                                             // 16MB bump caused regression: p99
+                                                             // 1.5s → 12-26s, max 5s → 20-34s.
+                                                             // Hypothesis: larger buffer makes
+                                                             // packets queue longer during
+                                                             // bursts, application drains
+                                                             // stale packets first, T4 still
+                                                             // fires on first received but
+                                                             // d01/d23 ballooned because OS
+                                                             // pre-Connected handshake replies
+                                                             // sit behind queued game traffic.
+                                                             // 4MB was the well-tested default.)
 
     // --- Poll defaults ---
     constexpr int DEFAULT_MAX_POLL_PACKETS = 256;
