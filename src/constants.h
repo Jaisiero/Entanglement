@@ -52,7 +52,14 @@ namespace entanglement
     constexpr int64_t HEARTBEAT_INTERVAL_US = 1'000'000;  // 1 s — send keepalive if idle
     constexpr int64_t CONNECTION_TIMEOUT_US = 10'000'000; // 10 s — disconnect if no recv
     constexpr int HANDSHAKE_MAX_ATTEMPTS = 10;            // connection request retries
-    constexpr int64_t HANDSHAKE_RETRY_INTERVAL_MS = 500;  // ms between retries
+    constexpr int64_t HANDSHAKE_RETRY_INTERVAL_MS = 100;  // ms between retries (was 500;
+                                                          // bench-D 2026-05-14 showed 92/92 cold-spawn
+                                                          // outliers were CONNECTION_REQUEST retransmits
+                                                          // — at 500ms cadence each lost reply burned
+                                                          // 500ms before retry → 10 attempts × 500ms =
+                                                          // 5s worst case d01. LAN RTT is <1ms so 100ms
+                                                          // is still 100× RTT — caps worst case to ~1s
+                                                          // while still 5× longer than required.)
     constexpr int MAX_TIMEOUTS_PER_UPDATE = 32;           // max timeouts processed per server update
 
     // --- Channel limits ---
