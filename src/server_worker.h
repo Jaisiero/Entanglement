@@ -191,6 +191,8 @@ namespace entanglement
         void disconnect_client(const endpoint_key &key);
         void disconnect_all();
         size_t connection_count() const { return m_index.size(); }
+        // Stale connections replaced because a new client instance reused their endpoint.
+        uint64_t client_restarts() const { return m_client_restarts.load(std::memory_order_relaxed); }
 
         bool is_fragment_throttled(const endpoint_key &key) const;
 
@@ -297,6 +299,7 @@ namespace entanglement
 
         bool m_auto_retransmit = false;
         bool m_verbose = true;
+        std::atomic<uint64_t> m_client_restarts{0};
 
         std::thread::id m_thread_id{};
 

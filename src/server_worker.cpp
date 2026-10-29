@@ -862,6 +862,32 @@ namespace entanglement
         {
             case CONTROL_CONNECTION_REQUEST:
             {
+                // Optional client instance id after the type byte (0 = legacy client).
+                uint64_t instance = 0;
+                if (payload_size >= 1 + sizeof(uint64_t))
+                {
+                    for (size_t i = 0; i < sizeof(uint64_t); ++i)
+                        instance |= static_cast<uint64_t>(payload[1 + i]) << (8 * i);
+                }
+
+                // Same endpoint, different instance: a new client process got the local port
+                // of a dead one whose connection we still hold (e.g. a bench restart).
+                // Re-accepting the old connection would hand the newcomer its sequence numbers
+                // (its packets are then dropped as duplicates) and its session. Close the
+                // stale connection exactly like a DISCONNECT and fall through to a fresh one.
+                if (conn && instance != 0 && instance != conn->client_instance())
+                {
+                    m_client_restarts.fetch_add(1, std::memory_order_relaxed);
+                    std::string address = endpoint_address_string(key);
+                    if (m_verbose)
+                        std::cout << "[server] Client restarted on " << address << ":" << key.port
+                                  << " — replacing stale connection" << std::endl;
+                    if (m_on_client_disconnected)
+                        m_on_client_disconnected(key, address, key.port);
+                    disconnect_client(key);
+                    conn = nullptr;
+                }
+
                 if (conn)
                 {
                     conn->process_incoming(header, m_cached_now);
@@ -884,6 +910,7 @@ namespace entanglement
 
                 conn->set_state(connection_state::CONNECTED);
                 conn->set_cached_now(m_cached_now);
+                conn->set_client_instance(instance);
                 conn->process_incoming(header, m_cached_now);
                 send_control_to(conn, CONTROL_CONNECTION_ACCEPTED, key);
 

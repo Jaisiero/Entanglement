@@ -370,6 +370,12 @@ namespace entanglement
         bool backpressure_sent() const { return m_backpressure_sent; }
         void set_backpressure_sent(bool sent) { m_backpressure_sent = sent; }
 
+        // Server side: random id the client sent in its CONNECTION_REQUEST (0 = legacy
+        // client without one). A request with a different id on the same endpoint is a
+        // new client instance that reused the port, not a handshake retry.
+        uint64_t client_instance() const { return m_client_instance; }
+        void set_client_instance(uint64_t id) { m_client_instance = id; }
+
         // --- Ordered delivery (receive-side hold-back for RELIABLE_ORDERED) ---
 
         // Expected next channel_sequence for a given channel (starts at 1)
@@ -484,6 +490,8 @@ namespace entanglement
         // Fragment flow control (backpressure)
         bool m_fragment_backpressured = false; // sender side: remote told us to throttle
         bool m_backpressure_sent = false;      // receiver side: we sent throttle signal
+
+        uint64_t m_client_instance = 0; // server side: client instance id from CONNECTION_REQUEST
 
         // Ordered delivery (receive-side hold-back for RELIABLE_ORDERED)
         uint32_t m_recv_channel_seq[MAX_CHANNELS]{}; // expected next per-channel seq (init 1 on first use)

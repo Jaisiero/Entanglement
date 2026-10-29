@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <random>
 #include <thread>
 
 namespace entanglement
@@ -52,8 +53,14 @@ namespace entanglement
         m_connection.set_active(true);
         m_connection.set_state(connection_state::CONNECTING);
 
+        // A fresh instance id per connect(). The server keeps one connection per endpoint;
+        // if this socket got the local port of a dead client whose connection the server
+        // still holds, the different id tells the server to drop that stale connection
+        // (and its session) instead of handing us its sequence numbers.
+        m_instance_id = new_instance_id();
+
         // Handshake: send CONNECTION_REQUEST, wait for ACCEPTED with retries
-        send_control(CONTROL_CONNECTION_REQUEST);
+        send_connection_request();
 
         auto retry_interval = std::chrono::milliseconds(HANDSHAKE_RETRY_INTERVAL_MS);
         auto last_attempt = std::chrono::steady_clock::now();
@@ -96,7 +103,7 @@ namespace entanglement
                     std::cout << "[client] Retrying connection (" << attempt << "/" << HANDSHAKE_MAX_ATTEMPTS << ")"
                               << std::endl;
                 }
-                send_control(CONTROL_CONNECTION_REQUEST);
+                send_connection_request();
                 last_attempt = now;
             }
 
@@ -412,6 +419,27 @@ namespace entanglement
     void client::set_on_message_acked(on_message_acked cb)
     {
         m_connection.set_on_message_acked(std::move(cb));
+    }
+
+    uint64_t client::new_instance_id()
+    {
+        static thread_local std::mt19937_64 rng{std::random_device{}() ^
+                                                static_cast<uint64_t>(
+                                                    std::chrono::steady_clock::now().time_since_epoch().count())};
+        uint64_t id = 0;
+        while (id == 0) // 0 means "no instance id" on the wire
+            id = rng();
+        return id;
+    }
+
+    void client::send_connection_request()
+    {
+        // [type][instance id, 8 bytes LE]. Older servers only read payload[0].
+        uint8_t payload[1 + sizeof(uint64_t)];
+        payload[0] = CONTROL_CONNECTION_REQUEST;
+        for (size_t i = 0; i < sizeof(uint64_t); ++i)
+            payload[1 + i] = static_cast<uint8_t>(m_instance_id >> (8 * i));
+        send_control_payload(payload, sizeof(payload));
     }
 
     void client::send_control(uint8_t control_type)

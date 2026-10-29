@@ -55,6 +55,7 @@ namespace entanglement
         // Reset backpressure flags
         m_fragment_backpressured = false;
         m_backpressure_sent = false;
+        m_client_instance = 0;
 
         // Reset oldest un-acked tracking
         m_oldest_unacked_seq = 1;
