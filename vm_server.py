@@ -1,9 +1,13 @@
+import os
 import paramiko
 import time
 import sys
 
-HOST = '192.168.1.232'
-USER = 'jaisiero'
+# The bench VM: set BENCH_HOST, BENCH_USER and BENCH_DIR (the Entanglement
+# build directory on it) in the environment.
+HOST = os.environ.get('BENCH_HOST', '127.0.0.1')
+USER = os.environ.get('BENCH_USER', os.environ.get('USER', ''))
+BENCH_DIR = os.environ.get('BENCH_DIR', '~/Projects/Entanglement/build')
 
 def ssh_connect(pw):
     ssh = paramiko.SSHClient()
@@ -23,7 +27,7 @@ def start_server(pw, workers=8):
     # Start in background via bash
     transport = ssh.get_transport()
     ch = transport.open_session()
-    cmd = 'cd /home/jaisiero/Projects/Entanglement/build && ./EntanglementNetBench server 9876 {} > /tmp/bench_srv.log 2>&1 &'.format(workers)
+    cmd = 'cd {} && ./EntanglementNetBench server 9876 {} > /tmp/bench_srv.log 2>&1 &'.format(BENCH_DIR, workers)
     ch.exec_command('bash -c ' + repr(cmd))
     ch.recv_exit_status()
     time.sleep(3)
