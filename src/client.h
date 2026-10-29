@@ -174,6 +174,8 @@ namespace entanglement
         bool m_sender_filter = true;
         bool m_exclusive_port = true;
         std::atomic<uint64_t> m_foreign_sender_drops{0};
+        // Random id sent in every CONNECTION_REQUEST of one connect(); new per connect().
+        uint64_t m_instance_id = 0;
         on_data_received m_on_data_received;
         on_connected m_on_connected;
         on_disconnected m_on_disconnected;
@@ -185,6 +187,8 @@ namespace entanglement
 
         // Send a control packet (FLAG_CONTROL + type byte)
         void send_control(uint8_t control_type);
+        void send_connection_request();
+        static uint64_t new_instance_id();
 
         // Send a multi-byte control payload
         void send_control_payload(const void *payload, size_t size);
