@@ -140,6 +140,22 @@ namespace entanglement
         void set_verbose(bool verbose) { m_verbose = verbose; }
         bool verbose() const { return m_verbose; }
 
+        // Sender filter (default ON; env ENTANGLEMENT_CLIENT_SENDER_FILTER=0 disables).
+        // poll() drops any datagram whose source endpoint is not the server this client
+        // talks to, before it touches connection state. Without it, a stale connection on
+        // another server that still heartbeats to our (reused) local port can bump the
+        // remote sequence and make the real server's packets look like duplicates.
+        void set_sender_filter(bool enabled) { m_sender_filter = enabled; }
+        bool sender_filter() const { return m_sender_filter; }
+        // Datagrams dropped by the sender filter since construction.
+        uint64_t foreign_sender_drops() const { return m_foreign_sender_drops.load(std::memory_order_relaxed); }
+
+        // Exclusive ephemeral port (default ON; env ENTANGLEMENT_CLIENT_EXCLUSIVE_PORT=0
+        // disables). When ON, connect() binds port 0 without SO_REUSEADDR, so the kernel
+        // never gives two live clients the same local port. Takes effect on the next connect().
+        void set_exclusive_port(bool enabled) { m_exclusive_port = enabled; }
+        bool exclusive_port() const { return m_exclusive_port; }
+
 #ifdef ENTANGLEMENT_SIMULATE_LOSS
         void set_simulated_drop_rate(double rate) { m_socket.set_drop_rate(rate); }
         double simulated_drop_rate() const { return m_socket.drop_rate(); }
@@ -155,6 +171,9 @@ namespace entanglement
         endpoint_key m_server_endpoint; // precomputed from address + port
         std::atomic<bool> m_connected{false};
         bool m_verbose = true;
+        bool m_sender_filter = true;
+        bool m_exclusive_port = true;
+        std::atomic<uint64_t> m_foreign_sender_drops{0};
         on_data_received m_on_data_received;
         on_connected m_on_connected;
         on_disconnected m_on_disconnected;

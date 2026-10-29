@@ -1,5 +1,7 @@
 #include "client.h"
 #include <algorithm>
+#include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <thread>
@@ -7,9 +9,22 @@
 namespace entanglement
 {
 
+    // Boolean env flag: unset or empty → default_value; "0"/"false"/"off" → false; anything else → true.
+    static bool env_flag(const char *name, bool default_value)
+    {
+        const char *v = std::getenv(name);
+        if (!v || !*v)
+            return default_value;
+        std::string s(v);
+        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        return !(s == "0" || s == "false" || s == "off" || s == "no");
+    }
+
     client::client(const std::string &server_address, uint16_t server_port)
         : m_server_endpoint(endpoint_from_string(server_address, server_port))
     {
+        m_sender_filter = env_flag("ENTANGLEMENT_CLIENT_SENDER_FILTER", true);
+        m_exclusive_port = env_flag("ENTANGLEMENT_CLIENT_EXCLUSIVE_PORT", true);
     }
 
     client::~client()
@@ -19,7 +34,8 @@ namespace entanglement
 
     error_code client::connect()
     {
-        if (auto ec = m_socket.bind(0); failed(ec))
+        if (auto ec = m_socket.bind(0, "0.0.0.0", /*reuse_port=*/false, /*reuse_addr_ephemeral=*/!m_exclusive_port);
+            failed(ec))
             return ec;
 
         if (auto ec = m_socket.set_non_blocking(true); failed(ec))
@@ -168,6 +184,20 @@ namespace entanglement
             int result = m_socket.recv_packet(header, payload, MAX_PAYLOAD_SIZE, sender);
             if (result <= 0)
                 break;
+
+            // Drop datagrams that do not come from our server before they reach
+            // process_incoming. A stale connection on another server that still
+            // heartbeats to this (reused) local port would otherwise advance
+            // m_remote_sequence, and the real server's packets would then be
+            // discarded as duplicates. An INADDR_ANY server address (sends land on
+            // a local interface) is matched by port only.
+            if (m_sender_filter && !(sender == m_server_endpoint) &&
+                !(m_server_endpoint.address == 0 && sender.port == m_server_endpoint.port))
+            {
+                m_foreign_sender_drops.fetch_add(1, std::memory_order_relaxed);
+                ++count;
+                continue;
+            }
 
             bool is_control = (header.flags & FLAG_CONTROL) && header.payload_size >= 1;
 

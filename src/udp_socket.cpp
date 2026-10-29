@@ -51,7 +51,7 @@ namespace entanglement
         return *this;
     }
 
-    error_code udp_socket::bind(uint16_t port, const std::string &address, bool reuse_port)
+    error_code udp_socket::bind(uint16_t port, const std::string &address, bool reuse_port, bool reuse_addr_ephemeral)
     {
         m_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (m_socket == INVALID_SOCK)
@@ -60,9 +60,15 @@ namespace entanglement
             return error_code::socket_error;
         }
 
-        // Allow address reuse
-        int opt = 1;
-        setsockopt(m_socket, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char *>(&opt), sizeof(opt));
+        // Allow address reuse — only for an explicit port. On Linux, UDP sockets that both
+        // have SO_REUSEADDR may share a port, and that includes the ephemeral port chosen by
+        // bind(0): two clients on one host can end up on the same local port, and unicast is
+        // then delivered only to the newest socket (the older one goes silent).
+        if (port != 0 || reuse_addr_ephemeral)
+        {
+            int opt = 1;
+            setsockopt(m_socket, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char *>(&opt), sizeof(opt));
+        }
 
 #ifdef ENTANGLEMENT_PLATFORM_LINUX
         // SO_REUSEPORT: allow multiple sockets on the same port (kernel distributes by 5-tuple hash)

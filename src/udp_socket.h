@@ -65,7 +65,12 @@ namespace entanglement
 
         // Create and bind to a local port (0 = any available port)
         // reuse_port: on Linux, set SO_REUSEPORT to allow multiple sockets on the same port.
-        error_code bind(uint16_t port, const std::string &address = "0.0.0.0", bool reuse_port = false);
+        // SO_REUSEADDR is only set for an explicit port (port != 0). With port 0 it would let
+        // the Linux kernel hand the same ephemeral port to two live sockets, and unicast then
+        // goes only to the newest one. reuse_addr_ephemeral = true restores the legacy
+        // behaviour (SO_REUSEADDR on port 0 too) for A/B comparison.
+        error_code bind(uint16_t port, const std::string &address = "0.0.0.0", bool reuse_port = false,
+                        bool reuse_addr_ephemeral = false);
 
         // Send raw data to a remote endpoint
         int send_to(const void *data, size_t size, const endpoint_key &dest);
