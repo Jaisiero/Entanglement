@@ -343,6 +343,14 @@ namespace entanglement
         m_worker_send_sockets.clear();
         m_workers.clear();
 
+        // All workers are joined: reset the dispatch generations so the workers of
+        // a later start() (which begin at last_run_gen = 0) do not mistake the old
+        // generation for a new dispatch and report a spurious "done".
+        m_dispatch_gen.store(0, std::memory_order_relaxed);
+        m_dispatch_released.store(0, std::memory_order_relaxed);
+        m_dispatch_done.store(0, std::memory_order_relaxed);
+        m_dispatch_fn = nullptr;
+
         if (m_verbose)
             std::cout << "[server] Stopped" << std::endl;
     }
@@ -447,19 +455,27 @@ namespace entanglement
     {
         auto &worker = *m_workers[worker_idx];
         worker.set_thread_id(std::this_thread::get_id());
+        // Last dispatch generation this worker has already run.
+        uint64_t last_run_gen = 0;
 
         while (m_running.load(std::memory_order_relaxed))
         {
             // Highest priority: dispatched task (thread fusion)
-            if (m_dispatch_pending.load(std::memory_order_acquire))
+            const uint64_t gen = m_dispatch_gen.load(std::memory_order_acquire);
+            if (gen != last_run_gen)
             {
+                last_run_gen = gen;
                 auto fn = m_dispatch_fn;
                 auto ctx = m_dispatch_contexts[worker_idx];
                 if (fn)
                     fn(ctx, static_cast<int>(worker_idx));
                 m_dispatch_done.fetch_add(1, std::memory_order_release);
-                // Spin until main thread clears the dispatch flag
-                while (m_dispatch_pending.load(std::memory_order_acquire))
+                // Wait until ALL workers finish this generation before going back
+                // to the normal loop (same contract as before). The condition
+                // compares against a monotonic counter: even if the dispatcher
+                // publishes the next generation while this worker was preempted,
+                // the released generation is already >= gen and the wait ends.
+                while (m_dispatch_released.load(std::memory_order_acquire) < gen)
                 {
 #if defined(__x86_64__) || defined(_M_X64)
                     CPU_PAUSE();
@@ -522,8 +538,9 @@ namespace entanglement
         for (int i = 0; i < count; ++i)
             m_dispatch_contexts[i] = contexts[i];
 
-        // Publish task — workers will pick it up on next loop iteration
-        m_dispatch_pending.store(true, std::memory_order_release);
+        // Publish the new generation: the `release` write makes fn/contexts
+        // visible to the workers that read it with `acquire`.
+        const uint64_t gen = m_dispatch_gen.fetch_add(1, std::memory_order_acq_rel) + 1;
 
         // Wait for all workers to complete
         while (m_dispatch_done.load(std::memory_order_acquire) < count)
@@ -535,9 +552,9 @@ namespace entanglement
 #endif
         }
 
-        // Clear dispatch state; workers will see this and resume normal loop
+        // Release the generation: workers go back to their normal loop.
         m_dispatch_fn = nullptr;
-        m_dispatch_pending.store(false, std::memory_order_release);
+        m_dispatch_released.store(gen, std::memory_order_release);
     }
 
     int server::worker_send_to(size_t worker_idx, const void *data, size_t size,

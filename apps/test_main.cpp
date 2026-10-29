@@ -13,6 +13,7 @@
 #include "udp_connection.h"
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <iostream>
@@ -4643,6 +4644,159 @@ static bool test_coalesce_data_integrity()
     return true;
 }
 
+// ============================================================================
+// TEST: Client drops datagrams from a foreign sender
+// ============================================================================
+// A stale connection on another server keeps heartbeating to the client's
+// (reused) local port with a high sequence. Before the sender filter, that
+// heartbeat advanced m_remote_sequence and every later packet from the real
+// server was discarded as a duplicate. With the filter ON the foreign packet
+// is dropped and counted, and the echo still arrives. With the filter OFF the
+// legacy failure is reproduced, which proves the test exercises the mechanism.
+// ============================================================================
+
+static bool foreign_heartbeat_echo_run(uint16_t port, bool filter, uint64_t &drops, bool &echoed)
+{
+    server srv(port);
+    srv.set_verbose(false);
+    std::atomic<bool> stop_flag{false};
+    srv.set_on_client_data_received(
+        [&](const packet_header &header, const uint8_t *payload, size_t payload_size, const endpoint_key &sender)
+        { srv.send_to(payload, payload_size, header.channel_id, sender); });
+    TEST_ASSERT(succeeded(srv.start()), "server should start");
+    std::thread server_thread(
+        [&]()
+        {
+            while (!stop_flag.load())
+            {
+                srv.poll();
+                srv.update();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+
+    client c("127.0.0.1", port);
+    c.set_verbose(false);
+    c.set_sender_filter(filter);
+    std::atomic<int> responses{0};
+    c.set_on_data_received([&](const packet_header &, const uint8_t *, size_t) { responses++; });
+
+    bool connected = succeeded(c.connect());
+
+    if (connected)
+    {
+        // Impostor: a different local endpoint sending a HEARTBEAT with a far-ahead sequence.
+        udp_socket impostor;
+        if (succeeded(impostor.bind(0)))
+        {
+            packet_header h{};
+            h.magic = PROTOCOL_MAGIC;
+            h.version = PROTOCOL_VERSION;
+            h.flags = FLAG_CONTROL;
+            h.channel_id = channels::CONTROL.id;
+            h.sequence = 1'000'000;
+            h.payload_size = 1;
+            uint8_t hb = CONTROL_HEARTBEAT;
+            impostor.send_packet(h, &hb, endpoint_from_string("127.0.0.1", c.local_port()));
+        }
+
+        // Let the impostor packet land before the echo request.
+        auto settle = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+        while (std::chrono::steady_clock::now() < settle)
+        {
+            c.poll();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
+        c.send("PING", 4, channels::RELIABLE.id);
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
+        while (responses.load() == 0 && std::chrono::steady_clock::now() < deadline)
+        {
+            c.poll();
+            c.update(nullptr);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
+    drops = c.foreign_sender_drops();
+    echoed = responses.load() > 0;
+    c.disconnect();
+    stop_flag = true;
+    server_thread.join();
+    srv.stop();
+    TEST_ASSERT(connected, "client should connect");
+    return true;
+}
+
+static bool test_client_drops_foreign_sender()
+{
+    uint64_t drops = 0;
+    bool echoed = false;
+    if (!foreign_heartbeat_echo_run(9970, /*filter=*/true, drops, echoed))
+        return false;
+    TEST_ASSERT(drops == 1, "filter ON: the impostor heartbeat must be dropped and counted once");
+    TEST_ASSERT(echoed, "filter ON: the server echo must still be delivered");
+
+    if (!foreign_heartbeat_echo_run(9971, /*filter=*/false, drops, echoed))
+        return false;
+    TEST_ASSERT(drops == 0, "filter OFF: nothing is counted");
+    TEST_ASSERT(!echoed, "filter OFF: the legacy path loses the echo (remote sequence poisoned)");
+    return true;
+}
+
+// ============================================================================
+// TEST: Client ephemeral port is exclusive (no SO_REUSEADDR on bind(0))
+// ============================================================================
+// On Linux, two UDP sockets that both set SO_REUSEADDR may share a port —
+// including an ephemeral one picked by bind(0). A connected client must not
+// carry SO_REUSEADDR, so a second socket that tries to bind its port (with
+// SO_REUSEADDR, as udp_socket does for explicit ports) must fail. Windows
+// semantics differ (SO_REUSEADDR there may steal any non-exclusive port), so
+// the cross-bind assertion is Linux-only; elsewhere we only check the client
+// still connects with the default settings.
+// ============================================================================
+
+static bool test_client_exclusive_ephemeral_port()
+{
+    test_server_ctx ctx(9972);
+    ctx.srv.set_verbose(false);
+    TEST_ASSERT(ctx.start(), "server should start");
+
+    client c("127.0.0.1", 9972);
+    c.set_verbose(false);
+    // Default is ON unless the A/B env var turns it off; force it so the test does
+    // not depend on the environment.
+    if (!std::getenv("ENTANGLEMENT_CLIENT_EXCLUSIVE_PORT"))
+        TEST_ASSERT(c.exclusive_port(), "exclusive port should default ON");
+    c.set_exclusive_port(true);
+    TEST_ASSERT(succeeded(c.connect()), "client should connect");
+    uint16_t port = c.local_port();
+    TEST_ASSERT(port != 0, "client should have a local port");
+
+#ifdef ENTANGLEMENT_PLATFORM_LINUX
+    {
+        udp_socket other;
+        error_code ec = other.bind(port); // explicit port → SO_REUSEADDR set on `other`
+        TEST_ASSERT(failed(ec), "second socket must not share the client's ephemeral port");
+    }
+
+    // Legacy behaviour (A/B): with SO_REUSEADDR on the client socket the port is shareable.
+    client legacy("127.0.0.1", 9972);
+    legacy.set_verbose(false);
+    legacy.set_exclusive_port(false);
+    TEST_ASSERT(succeeded(legacy.connect()), "legacy client should connect");
+    {
+        udp_socket other;
+        error_code ec = other.bind(legacy.local_port());
+        TEST_ASSERT(succeeded(ec), "legacy: SO_REUSEADDR client port is shareable (the bug)");
+    }
+    legacy.disconnect();
+#endif
+
+    c.disconnect();
+    return true;
+}
+
 int main()
 {
     platform_init();
@@ -4749,6 +4903,10 @@ int main()
     register_test("Coalesce batching efficiency", test_coalesce_batching_efficiency);
     register_test("Coalesce explicit flush", test_coalesce_explicit_flush);
     register_test("Coalesce data integrity", test_coalesce_data_integrity);
+
+    // -- Client transport hygiene --
+    register_test("Client drops foreign sender", test_client_drops_foreign_sender);
+    register_test("Client exclusive ephemeral port", test_client_exclusive_ephemeral_port);
 
     std::cout << "========================================" << std::endl;
     std::cout << " Entanglement Test Battery" << std::endl;

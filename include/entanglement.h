@@ -285,6 +285,15 @@ extern "C"
     ENT_API void ent_client_set_verbose(ent_client_t *c, int verbose);
     ENT_API uint16_t ent_client_local_port(const ent_client_t *c);
 
+    /* Sender filter: drop datagrams whose source is not the server (default ON,
+     * env ENTANGLEMENT_CLIENT_SENDER_FILTER=0 disables). */
+    ENT_API void ent_client_set_sender_filter(ent_client_t *c, int enabled);
+    /* Number of datagrams dropped by the sender filter. */
+    ENT_API uint64_t ent_client_foreign_sender_drops(const ent_client_t *c);
+    /* Exclusive ephemeral port: bind(0) without SO_REUSEADDR (default ON,
+     * env ENTANGLEMENT_CLIENT_EXCLUSIVE_PORT=0 disables). Applies on next connect. */
+    ENT_API void ent_client_set_exclusive_port(ent_client_t *c, int enabled);
+
     /* -----------------------------------------------------------------------
      * Server API
      * ----------------------------------------------------------------------- */

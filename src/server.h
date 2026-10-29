@@ -321,7 +321,14 @@ namespace entanglement
         void dispatch_to_workers(worker_task_fn fn, void **contexts);
 
     private:
-        std::atomic<bool> m_dispatch_pending{false};
+        // Dispatch generations (thread fusion). This used to be a single bool
+        // `m_dispatch_pending` that the dispatcher cleared when dispatch N finished
+        // and set again when N+1 started: a worker waiting to see N's clear that
+        // was preempted right there missed it (ABA), waited for N forever, and the
+        // dispatcher waited for its "done" forever. Monotonic counters never repeat
+        // a value. Reset in stop() once the workers are joined.
+        std::atomic<uint64_t> m_dispatch_gen{0};      // last published generation
+        std::atomic<uint64_t> m_dispatch_released{0}; // last generation finished by all workers
         worker_task_fn m_dispatch_fn = nullptr;
         void *m_dispatch_contexts[64] = {};
         std::atomic<int> m_dispatch_done{0};

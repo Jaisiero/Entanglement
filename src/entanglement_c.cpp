@@ -435,6 +435,23 @@ uint16_t ent_client_local_port(const ent_client_t *c)
     return c ? c->cpp.local_port() : 0;
 }
 
+void ent_client_set_sender_filter(ent_client_t *c, int enabled)
+{
+    if (c)
+        c->cpp.set_sender_filter(enabled != 0);
+}
+
+uint64_t ent_client_foreign_sender_drops(const ent_client_t *c)
+{
+    return c ? c->cpp.foreign_sender_drops() : 0;
+}
+
+void ent_client_set_exclusive_port(ent_client_t *c, int enabled)
+{
+    if (c)
+        c->cpp.set_exclusive_port(enabled != 0);
+}
+
 /* -----------------------------------------------------------------------
  * Server: lifecycle
  * ----------------------------------------------------------------------- */
